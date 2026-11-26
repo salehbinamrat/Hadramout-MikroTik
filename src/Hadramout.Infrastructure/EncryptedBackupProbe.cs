@@ -18,13 +18,18 @@ public static class EncryptedBackupProbe
             {
                 db.Sites.Add(new Site { Name = "encrypted-probe" });
                 db.SaveChanges();
+                using var cmd = c.CreateCommand();
+                cmd.CommandText = "CREATE TABLE test_payload(Data BLOB NOT NULL); INSERT INTO test_payload VALUES(zeroblob(3145728));";
+                cmd.ExecuteNonQuery();
             }
             EncryptedDatabaseBackup.Create(source, encrypted, "synthetic-probe-password"u8);
             EncryptedDatabaseBackup.PrepareRestore(encrypted, candidate, "synthetic-probe-password"u8);
             using var connection = DatabaseStore.Open(candidate);
             using var restored = new NetworkDbContext(new DbContextOptionsBuilder<NetworkDbContext>()
                 .UseSqlite(connection).Options);
-            return restored.Sites.Single().Name == "encrypted-probe";
+            using var check = connection.CreateCommand();
+            check.CommandText = "SELECT length(Data) FROM test_payload;";
+            return restored.Sites.Single().Name == "encrypted-probe" && (long)check.ExecuteScalar()! == 3145728;
         }
         finally { directory.Delete(recursive: true); }
     }
