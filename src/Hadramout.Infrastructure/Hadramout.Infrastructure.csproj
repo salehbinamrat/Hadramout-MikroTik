@@ -3,5 +3,6 @@
  <ItemGroup>
   <ProjectReference Include="../Hadramout.Core/Hadramout.Core.csproj"/>
   <PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite"/>
+  <PackageReference Include="System.Security.Cryptography.ProtectedData"/>
  </ItemGroup>
 </Project>

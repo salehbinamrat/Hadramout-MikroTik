@@ -38,7 +38,7 @@ public sealed class DatabaseDurabilityTests
         using var upgraded = DatabaseStore.Open(file.Path);
         using var read = Context(upgraded);
         Assert.Equal(id, read.Sites.Single().Id);
-        Assert.Equal(2L, Scalar(upgraded, "PRAGMA user_version"));
+        Assert.Equal((long)DatabaseStore.CurrentSchemaVersion, Scalar(upgraded, "PRAGMA user_version"));
         Assert.Equal(2L, Scalar(upgraded, """
             SELECT count(*) FROM sqlite_schema WHERE type='index'
             AND name IN ('IX_voucher_batches_BackendId_PlanId','IX_voucher_reservations_BackendId_BatchId')
@@ -122,7 +122,7 @@ public sealed class DatabaseDurabilityTests
         Parallel.For(0, 4, _ =>
         {
             using var c = DatabaseStore.Open(file.Path);
-            Assert.Equal(2L, Scalar(c, "PRAGMA user_version"));
+            Assert.Equal((long)DatabaseStore.CurrentSchemaVersion, Scalar(c, "PRAGMA user_version"));
         });
         using var final = DatabaseStore.Open(file.Path);
         Assert.Equal("ok", Scalar(final, "PRAGMA quick_check"));
@@ -154,9 +154,10 @@ public sealed class DatabaseDurabilityTests
     private static NetworkDbContext Context(SqliteConnection c) =>
         new(new DbContextOptionsBuilder<NetworkDbContext>().UseSqlite(c).Options);
 
-    // Synthetic exact v1 fixture: v2 is solely the two named indexes.
+    // Synthetic v1 fixture: remove the v3 table and both v2 indexes.
     private static void RecreateV1Fixture(SqliteConnection c) =>
         Execute(c, """
+            DROP TABLE router_credentials;
             DROP INDEX IX_voucher_batches_BackendId_PlanId;
             DROP INDEX IX_voucher_reservations_BackendId_BatchId;
             PRAGMA user_version=1;

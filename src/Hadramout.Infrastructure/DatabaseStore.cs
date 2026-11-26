@@ -6,7 +6,7 @@ namespace Hadramout.Infrastructure;
 /// <summary>Opens an owned local database with durable settings and atomic schema upgrades.</summary>
 public static class DatabaseStore
 {
-    public const int CurrentSchemaVersion = 2;
+    public const int CurrentSchemaVersion = 3;
     public const int ApplicationId = 0x484D4B54;
 
     public static SqliteConnection Open(string path)
@@ -74,6 +74,13 @@ public static class DatabaseStore
             Execute(connection, tx, SchemaV2);
             Execute(connection, tx, "PRAGMA user_version=2;");
             version = 2;
+        }
+
+        if (version == 2)
+        {
+            Execute(connection, tx, SchemaV3);
+            Execute(connection, tx, "PRAGMA user_version=3;");
+            version = 3;
         }
 
         if (version != CurrentSchemaVersion)
@@ -149,5 +156,14 @@ public static class DatabaseStore
     private const string SchemaV2 = """
         CREATE INDEX IX_voucher_batches_BackendId_PlanId ON voucher_batches(BackendId, PlanId);
         CREATE INDEX IX_voucher_reservations_BackendId_BatchId ON voucher_reservations(BackendId, BatchId);
+        """;
+
+    // Only encrypted envelopes are stored. No plaintext credential column.
+    private const string SchemaV3 = """
+        CREATE TABLE router_credentials (
+            RouterId TEXT NOT NULL PRIMARY KEY REFERENCES routers(Id) ON DELETE RESTRICT,
+            UsernameEnvelope BLOB NOT NULL CHECK (typeof(UsernameEnvelope)='blob' AND length(UsernameEnvelope)>0),
+            PasswordEnvelope BLOB NOT NULL CHECK (typeof(PasswordEnvelope)='blob' AND length(PasswordEnvelope)>0)
+        );
         """;
 }
