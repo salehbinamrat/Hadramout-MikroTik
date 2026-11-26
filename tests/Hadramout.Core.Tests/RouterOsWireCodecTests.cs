@@ -147,6 +147,140 @@ public sealed class RouterOsWireCodecTests
             await RouterOsWireCodec.ReadSentenceAsync(stream, cts.Token));
     }
 
+    [Fact]
+    public async Task ReplyReaderReturnsRowsOnlyAfterCompletion()
+    {
+        using var stream = new MemoryStream();
+        await ReplyAsync(stream, "!re", "=name=user-manager", "=version=6.49.19");
+        await ReplyAsync(stream, "!re", "=name=system", "=version=6.49.19");
+        await ReplyAsync(stream, "!done");
+        stream.Position = 0;
+        var result = await RouterOsReplyReader.ReadAsync(stream,
+            words => Encoding.ASCII.GetString(words[1]), 2, CancellationToken.None);
+        Assert.Equal(RouterOsReplyOutcome.Completed, result.Outcome);
+        Assert.Equal(new[] { "=name=user-manager", "=name=system" }, result.Rows);
+        Assert.Null(result.TrapCategory);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ReplyReaderRecognizesLegacyAndModernEmptyResults(bool explicitEmpty)
+    {
+        using var stream = new MemoryStream();
+        if (explicitEmpty) await ReplyAsync(stream, "!empty");
+        await ReplyAsync(stream, "!done");
+        stream.Position = 0;
+        var result = await RouterOsReplyReader.ReadAsync(stream, _ => "unexpected", 2, CancellationToken.None);
+        Assert.Equal(RouterOsReplyOutcome.Completed, result.Outcome);
+        Assert.Empty(result.Rows);
+    }
+
+    [Theory]
+    [InlineData("!trap", "=category=2", 2)]
+    [InlineData("!trap", "=category=9", null)]
+    [InlineData("!fatal", "=message=connection-closed", null)]
+    public async Task FailedReplyDiscardsPartialRows(string kind, string attribute, int? category)
+    {
+        using var stream = new MemoryStream();
+        await ReplyAsync(stream, "!re", "=name=partial");
+        await ReplyAsync(stream, kind, attribute);
+        await ReplyAsync(stream, "!done");
+        stream.Position = 0;
+        var result = await RouterOsReplyReader.ReadAsync(stream, _ => "partial", 2, CancellationToken.None);
+        Assert.Equal(kind == "!trap" ? RouterOsReplyOutcome.Rejected : RouterOsReplyOutcome.Fatal, result.Outcome);
+        Assert.Empty(result.Rows);
+        Assert.Equal(category, result.TrapCategory);
+        // The caller must close, not accidentally use the pending completion as another command's reply.
+        Assert.True(stream.Position < stream.Length);
+    }
+
+    [Theory]
+    [InlineData("unknown")]
+    [InlineData("tagged")]
+    [InlineData("duplicate")]
+    [InlineData("invalid-attribute")]
+    [InlineData("done-data")]
+    [InlineData("empty-then-row")]
+    [InlineData("row-then-empty")]
+    [InlineData("double-empty")]
+    [InlineData("row-limit")]
+    [InlineData("bare-row")]
+    [InlineData("zero-frame")]
+    public async Task MalformedReplyCannotBeReportedAsSuccessful(string scenario)
+    {
+        using var stream = new MemoryStream();
+        switch (scenario)
+        {
+            case "unknown": await ReplyAsync(stream, "!other"); break;
+            case "tagged": await ReplyAsync(stream, "!re", ".tag=unrelated", "=name=x"); break;
+            case "duplicate": await ReplyAsync(stream, "!re", "=name=x", "=name=y"); break;
+            case "invalid-attribute": await ReplyAsync(stream, "!re", "=invalid"); break;
+            case "done-data": await ReplyAsync(stream, "!done", "=ret=unexpected"); break;
+            case "empty-then-row": await ReplyAsync(stream, "!empty"); await ReplyAsync(stream, "!re", "=name=x"); break;
+            case "row-then-empty": await ReplyAsync(stream, "!re", "=name=x"); await ReplyAsync(stream, "!empty"); break;
+            case "double-empty": await ReplyAsync(stream, "!empty"); await ReplyAsync(stream, "!empty"); break;
+            case "row-limit": await ReplyAsync(stream, "!re", "=name=x"); await ReplyAsync(stream, "!re", "=name=y"); break;
+            case "bare-row": await ReplyAsync(stream, "!re"); break;
+            case "zero-frame": stream.WriteByte(0); break;
+        }
+        await ReplyAsync(stream, "!done");
+        stream.Position = 0;
+        await Assert.ThrowsAsync<InvalidDataException>(async () =>
+            await RouterOsReplyReader.ReadAsync(stream, _ => "row", 1, CancellationToken.None));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task MissingCompletionIsNeverSuccess(bool explicitEmpty)
+    {
+        using var stream = new MemoryStream();
+        if (explicitEmpty) await ReplyAsync(stream, "!empty");
+        else await ReplyAsync(stream, "!re", "=name=partial");
+        stream.Position = 0;
+        await Assert.ThrowsAsync<EndOfStreamException>(async () =>
+            await RouterOsReplyReader.ReadAsync(stream, _ => "partial", 2, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task AggregateReplyLimitRejectsIndividuallyValidSentences()
+    {
+        using var stream = new MemoryStream();
+        byte[] field = new byte[RouterOsWireCodec.MaxWordBytes];
+        "=name="u8.CopyTo(field);
+        for (int i = 0; i < 16; i++)
+            await RouterOsWireCodec.WriteSentenceAsync(stream,
+                ["!re"u8.ToArray(), field], CancellationToken.None);
+        await ReplyAsync(stream, "!done");
+        stream.Position = 0;
+        await Assert.ThrowsAsync<InvalidDataException>(async () =>
+            await RouterOsReplyReader.ReadAsync(stream, _ => "row", 20, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task RawReplyWordsAreClearedAfterProjection()
+    {
+        using var stream = new MemoryStream();
+        await ReplyAsync(stream, "!re", "=name=synthetic");
+        await ReplyAsync(stream, "!done");
+        stream.Position = 0;
+        byte[][]? captured = null;
+        var result = await RouterOsReplyReader.ReadAsync(stream, words =>
+        {
+            captured = words; // test-only inspection of buffer cleanup
+            return Encoding.ASCII.GetString(words[1]);
+        }, 1, CancellationToken.None);
+        Assert.Equal("=name=synthetic", Assert.Single(result.Rows));
+        Assert.NotNull(captured);
+        Assert.All(captured, word => Assert.All(word, value => Assert.Equal((byte)0, value)));
+    }
+
+    private static ValueTask ReplyAsync(Stream stream, params string[] words) =>
+        RouterOsWireCodec.WriteSentenceAsync(stream,
+            words.Select(word => (ReadOnlyMemory<byte>)Encoding.ASCII.GetBytes(word)).ToArray(),
+            CancellationToken.None);
+
     private sealed class FragmentedStream(byte[] bytes) : MemoryStream(bytes)
     {
         public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default) =>

@@ -189,6 +189,8 @@ public sealed class RouterOsTlsTransportTests(ITestOutputHelper output)
     [InlineData("premature-done")]
     [InlineData("duplicate-version")]
     [InlineData("trap")]
+    [InlineData("fatal")]
+    [InlineData("tagged")]
     [InlineData("missing-version")]
     public async Task InvalidVersionResponseClosesSession(string condition)
     {
@@ -204,6 +206,8 @@ public sealed class RouterOsTlsTransportTests(ITestOutputHelper output)
                 "premature-done" => ["!done"u8.ToArray()],
                 "duplicate-version" => ["!re"u8.ToArray(), "=version=6.49.19"u8.ToArray(), "=version=7.21.1"u8.ToArray()],
                 "trap" => ["!trap"u8.ToArray()],
+                "fatal" => ["!fatal"u8.ToArray(), "=message=connection-closed"u8.ToArray()],
+                "tagged" => ["!re"u8.ToArray(), "=version=6.49.19"u8.ToArray(), ".tag=unknown"u8.ToArray()],
                 _ => ["!re"u8.ToArray(), "=architecture-name=arm"u8.ToArray()]
             };
             await RouterOsWireCodec.WriteSentenceAsync(tls, reply, token);

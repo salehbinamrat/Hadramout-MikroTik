@@ -13,7 +13,8 @@
 - PR #12 merged d3aa740f202d8215c098f675213efa74a6a505df; Core 45864979363 / Release 45864979311 passed on a98ec187d853bb714ecbca35a20dde266b76fc7b; artifact 15139952195. P10h startup hosted checks passed.
 - PR #13 merged 19d8434f8ac02c5cab62fcb2ae34a1c3ab343ea4; Core 45866673293 / Release 45866673320 passed on b9088833b9c0608f3bf313d382019ba2676d4836; artifact 15140203761. P11a wire framing hosted tests passed.
 - PR #14 merged 670159eff9aa38a80084630979fed5fcc74ed466; Core 45868870286 / Release 45868870260 passed on fd116c19bea55274ae52c4f1f95a126a90ca45ba; artifact 15141234833. TLS correction validated in hosted CI.
-- P12a proposed authenticated single-command sessions and first bounded version read; 13 new loopback cases. CI pending. No new external packages.
+- PR #15 merged 33c257ab26b59d132970aaea11ff26ab0b8e360b; Core 45870037068 / Release 45870036901 passed on 94714b4b8e84382badf096aaf3ef8327e6c0487e; artifact 15142257414. P12a hosted tests passed.
+- P12b proposed common bounded read reply model, 21 new stream cases and 2 new TLS session cases; CI pending. No new dependency or live router access.
 - P10 remaining: restore UI and RBAC, managed crash cleanup, real cross-account/device validation, full audit coverage/actor attribution, retention and scheduling. No production restore.
 - P01 deeper per-feature audit; physical Windows, RouterOS, printers; hard-kill, power-loss and disk-full tests pending. main remains unprotected; exact-head manual gate enforced. No production DB or real router changes.
 
