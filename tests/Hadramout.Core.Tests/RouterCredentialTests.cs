@@ -151,7 +151,7 @@ public sealed class RouterCredentialTests
         using (var c = DatabaseStore.Open(f.Path))
         using (var cmd = c.CreateCommand())
         {
-            cmd.CommandText = "DROP TABLE router_credentials; PRAGMA user_version=2;";
+            cmd.CommandText = "DROP TABLE audit_events; DROP TABLE router_credentials; PRAGMA user_version=2;";
             cmd.ExecuteNonQuery();
         }
         var store = new RouterCredentialStore(f.Path);

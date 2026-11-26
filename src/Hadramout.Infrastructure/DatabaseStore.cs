@@ -6,7 +6,7 @@ namespace Hadramout.Infrastructure;
 /// <summary>Opens an owned local database with durable settings and atomic schema upgrades.</summary>
 public static class DatabaseStore
 {
-    public const int CurrentSchemaVersion = 3;
+    public const int CurrentSchemaVersion = 4;
     public const int ApplicationId = 0x484D4B54;
 
     public static SqliteConnection Open(string path)
@@ -81,6 +81,13 @@ public static class DatabaseStore
             Execute(connection, tx, SchemaV3);
             Execute(connection, tx, "PRAGMA user_version=3;");
             version = 3;
+        }
+
+        if (version == 3)
+        {
+            Execute(connection, tx, SchemaV4);
+            Execute(connection, tx, "PRAGMA user_version=4;");
+            version = 4;
         }
 
         if (version != CurrentSchemaVersion)
@@ -165,5 +172,21 @@ public static class DatabaseStore
             UsernameEnvelope BLOB NOT NULL CHECK (typeof(UsernameEnvelope)='blob' AND length(UsernameEnvelope)>0),
             PasswordEnvelope BLOB NOT NULL CHECK (typeof(PasswordEnvelope)='blob' AND length(PasswordEnvelope)>0)
         );
+        """;
+
+    private const string SchemaV4 = """
+        CREATE TABLE audit_events (
+            Id TEXT NOT NULL PRIMARY KEY,
+            OccurredUtc TEXT NOT NULL,
+            Kind INTEGER NOT NULL CHECK (Kind IN (1,2,3,4)),
+            SubjectId TEXT,
+            CHECK ((Kind IN (1,2) AND SubjectId IS NOT NULL)
+                OR (Kind IN (3,4) AND SubjectId IS NULL))
+        );
+        CREATE INDEX IX_audit_events_OccurredUtc ON audit_events(OccurredUtc, Id);
+        CREATE TRIGGER audit_no_update BEFORE UPDATE ON audit_events
+            BEGIN SELECT RAISE(ABORT, 'Audit events are append-only'); END;
+        CREATE TRIGGER audit_no_delete BEFORE DELETE ON audit_events
+            BEGIN SELECT RAISE(ABORT, 'Audit events are append-only'); END;
         """;
 }

@@ -43,7 +43,9 @@ public sealed class RouterCredentialStore(string databasePath)
         byte[] userEnvelope = RouterCredentialProtector.Protect(routerId, "username", username);
         byte[] passEnvelope = RouterCredentialProtector.Protect(routerId, "password", password);
         using var connection = DatabaseStore.Open(databasePath);
+        using var tx = connection.BeginTransaction(deferred: false);
         using var cmd = connection.CreateCommand();
+        cmd.Transaction = tx;
         cmd.CommandText = """
             INSERT INTO router_credentials(RouterId, UsernameEnvelope, PasswordEnvelope)
             VALUES($id, $username, $password)
@@ -54,6 +56,8 @@ public sealed class RouterCredentialStore(string databasePath)
         cmd.Parameters.Add("$username", SqliteType.Blob).Value = userEnvelope;
         cmd.Parameters.Add("$password", SqliteType.Blob).Value = passEnvelope;
         cmd.ExecuteNonQuery();
+        AuditStore.Append(connection, tx, AuditKind.CredentialSaved, routerId);
+        tx.Commit();
     }
 
     public RouterCredentialLease? Load(Guid routerId)
@@ -82,10 +86,15 @@ public sealed class RouterCredentialStore(string databasePath)
     {
         ValidateId(routerId);
         using var connection = DatabaseStore.Open(databasePath);
+        using var tx = connection.BeginTransaction(deferred: false);
         using var cmd = connection.CreateCommand();
+        cmd.Transaction = tx;
         cmd.CommandText = "DELETE FROM router_credentials WHERE RouterId=$id;";
         cmd.Parameters.AddWithValue("$id", routerId);
-        return cmd.ExecuteNonQuery() == 1;
+        bool removed = cmd.ExecuteNonQuery() == 1;
+        if (removed) AuditStore.Append(connection, tx, AuditKind.CredentialRemoved, routerId);
+        tx.Commit();
+        return removed;
     }
 
     private static void ValidateId(Guid id)
