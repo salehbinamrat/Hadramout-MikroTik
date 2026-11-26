@@ -479,6 +479,29 @@ public sealed class RouterOsWireCodecTests
         Assert.Equal(ulong.MaxValue, new UserManager6Usage(maximum, zero, null).ObservedTransferBytes);
     }
 
+    [Theory]
+    [InlineData("")]
+    [InlineData(" quota")]
+    [InlineData("quota ")]
+    public void Um6ProfileLinkRejectsMalformedLimitationIdentity(string limitation)
+    {
+        Assert.Throws<InvalidDataException>(() => UserManager6Records.ParseProfileLink(
+            ["!re"u8.ToArray(), "=profile=day"u8.ToArray(), Encoding.UTF8.GetBytes("=limitation=" + limitation)], "day"));
+    }
+
+    [Fact]
+    public async Task Um6ProfileMappingRejectsMoreThanThirtyTwoRows()
+    {
+        using var stream = new MemoryStream();
+        for (int i = 0; i < 33; i++)
+            await ReplyAsync(stream, "!re", "=profile=day", "=limitation=quota");
+        await ReplyAsync(stream, "!done");
+        stream.Position = 0;
+        await Assert.ThrowsAsync<InvalidDataException>(async () =>
+            await RouterOsReplyReader.ReadAsync(stream, words => UserManager6Records.ParseProfileLink(words, "day"),
+                32, CancellationToken.None));
+    }
+
     private sealed class FragmentedStream(byte[] bytes) : MemoryStream(bytes)
     {
         public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default) =>
