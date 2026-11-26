@@ -469,6 +469,170 @@ public sealed class RouterOsTlsTransportTests(ITestOutputHelper output)
         finally { await serve; }
     }
 
+    [Fact]
+    public async Task ReadRecoveryDiscardsIncompleteVersionAndUsesNewAuthenticatedSession()
+    {
+        using var certificates = new Certificates();
+        using var server = new LoopbackServer(certificates.Leaf, certificates.Root, output);
+        Task serve = ServeRecoveryAsync();
+        async Task ServeRecoveryAsync()
+        {
+            await server.RunAsync(reply: true, handler: async (tls, token) =>
+            {
+                await AssertLoginAsync(tls, token);
+                await RouterOsWireCodec.WriteSentenceAsync(tls, ["!done"u8.ToArray()], token);
+                await AssertVersionRequestAsync(tls, token);
+                await RouterOsWireCodec.WriteSentenceAsync(tls,
+                    ["!re"u8.ToArray(), "=version=6.49.19"u8.ToArray()], token);
+                // Graceful TLS shutdown before !done produces EOF at the frame reader.
+                await tls.ShutdownAsync();
+            });
+            await server.RunAsync(reply: true, handler: async (tls, token) =>
+            {
+                await PrepareProbePeerAsync(tls, token, "7.21.1");
+            });
+        }
+        try
+        {
+            string version = await RouterOsReadRecovery.ReadVersionAsync("127.0.0.1", "router.test",
+                "synthetic-user"u8.ToArray(), "synthetic-private-password"u8.ToArray(), server.Port,
+                trustedRootDer: certificates.Root.RawData);
+            Assert.Equal("7.21.1", version);
+        }
+        finally { await serve; }
+        Assert.False(server.HasPendingConnection);
+    }
+
+    [Fact]
+    public async Task RecoveryStopsAfterSecondIncompleteRead()
+    {
+        using var certificates = new Certificates();
+        using var server = new LoopbackServer(certificates.Leaf, certificates.Root, output);
+        Task serve = ServeTwiceAsync();
+        async Task ServeTwiceAsync()
+        {
+            for (int i = 0; i < 2; i++)
+                await server.RunAsync(reply: true, handler: async (tls, token) =>
+                {
+                    await AssertLoginAsync(tls, token);
+                    await RouterOsWireCodec.WriteSentenceAsync(tls, ["!done"u8.ToArray()], token);
+                    await AssertVersionRequestAsync(tls, token);
+                    await tls.ShutdownAsync();
+                });
+        }
+        try
+        {
+            await Assert.ThrowsAsync<EndOfStreamException>(() =>
+                RouterOsReadRecovery.ReadVersionAsync("127.0.0.1", "router.test",
+                    "synthetic-user"u8.ToArray(), "synthetic-private-password"u8.ToArray(), server.Port,
+                    trustedRootDer: certificates.Root.RawData));
+        }
+        finally { await serve; }
+        Assert.False(server.HasPendingConnection);
+    }
+
+    [Theory]
+    [InlineData("login")]
+    [InlineData("trap")]
+    [InlineData("malformed")]
+    public async Task RecoveryNeverRetriesAuthenticationOrProtocolRejection(string condition)
+    {
+        using var certificates = new Certificates();
+        using var server = new LoopbackServer(certificates.Leaf, certificates.Root, output);
+        Task serve = server.RunAsync(reply: true, handler: async (tls, token) =>
+        {
+            await AssertLoginAsync(tls, token);
+            if (condition == "login")
+            {
+                await RouterOsWireCodec.WriteSentenceAsync(tls, ["!trap"u8.ToArray()], token);
+                return;
+            }
+            await RouterOsWireCodec.WriteSentenceAsync(tls, ["!done"u8.ToArray()], token);
+            await AssertVersionRequestAsync(tls, token);
+            await RouterOsWireCodec.WriteSentenceAsync(tls,
+                [Encoding.ASCII.GetBytes(condition == "trap" ? "!trap" : "!unknown")], token);
+        });
+        try
+        {
+            Task<string> read = RouterOsReadRecovery.ReadVersionAsync("127.0.0.1", "router.test",
+                "synthetic-user"u8.ToArray(), "synthetic-private-password"u8.ToArray(), server.Port,
+                trustedRootDer: certificates.Root.RawData);
+            if (condition == "login")
+                await Assert.ThrowsAsync<AuthenticationException>(() => read);
+            else
+                await Assert.ThrowsAsync<InvalidDataException>(() => read);
+        }
+        finally { await serve; }
+        Assert.False(server.HasPendingConnection);
+    }
+
+    [Fact]
+    public async Task RecoveryDeadlineDoesNotStartAnotherConnection()
+    {
+        using var certificates = new Certificates();
+        using var server = new LoopbackServer(certificates.Leaf, certificates.Root, output);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        Task serve = server.RunAsync(reply: true, handler: async (tls, token) =>
+        {
+            await AssertLoginAsync(tls, token);
+            await RouterOsWireCodec.WriteSentenceAsync(tls, ["!done"u8.ToArray()], token);
+            await AssertVersionRequestAsync(tls, token);
+            await release.Task.WaitAsync(token);
+        });
+        try
+        {
+            await Assert.ThrowsAsync<TimeoutException>(() =>
+                RouterOsReadRecovery.ReadVersionAsync("127.0.0.1", "router.test",
+                    "synthetic-user"u8.ToArray(), "synthetic-private-password"u8.ToArray(), server.Port,
+                    timeout: TimeSpan.FromSeconds(4), trustedRootDer: certificates.Root.RawData));
+        }
+        finally
+        {
+            release.TrySetResult();
+            await serve;
+        }
+        Assert.False(server.HasPendingConnection);
+    }
+
+    [Fact]
+    public async Task PrecancelledRecoveryNeverConnects()
+    {
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            RouterOsReadRecovery.ReadVersionAsync("127.0.0.1", "router.test",
+                "synthetic-user"u8.ToArray(), "synthetic-private-password"u8.ToArray(),
+                ((IPEndPoint)listener.LocalEndpoint).Port, cancellationToken: cts.Token));
+        Assert.False(listener.Pending());
+    }
+
+    [Theory]
+    [InlineData(SocketError.ConnectionReset, true)]
+    [InlineData(SocketError.ConnectionAborted, true)]
+    [InlineData(SocketError.NetworkReset, true)]
+    [InlineData(SocketError.Shutdown, true)]
+    [InlineData(SocketError.ConnectionRefused, false)]
+    [InlineData(SocketError.TimedOut, false)]
+    [InlineData(SocketError.AccessDenied, false)]
+    public void RecoveryClassifiesOnlyExplicitTransientSocketDisconnects(SocketError code, bool expected)
+    {
+        var socket = new SocketException((int)code);
+        Assert.Equal(expected, RouterOsReadRecovery.IsTransientReadDisconnect(socket));
+        Assert.Equal(expected, RouterOsReadRecovery.IsTransientReadDisconnect(new IOException("transport", socket)));
+    }
+
+    [Fact]
+    public void RecoveryDoesNotTreatGenericIoOrSecurityFailuresAsTransient()
+    {
+        Assert.True(RouterOsReadRecovery.IsTransientReadDisconnect(new EndOfStreamException()));
+        Assert.False(RouterOsReadRecovery.IsTransientReadDisconnect(new IOException("ambiguous TLS failure")));
+        Assert.False(RouterOsReadRecovery.IsTransientReadDisconnect(new AuthenticationException()));
+        Assert.False(RouterOsReadRecovery.IsTransientReadDisconnect(new InvalidDataException()));
+        Assert.False(RouterOsReadRecovery.IsTransientReadDisconnect(new TimeoutException()));
+    }
+
     private static async Task PrepareProbePeerAsync(SslStream tls, CancellationToken token, string version)
     {
         await AssertLoginAsync(tls, token);
@@ -568,6 +732,7 @@ public sealed class RouterOsTlsTransportTests(ITestOutputHelper output)
         private readonly ITestOutputHelper output;
         private readonly CancellationTokenSource deadline = new(TimeSpan.FromSeconds(20));
         public int Port => ((IPEndPoint)listener.LocalEndpoint).Port;
+        public bool HasPendingConnection => listener.Pending();
 
         public LoopbackServer(X509Certificate2 certificate, X509Certificate2 root, ITestOutputHelper output)
         {
