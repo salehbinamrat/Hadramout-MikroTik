@@ -1,3 +1,5 @@
+using System.Globalization;
+using System.Net;
 using System.Net.Sockets;
 using Hadramout.Core;
 
@@ -7,6 +9,7 @@ namespace Hadramout.Infrastructure;
 // Never replay an authentication failure, protocol failure or mutation.
 internal static class RouterOsReadRecovery
 {
+    private static readonly RouterOsReadAdmission Admission = new(8);
     private static readonly TimeSpan RetryDelay = TimeSpan.FromMilliseconds(250);
 
     internal static Task<string> ReadVersionAsync(string host, string certificateName,
@@ -42,6 +45,8 @@ internal static class RouterOsReadRecovery
         if (limit <= TimeSpan.Zero || limit > TimeSpan.FromMinutes(2))
             throw new ArgumentOutOfRangeException(nameof(timeout));
         cancellationToken.ThrowIfCancellationRequested();
+        // Hold admission across the complete operation, including reconnect and delay.
+        using var admission = Admission.Acquire(host, port, cancellationToken);
         using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         deadline.CancelAfter(limit);
         try
@@ -90,5 +95,62 @@ internal static class RouterOsReadRecovery
         };
         return socket?.SocketErrorCode is SocketError.ConnectionReset or SocketError.ConnectionAborted
             or SocketError.NetworkReset or SocketError.Shutdown;
+    }
+}
+
+internal enum RouterOsReadBusyReason { EndpointBusy, CapacityReached }
+
+internal sealed class RouterOsReadBusyException(RouterOsReadBusyReason reason)
+    : InvalidOperationException("RouterOS read admission limit reached.")
+{
+    internal RouterOsReadBusyReason Reason { get; } = reason;
+}
+
+// No queued waiters, no unbounded per-router state. A lease covers one complete
+// logical read and its possible reconnect. Host aliases are not resolved here.
+internal sealed class RouterOsReadAdmission(int capacity)
+{
+    private readonly int limit = capacity is >= 1 and <= 64 ? capacity :
+        throw new ArgumentOutOfRangeException(nameof(capacity));
+    private readonly object sync = new();
+    private readonly HashSet<(string Host, int Port)> active = [];
+
+    internal IDisposable Acquire(string host, int port, CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        if (port is < 1 or > 65535) throw new ArgumentOutOfRangeException(nameof(port));
+        var key = (NormalizeHost(host), port);
+        lock (sync)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (active.Contains(key))
+                throw new RouterOsReadBusyException(RouterOsReadBusyReason.EndpointBusy);
+            if (active.Count >= limit)
+                throw new RouterOsReadBusyException(RouterOsReadBusyReason.CapacityReached);
+            var lease = new Lease(this, key);
+            active.Add(key);
+            return lease;
+        }
+    }
+
+    private static string NormalizeHost(string host)
+    {
+        if (string.IsNullOrWhiteSpace(host) || host != host.Trim() ||
+            Uri.CheckHostName(host) == UriHostNameType.Unknown)
+            throw new ArgumentException("A DNS name or IP address is required.", nameof(host));
+        if (IPAddress.TryParse(host, out var address))
+            return (address.IsIPv4MappedToIPv6 ? address.MapToIPv4() : address).ToString();
+        return new IdnMapping().GetAscii(host.TrimEnd('.')).ToLowerInvariant();
+    }
+
+    private void Release((string Host, int Port) key)
+    {
+        lock (sync) active.Remove(key);
+    }
+
+    private sealed class Lease(RouterOsReadAdmission owner, (string Host, int Port) key) : IDisposable
+    {
+        private RouterOsReadAdmission? admission = owner;
+        public void Dispose() => Interlocked.Exchange(ref admission, null)?.Release(key);
     }
 }

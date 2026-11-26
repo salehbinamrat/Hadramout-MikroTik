@@ -633,6 +633,125 @@ public sealed class RouterOsTlsTransportTests(ITestOutputHelper output)
         Assert.False(RouterOsReadRecovery.IsTransientReadDisconnect(new TimeoutException()));
     }
 
+    [Fact]
+    public void AdmissionLimitsConcurrentEndpointsWithoutQueuing()
+    {
+        var admission = new RouterOsReadAdmission(2);
+        using var first = admission.Acquire("router-a.test", 8729);
+        using var second = admission.Acquire("router-b.test", 8729);
+        var busy = Assert.Throws<RouterOsReadBusyException>(() => admission.Acquire("router-c.test", 8729));
+        Assert.Equal(RouterOsReadBusyReason.CapacityReached, busy.Reason);
+        first.Dispose();
+        using var third = admission.Acquire("router-c.test", 8729);
+    }
+
+    [Theory]
+    [InlineData("Router.TEST", "router.test.")]
+    [InlineData("127.0.0.1", "::ffff:127.0.0.1")]
+    [InlineData("2001:db8::1", "2001:0db8:0:0:0:0:0:1")]
+    public void AdmissionNormalizesEquivalentEndpointSpellings(string firstHost, string secondHost)
+    {
+        var admission = new RouterOsReadAdmission(2);
+        using var first = admission.Acquire(firstHost, 8729);
+        var busy = Assert.Throws<RouterOsReadBusyException>(() => admission.Acquire(secondHost, 8729));
+        Assert.Equal(RouterOsReadBusyReason.EndpointBusy, busy.Reason);
+        using var differentPort = admission.Acquire(secondHost, 9872);
+    }
+
+    [Fact]
+    public void DisposingOldLeaseAgainCannotReleaseNewLease()
+    {
+        var admission = new RouterOsReadAdmission(1);
+        using var first = admission.Acquire("router.test", 8729);
+        first.Dispose();
+        using var second = admission.Acquire("router.test", 8729);
+        first.Dispose();
+        var busy = Assert.Throws<RouterOsReadBusyException>(() => admission.Acquire("router.test", 8729));
+        Assert.Equal(RouterOsReadBusyReason.EndpointBusy, busy.Reason);
+    }
+
+    [Fact]
+    public void PrecancelledAdmissionDoesNotConsumeCapacity()
+    {
+        var admission = new RouterOsReadAdmission(1);
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+        Assert.ThrowsAny<OperationCanceledException>(() => admission.Acquire("router.test", 8729, cancellation.Token));
+        using var lease = admission.Acquire("router.test", 8729);
+    }
+
+    [Fact]
+    public void ParallelAdmissionAllowsExactlyOneLeaseForEndpoint()
+    {
+        var admission = new RouterOsReadAdmission(8);
+        var leases = new System.Collections.Concurrent.ConcurrentBag<IDisposable>();
+        int rejected = 0;
+        try
+        {
+            Parallel.For(0, 16, _ =>
+            {
+                try { leases.Add(admission.Acquire("router.test", 8729)); }
+                catch (RouterOsReadBusyException ex) when (ex.Reason == RouterOsReadBusyReason.EndpointBusy)
+                { Interlocked.Increment(ref rejected); }
+            });
+            Assert.Single(leases);
+            Assert.Equal(15, rejected);
+        }
+        finally
+        {
+            foreach (var lease in leases) lease.Dispose();
+        }
+        using var next = admission.Acquire("router.test", 8729);
+    }
+
+    [Fact]
+    public async Task BusyRecoveryDoesNotOpenSecondConnectionAndCancellationReleasesAdmission()
+    {
+        using var certificates = new Certificates();
+        using var server = new LoopbackServer(certificates.Leaf, certificates.Root, output);
+        var reached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var cancellation = new CancellationTokenSource();
+        Task serve = server.RunAsync(reply: true, handler: async (tls, token) =>
+        {
+            await AssertLoginAsync(tls, token);
+            await RouterOsWireCodec.WriteSentenceAsync(tls, ["!done"u8.ToArray()], token);
+            await AssertVersionRequestAsync(tls, token);
+            reached.SetResult();
+            await release.Task.WaitAsync(token);
+        });
+        Task<string> first = RouterOsReadRecovery.ReadVersionAsync("127.0.0.1", "router.test",
+            "synthetic-user"u8.ToArray(), "synthetic-private-password"u8.ToArray(), server.Port,
+            trustedRootDer: certificates.Root.RawData, cancellationToken: cancellation.Token);
+        try
+        {
+            await reached.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            // Different certificate identity/credentials must not bypass the endpoint limit.
+            var busy = await Assert.ThrowsAsync<RouterOsReadBusyException>(() =>
+                RouterOsReadRecovery.ReadVersionAsync("127.0.0.1", "different.test",
+                    "other-user"u8.ToArray(), "other-password"u8.ToArray(), server.Port,
+                    trustedRootDer: certificates.Root.RawData));
+            Assert.Equal(RouterOsReadBusyReason.EndpointBusy, busy.Reason);
+            Assert.False(server.HasPendingConnection);
+        }
+        finally
+        {
+            cancellation.Cancel();
+            release.TrySetResult();
+            try { await Assert.ThrowsAnyAsync<OperationCanceledException>(() => first); }
+            finally { await serve; }
+        }
+
+        Task next = server.RunAsync(reply: true, handler: (tls, token) => PrepareProbePeerAsync(tls, token, "6.49.19"));
+        try
+        {
+            Assert.Equal("6.49.19", await RouterOsReadRecovery.ReadVersionAsync("127.0.0.1", "router.test",
+                "synthetic-user"u8.ToArray(), "synthetic-private-password"u8.ToArray(), server.Port,
+                trustedRootDer: certificates.Root.RawData));
+        }
+        finally { await next; }
+    }
+
     private static async Task PrepareProbePeerAsync(SslStream tls, CancellationToken token, string version)
     {
         await AssertLoginAsync(tls, token);
