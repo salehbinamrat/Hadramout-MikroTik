@@ -1,3 +1,4 @@
+using System.Runtime.Versioning;
 using Hadramout.Core;
 using Microsoft.EntityFrameworkCore;
 
@@ -31,5 +32,30 @@ public static class DatabaseProbe
         {
             directory.Delete(recursive: true);
         }
+    }
+
+    [SupportedOSPlatform("windows")]
+    public static bool VerifyManagedStartup()
+    {
+        var directory = Directory.CreateTempSubdirectory("hadramout-managed-startup-");
+        try
+        {
+            Guid id;
+            using (var session = ManagedDatabase.OpenApplicationSessionAt(directory.FullName))
+            {
+                id = session.Generation;
+                using var c = DatabaseStore.OpenExisting(session.DatabasePath);
+                using var db = new NetworkDbContext(new DbContextOptionsBuilder<NetworkDbContext>()
+                    .UseSqlite(c).Options);
+                db.Sites.Add(new Site { Name = "managed-startup-probe" });
+                db.SaveChanges();
+            }
+            using var reopened = ManagedDatabase.OpenApplicationSessionAt(directory.FullName);
+            using var connection = DatabaseStore.OpenExisting(reopened.DatabasePath);
+            using var read = new NetworkDbContext(new DbContextOptionsBuilder<NetworkDbContext>()
+                .UseSqlite(connection).Options);
+            return id == reopened.Generation && read.Sites.Single().Name == "managed-startup-probe";
+        }
+        finally { directory.Delete(recursive: true); }
     }
 }

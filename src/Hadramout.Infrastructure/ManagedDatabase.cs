@@ -41,6 +41,30 @@ public static class ManagedDatabase
     private const string PointerName = "active-generation";
     private const string GateName = "database-session.lock";
 
+    public static ManagedDatabaseSession OpenApplicationSession()
+    {
+        string parent = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        if (string.IsNullOrWhiteSpace(parent))
+            throw new InvalidOperationException("Local application data directory is unavailable.");
+        return OpenApplicationSessionAt(parent);
+    }
+
+    // Also used by isolated startup tests; production uses the Windows known folder.
+    internal static ManagedDatabaseSession OpenApplicationSessionAt(string parent)
+    {
+        parent = ValidateRoot(parent);
+        string volume = Path.GetPathRoot(parent) ?? throw new IOException("Managed storage volume is unavailable.");
+        if (new DriveInfo(volume).DriveType != DriveType.Fixed)
+            throw new IOException("Managed storage requires a local fixed drive.");
+        for (DirectoryInfo? directory = new DirectoryInfo(parent); directory is not null; directory = directory.Parent)
+            if ((directory.Attributes & FileAttributes.ReparsePoint) != 0)
+                throw new IOException("Managed storage must not traverse a reparse point.");
+
+        string root = Path.Combine(parent, "HadramoutMikroTik.Data");
+        DatabaseBackup.EnsurePrivateWindowsDirectory(root);
+        return OpenSession(root);
+    }
+
     public static ManagedDatabaseSession OpenSession(string root)
     {
         root = ValidateRoot(root);
@@ -74,6 +98,8 @@ public static class ManagedDatabase
             RequireRegularFile(active);
             using (var c = DatabaseBackup.OpenRaw(active, Microsoft.Data.Sqlite.SqliteOpenMode.ReadOnly))
                 DatabaseBackup.RequireIdentity(c);
+            using (var c = DatabaseStore.OpenExisting(active))
+                DatabaseBackup.ValidateConnection(c, fullIntegrityCheck: false);
             return new ManagedDatabaseSession(gate, id, active);
         }
         catch
