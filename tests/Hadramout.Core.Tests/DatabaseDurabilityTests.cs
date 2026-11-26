@@ -322,7 +322,7 @@ public sealed class DatabaseDurabilityTests
         using (var c = DatabaseStore.Open(file.Path))
             RecreateLegacyFixture(c, 4);
         using var upgraded = DatabaseStore.OpenExisting(file.Path);
-        Assert.Equal(5L, Scalar(upgraded, "PRAGMA user_version;"));
+        Assert.Equal((long)DatabaseStore.CurrentSchemaVersion, Scalar(upgraded, "PRAGMA user_version;"));
         Assert.Equal(1L, Scalar(upgraded, "SELECT count(*) FROM voucher_reservations;"));
         Assert.Equal(0L, Scalar(upgraded, "SELECT count(*) FROM um6_create_journal;"));
         Assert.Equal("001", new UserManager6CreateJournal(file.Path).Prepare(id, "admin").Username);
@@ -453,6 +453,94 @@ public sealed class DatabaseDurabilityTests
         Assert.Equal(new UserManager6CreationCounts(0, 0, 0, 0), journal.ReadCounts(Guid.NewGuid()));
     }
 
+    [Fact]
+    public void RouterTargetEnrollmentIsImmutableAndScoped()
+    {
+        using var file = new TestFile();
+        SeedReservation(file.Path, BackendKind.UserManager6);
+        Guid router;
+        Guid other;
+        using (var c = DatabaseStore.OpenExisting(file.Path))
+        using (var db = Context(c))
+        {
+            router = db.Routers.Single().Id;
+            var second = new Router { SiteId = db.Sites.Single().Id, Name = "other" };
+            db.Routers.Add(second);
+            db.SaveChanges();
+            other = second.Id;
+        }
+        using var ca = CreateEnrollmentCa();
+        byte[] root = ca.RawData;
+        var store = new RouterTargetStore(file.Path);
+        Assert.Null(store.Read(router));
+        string pin = new('a', 64);
+        store.Enroll(router, "Router.TEST.", 8729, "ROUTER.TEST", pin, root);
+        var target = store.Read(router);
+        Assert.NotNull(target);
+        Assert.Equal("router.test", target.Host);
+        Assert.Equal("router.test", target.CertificateName);
+        Assert.Equal(pin.ToUpperInvariant(), target.LeafSha256);
+        Assert.Equal(root, target.TrustedRootDer);
+        Assert.Throws<SqliteException>(() => store.Enroll(router, "different.test", 8729, "router.test", pin, root));
+        Assert.Throws<SqliteException>(() => store.Enroll(other, "different.test", 8729, "different.test", pin, root));
+        Assert.Throws<SqliteException>(() => store.Enroll(other, "router.test", 8729, "different.test", new string('b',64), root));
+        Assert.Throws<SqliteException>(() => store.Enroll(Guid.NewGuid(), "new.test", 8729, "new.test", new string('c',64), root));
+        using var dbConnection = DatabaseStore.OpenExisting(file.Path);
+        Assert.Throws<SqliteException>(() => Execute(dbConnection, "UPDATE router_targets SET Port=8730;"));
+        Assert.Throws<SqliteException>(() => Execute(dbConnection, "DELETE FROM router_targets;"));
+        Assert.Throws<SqliteException>(() => Execute(dbConnection, "INSERT OR REPLACE INTO router_targets SELECT * FROM router_targets;"));
+        Assert.Null(store.Read(other));
+    }
+
+    [Theory]
+    [InlineData("bad-host")]
+    [InlineData("bad-port")]
+    [InlineData("bad-pin")]
+    [InlineData("empty-root")]
+    public void RouterTargetRejectsInvalidEnrollment(string condition)
+    {
+        using var file = new TestFile();
+        SeedReservation(file.Path, BackendKind.UserManager6);
+        using var c = DatabaseStore.OpenExisting(file.Path);
+        using var db = Context(c);
+        Guid id = db.Routers.Single().Id;
+        using var ca = CreateEnrollmentCa();
+        var store = new RouterTargetStore(file.Path);
+        Assert.ThrowsAny<ArgumentException>(() => store.Enroll(id,
+            condition == "bad-host" ? "https://router.test" : "router.test",
+            condition == "bad-port" ? 0 : 8729, "router.test",
+            condition == "bad-pin" ? "invalid" : new string('a', 64),
+            condition == "empty-root" ? [] : ca.RawData));
+        Assert.Null(store.Read(id));
+    }
+
+    [Fact]
+    public void RouterTargetRestoreRequiresIdenticalTrustRecords()
+    {
+        using var file = new TestFile();
+        using var candidate = new TestFile();
+        SeedReservation(file.Path, BackendKind.UserManager6);
+        Guid id;
+        using (var c = DatabaseStore.OpenExisting(file.Path))
+        using (var db = Context(c)) id = db.Routers.Single().Id;
+        DatabaseBackup.Create(file.Path, candidate.Path);
+        using var ca = CreateEnrollmentCa();
+        new RouterTargetStore(file.Path).Enroll(id, "router.test", 8729, "router.test", new string('a',64), ca.RawData);
+        Assert.Throws<InvalidOperationException>(() => RouterTargetStore.RequireEquivalentForRestore(file.Path, candidate.Path));
+        new RouterTargetStore(candidate.Path).Enroll(id, "router.test", 8729, "router.test", new string('a',64), ca.RawData);
+        RouterTargetStore.RequireEquivalentForRestore(file.Path, candidate.Path);
+    }
+
+    private static System.Security.Cryptography.X509Certificates.X509Certificate2 CreateEnrollmentCa()
+    {
+        using var key = System.Security.Cryptography.RSA.Create(2048);
+        var request = new System.Security.Cryptography.X509Certificates.CertificateRequest("CN=Enrollment test CA",
+            key, System.Security.Cryptography.HashAlgorithmName.SHA256, System.Security.Cryptography.RSASignaturePadding.Pkcs1);
+        request.CertificateExtensions.Add(new System.Security.Cryptography.X509Certificates.X509BasicConstraintsExtension(true,false,0,true));
+        using var issued = request.CreateSelfSigned(DateTimeOffset.UtcNow.AddDays(-1), DateTimeOffset.UtcNow.AddDays(1));
+        return System.Security.Cryptography.X509Certificates.X509CertificateLoader.LoadCertificate(issued.RawData);
+    }
+
     internal static Guid SeedReservation(string path, BackendKind kind)
     {
         using var c = DatabaseStore.Open(path);
@@ -475,13 +563,14 @@ public sealed class DatabaseDurabilityTests
     // guard in sync with new migrations; never silently leave a newer table behind.
     internal static void RecreateLegacyFixture(SqliteConnection c, int version)
     {
-        if (version is < 1 or > 4) throw new ArgumentOutOfRangeException(nameof(version));
-        Assert.Equal(5, DatabaseStore.CurrentSchemaVersion);
-        Assert.Equal(5L, Scalar(c, "PRAGMA user_version;"));
+        if (version is < 1 or > 5) throw new ArgumentOutOfRangeException(nameof(version));
+        Assert.Equal(6, DatabaseStore.CurrentSchemaVersion);
+        Assert.Equal(6L, Scalar(c, "PRAGMA user_version;"));
         using var tx = c.BeginTransaction(deferred: false);
         using var cmd = c.CreateCommand();
         cmd.Transaction = tx;
-        cmd.CommandText = "DROP TABLE um6_create_journal;";
+        cmd.CommandText = "DROP TABLE router_targets;";
+        if (version < 5) cmd.CommandText += " DROP TABLE um6_create_journal;";
         if (version < 4) cmd.CommandText += " DROP TABLE audit_events;";
         if (version < 3) cmd.CommandText += " DROP TABLE router_credentials;";
         if (version < 2) cmd.CommandText +=
@@ -492,7 +581,7 @@ public sealed class DatabaseDurabilityTests
 
         cmd.Transaction = null;
         cmd.CommandText = "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%';";
-        Assert.Equal(version >= 4 ? 8L : version == 3 ? 7L : 6L, (long)cmd.ExecuteScalar()!);
+        Assert.Equal(version == 5 ? 9L : version == 4 ? 8L : version == 3 ? 7L : 6L, (long)cmd.ExecuteScalar()!);
         Assert.Equal((long)version, Scalar(c, "PRAGMA user_version;"));
     }
 
@@ -501,6 +590,7 @@ public sealed class DatabaseDurabilityTests
     [InlineData(2)]
     [InlineData(3)]
     [InlineData(4)]
+    [InlineData(5)]
     public void EveryLegacyFixtureHasOnlyItsOwnSchemaAndUpgrades(int version)
     {
         using var file = new TestFile();

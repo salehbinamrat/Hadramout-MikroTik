@@ -181,7 +181,7 @@ internal sealed class RouterOsReadAdmission(int capacity)
         }
     }
 
-    private static string NormalizeHost(string host)
+    internal static string NormalizeHost(string host)
     {
         if (string.IsNullOrWhiteSpace(host) || host != host.Trim() ||
             Uri.CheckHostName(host) == UriHostNameType.Unknown)

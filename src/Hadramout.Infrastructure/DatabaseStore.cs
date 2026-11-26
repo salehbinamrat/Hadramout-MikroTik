@@ -6,7 +6,7 @@ namespace Hadramout.Infrastructure;
 /// <summary>Opens an owned local database with durable settings and atomic schema upgrades.</summary>
 public static class DatabaseStore
 {
-    public const int CurrentSchemaVersion = 5;
+    public const int CurrentSchemaVersion = 6;
     public const int ApplicationId = 0x484D4B54;
 
     public static SqliteConnection Open(string path) => OpenCore(path, SqliteOpenMode.ReadWriteCreate);
@@ -100,6 +100,13 @@ public static class DatabaseStore
             Execute(connection, tx, SchemaV5);
             Execute(connection, tx, "PRAGMA user_version=5;");
             version = 5;
+        }
+
+        if (version == 5)
+        {
+            Execute(connection, tx, SchemaV6);
+            Execute(connection, tx, "PRAGMA user_version=6;");
+            version = 6;
         }
 
         if (version != CurrentSchemaVersion)
@@ -227,5 +234,22 @@ public static class DatabaseStore
         BEGIN SELECT RAISE(ABORT,'Invalid UM6 creation transition'); END;
         CREATE TRIGGER um6_create_no_delete BEFORE DELETE ON um6_create_journal
         BEGIN SELECT RAISE(ABORT,'UM6 creation evidence is retained'); END;
+        """;
+
+    // Explicit locally provisioned trust configuration. No automatic enrollment or rotation.
+    private const string SchemaV6 = """
+        CREATE TABLE router_targets (
+            RouterId TEXT NOT NULL PRIMARY KEY REFERENCES routers(Id) ON DELETE RESTRICT,
+            Host TEXT COLLATE BINARY NOT NULL CHECK (length(Host) BETWEEN 1 AND 253),
+            Port INTEGER NOT NULL CHECK (Port BETWEEN 1 AND 65535),
+            CertificateName TEXT COLLATE BINARY NOT NULL CHECK (length(CertificateName) BETWEEN 1 AND 253),
+            LeafSha256 TEXT COLLATE BINARY NOT NULL UNIQUE CHECK (length(LeafSha256)=64 AND LeafSha256 NOT GLOB '*[^0-9A-F]*'),
+            TrustedRootDer BLOB NOT NULL CHECK (typeof(TrustedRootDer)='blob' AND length(TrustedRootDer) BETWEEN 1 AND 65536),
+            UNIQUE(Host,Port)
+        );
+        CREATE TRIGGER router_target_no_update BEFORE UPDATE ON router_targets
+        BEGIN SELECT RAISE(ABORT,'Explicit target rotation is not implemented'); END;
+        CREATE TRIGGER router_target_no_delete BEFORE DELETE ON router_targets
+        BEGIN SELECT RAISE(ABORT,'Router target evidence is retained'); END;
         """;
 }

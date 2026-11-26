@@ -634,7 +634,7 @@ public sealed class EncryptedBackupTests
         using var db = DatabaseStore.OpenExisting(upgraded.DatabasePath);
         using var version = db.CreateCommand();
         version.CommandText = "PRAGMA user_version;";
-        Assert.Equal(5L, (long)version.ExecuteScalar()!);
+        Assert.Equal((long)DatabaseStore.CurrentSchemaVersion, (long)version.ExecuteScalar()!);
     }
 
     [Fact]
