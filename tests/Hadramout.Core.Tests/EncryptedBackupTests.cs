@@ -241,6 +241,133 @@ public sealed class EncryptedBackupTests
         f.AssertClean();
     }
 
+    [Fact]
+    public void ProtectedRestorePreservesBothHistoriesAndVerifiedPrecaution()
+    {
+        using var f = new Fixture();
+        Guid shared = Guid.NewGuid();
+        Guid currentOnly = Guid.NewGuid();
+        AppendAudit(f.Source, shared, "2026-01-01T00:00:00.0000000+00:00");
+        EncryptedDatabaseBackup.Create(f.Source, f.Encrypted, Password);
+        AppendAudit(f.Source, currentOnly, "2026-01-02T00:00:00.0000000+00:00");
+        using (var c = DatabaseStore.Open(f.Source))
+        using (var cmd = c.CreateCommand())
+        {
+            cmd.CommandText = "INSERT INTO sites VALUES('11111111-1111-1111-1111-111111111111','new-current');";
+            cmd.ExecuteNonQuery();
+        }
+        string precaution = Path.Combine(f.Root, "precaution.hmk");
+        string recovered = Path.Combine(f.Root, "precaution-recovered.db");
+        byte[] before = SHA256.HashData(File.ReadAllBytes(f.Source));
+        var receipt = EncryptedDatabaseBackup.PrepareWithPrecaution(f.Source, f.Encrypted, f.Candidate,
+            precaution, Password, "synthetic-precaution-password"u8);
+        Assert.True(before.AsSpan().SequenceEqual(SHA256.HashData(File.ReadAllBytes(f.Source))));
+        Assert.Equal(Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(precaution))).ToLowerInvariant(),
+            receipt.Precaution.Sha256);
+        Assert.Equal(Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(f.Candidate))).ToLowerInvariant(),
+            receipt.Candidate.Sha256);
+        var events = AuditStore.ReadRecent(f.Candidate);
+        Assert.Single(events, x => x.Id == shared);
+        Assert.Single(events, x => x.Id == currentOnly);
+        Assert.Contains(events, x => x.Kind == AuditKind.RestoreCandidatePrepared);
+        EncryptedDatabaseBackup.PrepareRestore(precaution, recovered, "synthetic-precaution-password"u8);
+        Assert.Contains(AuditStore.ReadRecent(recovered), x => x.Id == currentOnly);
+        using var c1 = DatabaseStore.Open(f.Candidate);
+        using var db1 = new NetworkDbContext(new DbContextOptionsBuilder<NetworkDbContext>().UseSqlite(c1).Options);
+        Assert.Single(db1.Sites);
+        using var c2 = DatabaseStore.Open(recovered);
+        using var db2 = new NetworkDbContext(new DbContextOptionsBuilder<NetworkDbContext>().UseSqlite(c2).Options);
+        Assert.Equal(2, db2.Sites.Count());
+        f.AssertClean();
+    }
+
+    [Fact]
+    public void ProtectedRestoreWrongPasswordDoesNotPublishAnything()
+    {
+        using var f = new Fixture();
+        EncryptedDatabaseBackup.Create(f.Source, f.Encrypted, Password);
+        string precaution = Path.Combine(f.Root, "precaution.hmk");
+        Assert.Throws<CryptographicException>(() =>
+            EncryptedDatabaseBackup.PrepareWithPrecaution(f.Source, f.Encrypted, f.Candidate,
+                precaution, "incorrect-password"u8, Password));
+        Assert.False(File.Exists(precaution));
+        Assert.False(File.Exists(f.Candidate));
+        f.AssertClean();
+    }
+
+    [Fact]
+    public void ProtectedRestoreRejectsConflictingHistoryAndRetainsSafetyCopy()
+    {
+        using var f = new Fixture();
+        Guid conflict = Guid.NewGuid();
+        AppendAudit(f.Source, conflict, "2026-01-01T00:00:00.0000000+00:00");
+        EncryptedDatabaseBackup.Create(f.Source, f.Encrypted, Password);
+        // Simulate conflicting history in an independently edited trusted database fixture.
+        using (var c = DatabaseStore.Open(f.Source))
+        using (var cmd = c.CreateCommand())
+        {
+            cmd.CommandText = """
+                DROP TRIGGER audit_no_update;
+                UPDATE audit_events SET OccurredUtc='2026-01-02T00:00:00.0000000+00:00';
+                CREATE TRIGGER audit_no_update BEFORE UPDATE ON audit_events
+                    BEGIN SELECT RAISE(ABORT, 'Audit events are append-only'); END;
+                """;
+            cmd.ExecuteNonQuery();
+        }
+        string precaution = Path.Combine(f.Root, "precaution.hmk");
+        Assert.Throws<InvalidDataException>(() =>
+            EncryptedDatabaseBackup.PrepareWithPrecaution(f.Source, f.Encrypted, f.Candidate,
+                precaution, Password, Password));
+        Assert.True(File.Exists(precaution));
+        Assert.False(File.Exists(f.Candidate));
+        f.AssertClean();
+    }
+
+    [Fact]
+    public void ProtectedRestoreRequiresSeparateUnusedDestinations()
+    {
+        using var f = new Fixture();
+        EncryptedDatabaseBackup.Create(f.Source, f.Encrypted, Password);
+        Assert.Throws<IOException>(() =>
+            EncryptedDatabaseBackup.PrepareWithPrecaution(f.Source, f.Encrypted, f.Candidate,
+                f.Candidate, Password, Password));
+        Assert.Throws<IOException>(() =>
+            EncryptedDatabaseBackup.PrepareWithPrecaution(f.Source, f.Encrypted, f.Candidate,
+                f.Encrypted, Password, Password));
+        Assert.False(File.Exists(f.Candidate));
+        f.AssertClean();
+    }
+
+    [Fact]
+    public void FailedPrecautionCreationCannotPublishCandidate()
+    {
+        using var f = new Fixture();
+        EncryptedDatabaseBackup.Create(f.Source, f.Encrypted, Password);
+        using (var c = DatabaseStore.Open(f.Source))
+        using (var cmd = c.CreateCommand())
+        {
+            cmd.CommandText = "PRAGMA user_version=999;";
+            cmd.ExecuteNonQuery();
+        }
+        string precaution = Path.Combine(f.Root, "precaution.hmk");
+        Assert.Throws<InvalidDataException>(() =>
+            EncryptedDatabaseBackup.PrepareWithPrecaution(f.Source, f.Encrypted, f.Candidate,
+                precaution, Password, Password));
+        Assert.False(File.Exists(precaution));
+        Assert.False(File.Exists(f.Candidate));
+        f.AssertClean();
+    }
+
+    private static void AppendAudit(string path, Guid id, string utc)
+    {
+        using var c = DatabaseStore.Open(path);
+        using var cmd = c.CreateCommand();
+        cmd.CommandText = "INSERT INTO audit_events(Id,OccurredUtc,Kind,SubjectId) VALUES($id,$utc,3,NULL);";
+        cmd.Parameters.AddWithValue("$id", id);
+        cmd.Parameters.AddWithValue("$utc", utc);
+        cmd.ExecuteNonQuery();
+    }
+
     private static void AddPayload(string path, int size)
     {
         using var c = DatabaseStore.Open(path);

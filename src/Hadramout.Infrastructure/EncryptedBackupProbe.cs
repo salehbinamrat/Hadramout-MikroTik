@@ -23,7 +23,9 @@ public static class EncryptedBackupProbe
                 cmd.ExecuteNonQuery();
             }
             EncryptedDatabaseBackup.Create(source, encrypted, "synthetic-probe-password"u8);
-            EncryptedDatabaseBackup.PrepareRestore(encrypted, candidate, "synthetic-probe-password"u8);
+            string precaution = Path.Combine(directory.FullName, "precaution.hmk");
+            EncryptedDatabaseBackup.PrepareWithPrecaution(source, encrypted, candidate, precaution,
+                "synthetic-probe-password"u8, "synthetic-precaution-password"u8);
             using var connection = DatabaseStore.Open(candidate);
             using var restored = new NetworkDbContext(new DbContextOptionsBuilder<NetworkDbContext>()
                 .UseSqlite(connection).Options);
