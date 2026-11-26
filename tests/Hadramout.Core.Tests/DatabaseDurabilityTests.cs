@@ -243,13 +243,75 @@ public sealed class DatabaseDurabilityTests
     public void JournalRestoreGuardNeverAllowsLossOfPreparedOrClaimedEvidence()
     {
         using var file = new TestFile();
+        using var candidate = new TestFile();
         Guid id = SeedReservation(file.Path, BackendKind.UserManager6);
-        UserManager6CreateJournal.RequireEmptyForRestore(file.Path);
+        using (var c = DatabaseStore.Open(candidate.Path)) { }
+        UserManager6CreateJournal.RequireEquivalentForRestore(file.Path, candidate.Path);
         var journal = new UserManager6CreateJournal(file.Path);
         journal.Prepare(id, "admin");
-        Assert.Throws<InvalidOperationException>(() => UserManager6CreateJournal.RequireEmptyForRestore(file.Path));
+        Assert.Throws<InvalidOperationException>(() =>
+            UserManager6CreateJournal.RequireEquivalentForRestore(file.Path, candidate.Path));
+        Assert.Throws<InvalidOperationException>(() =>
+            UserManager6CreateJournal.RequireEquivalentForRestore(candidate.Path, file.Path));
         Assert.True(journal.TryBeginDispatch(id));
-        Assert.Throws<InvalidOperationException>(() => UserManager6CreateJournal.RequireEmptyForRestore(file.Path));
+        Assert.Throws<InvalidOperationException>(() =>
+            UserManager6CreateJournal.RequireEquivalentForRestore(file.Path, candidate.Path));
+    }
+
+    [Theory]
+    [InlineData("prepared")]
+    [InlineData("started")]
+    [InlineData("indeterminate")]
+    [InlineData("acknowledged")]
+    public void JournalRestoreAcceptsExactHistoryWithoutRearming(string state)
+    {
+        using var file = new TestFile();
+        using var candidate = new TestFile();
+        Guid id = SeedReservation(file.Path, BackendKind.UserManager6);
+        var journal = new UserManager6CreateJournal(file.Path);
+        journal.Prepare(id, "admin");
+        if (state != "prepared") Assert.True(journal.TryBeginDispatch(id));
+        if (state == "indeterminate") Assert.True(journal.TryMarkIndeterminate(id));
+        if (state == "acknowledged") Assert.True(journal.TryMarkAcknowledged(id));
+        DatabaseBackup.Create(file.Path, candidate.Path);
+        UserManager6CreateJournal.RequireEquivalentForRestore(file.Path, candidate.Path);
+        var restored = new UserManager6CreateJournal(candidate.Path);
+        Assert.Equal(journal.Read(id), restored.Read(id));
+        if (state != "prepared") Assert.False(restored.TryBeginDispatch(id));
+    }
+
+    [Theory]
+    [InlineData("stale-state")]
+    [InlineData("newer-state")]
+    [InlineData("username")]
+    [InlineData("plan")]
+    [InlineData("router")]
+    [InlineData("site")]
+    public void JournalRestoreRejectsChangedStateOrTarget(string condition)
+    {
+        using var file = new TestFile();
+        using var candidate = new TestFile();
+        Guid id = SeedReservation(file.Path, BackendKind.UserManager6);
+        var journal = new UserManager6CreateJournal(file.Path);
+        journal.Prepare(id, "admin");
+        DatabaseBackup.Create(file.Path, candidate.Path);
+        var restored = new UserManager6CreateJournal(candidate.Path);
+        if (condition == "stale-state") Assert.True(journal.TryBeginDispatch(id));
+        else if (condition == "newer-state") Assert.True(restored.TryBeginDispatch(id));
+        else
+        {
+            using var c = DatabaseStore.OpenExisting(candidate.Path);
+            Execute(c, condition switch
+            {
+                "username" => "UPDATE voucher_reservations SET Username='002';",
+                "plan" => "UPDATE plans SET Name='different';",
+                "router" => "UPDATE routers SET Name='different';",
+                "site" => "UPDATE sites SET Name='different';",
+                _ => throw new InvalidOperationException()
+            });
+        }
+        Assert.Throws<InvalidOperationException>(() =>
+            UserManager6CreateJournal.RequireEquivalentForRestore(file.Path, candidate.Path));
     }
 
     [Fact]

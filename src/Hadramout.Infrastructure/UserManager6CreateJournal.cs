@@ -97,15 +97,51 @@ internal sealed class UserManager6CreateJournal(string databasePath)
         if (id == Guid.Empty) throw new ArgumentException("A reservation identity is required.", nameof(id));
     }
 
-    // Until durable reconciliation across generations is implemented, no journal
-    // may be lost or reintroduced by switching the active database.
-    internal static void RequireEmptyForRestore(string path)
+    // Conservative cross-generation reconciliation: only identical creation histories
+    // with matching local target relationships may switch generations. No union or replay.
+    // Caller must hold the exclusive managed gate and quiesce all writers.
+    internal static void RequireEquivalentForRestore(string currentPath, string candidatePath)
     {
-        using var c = DatabaseBackup.OpenRaw(path, SqliteOpenMode.ReadOnly);
-        DatabaseBackup.RequireIdentity(c);
-        using var cmd = c.CreateCommand();
-        cmd.CommandText = "SELECT EXISTS(SELECT 1 FROM um6_create_journal);";
-        if ((long)cmd.ExecuteScalar()! != 0)
-            throw new InvalidOperationException("UM6 creation evidence requires reconciliation before restore activation.");
+        using var current = DatabaseBackup.OpenRaw(currentPath, SqliteOpenMode.ReadOnly);
+        using var candidate = DatabaseBackup.OpenRaw(candidatePath, SqliteOpenMode.ReadOnly);
+        DatabaseBackup.RequireIdentity(current);
+        DatabaseBackup.RequireIdentity(candidate);
+        using var left = current.CreateCommand();
+        using var right = candidate.CreateCommand();
+        // LEFT JOIN is intentional: an inconsistent relationship must not hide a journal row.
+        const string query = """
+            SELECT j.ReservationId,j.BackendId,j.RouterId,j.Customer,j.Username,j.State,
+                   v.BatchId,p.Id,p.Name,r.SiteId,r.Name,s.Name,
+                   CASE WHEN v.Id IS NOT NULL AND v.BackendId=j.BackendId AND v.Username=j.Username
+                       AND b.Kind=2 AND b.RouterId=j.RouterId
+                       AND batch.Id IS NOT NULL AND batch.BackendId=j.BackendId
+                       AND p.Id IS NOT NULL AND p.BackendId=j.BackendId
+                       AND r.Id IS NOT NULL AND s.Id IS NOT NULL THEN 1 ELSE 0 END
+            FROM um6_create_journal j
+            LEFT JOIN voucher_reservations v ON v.Id=j.ReservationId
+            LEFT JOIN backends b ON b.Id=j.BackendId
+            LEFT JOIN voucher_batches batch ON batch.Id=v.BatchId
+            LEFT JOIN plans p ON p.Id=batch.PlanId
+            LEFT JOIN routers r ON r.Id=j.RouterId
+            LEFT JOIN sites s ON s.Id=r.SiteId
+            ORDER BY j.ReservationId COLLATE BINARY;
+            """;
+        left.CommandText = query;
+        right.CommandText = query;
+        using var a = left.ExecuteReader();
+        using var b = right.ExecuteReader();
+        while (true)
+        {
+            bool hasA = a.Read(), hasB = b.Read();
+            if (hasA != hasB) throw RestoreConflict();
+            if (!hasA) return;
+            if (a.GetInt32(12) != 1 || b.GetInt32(12) != 1) throw RestoreConflict();
+            for (int i = 0; i < 12; i++)
+                if (a.IsDBNull(i) || b.IsDBNull(i) || !Equals(a.GetValue(i), b.GetValue(i)))
+                    throw RestoreConflict();
+        }
     }
+
+    private static InvalidOperationException RestoreConflict() =>
+        new("UM6 creation evidence or its local target differs; restore requires explicit reconciliation.");
 }
