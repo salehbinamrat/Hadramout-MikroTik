@@ -6,7 +6,7 @@ namespace Hadramout.Infrastructure;
 /// <summary>Opens an owned local database with durable settings and atomic schema upgrades.</summary>
 public static class DatabaseStore
 {
-    public const int CurrentSchemaVersion = 7;
+    public const int CurrentSchemaVersion = 8;
     public const int ApplicationId = 0x484D4B54;
 
     public static SqliteConnection Open(string path) => OpenCore(path, SqliteOpenMode.ReadWriteCreate);
@@ -114,6 +114,13 @@ public static class DatabaseStore
             Execute(connection, tx, SchemaV7);
             Execute(connection, tx, "PRAGMA user_version=7;");
             version = 7;
+        }
+
+        if (version == 7)
+        {
+            Execute(connection, tx, SchemaV8);
+            Execute(connection, tx, "PRAGMA user_version=8;");
+            version = 8;
         }
 
         if (version != CurrentSchemaVersion)
@@ -287,5 +294,22 @@ public static class DatabaseStore
         BEGIN SELECT RAISE(ABORT,'Creation intent is immutable'); END;
         CREATE TRIGGER um6_intent_no_delete BEFORE DELETE ON um6_create_intents
         BEGIN SELECT RAISE(ABORT,'Creation intent is retained'); END;
+        """;
+
+    // Explicit encrypted password (including intentionally empty password).
+    private const string SchemaV8 = """
+        CREATE TABLE um6_voucher_secrets (
+            ReservationId TEXT NOT NULL PRIMARY KEY REFERENCES um6_create_intents(ReservationId) ON DELETE RESTRICT,
+            PasswordEnvelope BLOB NOT NULL CHECK(typeof(PasswordEnvelope)='blob' AND length(PasswordEnvelope) BETWEEN 1 AND 20513)
+        );
+        CREATE TRIGGER um6_secret_insert_guard BEFORE INSERT ON um6_voucher_secrets
+        WHEN NOT EXISTS (
+            SELECT 1 FROM um6_create_intents i JOIN um6_create_journal j ON j.ReservationId=i.ReservationId
+            WHERE i.ReservationId=NEW.ReservationId AND j.State=1)
+        BEGIN SELECT RAISE(ABORT,'Prepared creation intent required'); END;
+        CREATE TRIGGER um6_secret_no_update BEFORE UPDATE ON um6_voucher_secrets
+        BEGIN SELECT RAISE(ABORT,'Voucher secret is immutable'); END;
+        CREATE TRIGGER um6_secret_no_delete BEFORE DELETE ON um6_voucher_secrets
+        BEGIN SELECT RAISE(ABORT,'Voucher secret evidence is retained'); END;
         """;
 }

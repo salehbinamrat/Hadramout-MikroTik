@@ -1,4 +1,5 @@
 using Microsoft.Data.Sqlite;
+using System.Runtime.Versioning;
 
 namespace Hadramout.Infrastructure;
 
@@ -197,6 +198,7 @@ internal sealed class UserManager6CreateJournal(string databasePath)
 
     // Compare immutable intent with current local relationships atomically before claiming.
     // Remote checks, protected voucher credentials and authorization are still required.
+    [SupportedOSPlatform("windows")]
     internal bool TryBeginBoundDispatch(Guid reservationId)
     {
         ValidateId(reservationId);
@@ -221,9 +223,12 @@ internal sealed class UserManager6CreateJournal(string databasePath)
                   AND t.LeafSha256=i.LeafSha256);
             """;
         cmd.Parameters.AddWithValue("$id", reservationId);
-        bool changed = cmd.ExecuteNonQuery() == 1;
+        if (cmd.ExecuteNonQuery() != 1) return false;
+        // The update is still uncommitted. A missing or invalid secret rolls it back.
+        using var secret = UserManager6VoucherSecretStore.Load(c, tx, reservationId);
+        if (secret is null) return false;
         tx.Commit();
-        return changed;
+        return true;
     }
 
     internal bool TryMarkIndeterminate(Guid reservationId) =>
