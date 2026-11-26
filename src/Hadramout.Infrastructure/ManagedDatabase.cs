@@ -97,7 +97,7 @@ public static class ManagedDatabase
             string active = GenerationPath(root, id);
             RequireRegularFile(active);
             using (var c = DatabaseBackup.OpenRaw(active, Microsoft.Data.Sqlite.SqliteOpenMode.ReadOnly))
-                DatabaseBackup.ValidateConnection(c, fullIntegrityCheck: false, allowVersionFour: true);
+                DatabaseBackup.ValidateConnection(c, fullIntegrityCheck: false, allowLegacyVersion: true);
             using (var c = DatabaseStore.OpenExisting(active))
                 DatabaseBackup.ValidateConnection(c, fullIntegrityCheck: false);
             return new ManagedDatabaseSession(gate, id, active);
@@ -132,6 +132,7 @@ public static class ManagedDatabase
         var receipts = EncryptedDatabaseBackup.PrepareWithPrecaution(currentPath, encryptedPath,
             candidate, precautionPath, backupPassword, precautionPassword);
         UserManager6CreateJournal.RequireEquivalentForRestore(currentPath, candidate);
+        RouterTargetStore.RequireEquivalentForRestore(currentPath, candidate);
         var statuses = RestoreCredentialInspector.Inspect(candidate);
         if (!allowUnavailableCredentials && statuses.Any(s => s.State == RestoreCredentialState.Unavailable))
             throw new InvalidOperationException("Restored credentials require explicit review before activation.");

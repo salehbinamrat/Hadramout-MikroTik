@@ -55,7 +55,7 @@ public static class DatabaseBackup
                     throw new InvalidDataException("Backup digest does not match.");
             }
             // Verify a supported legacy snapshot before upgrading the authenticated copy.
-            ValidateSnapshot(staged, allowVersionFour: true);
+            ValidateSnapshot(staged, allowLegacyVersion: true);
             using (var target = DatabaseStore.OpenExisting(staged))
             {
                 using var tx = target.BeginTransaction(deferred: false);
@@ -183,7 +183,7 @@ public static class DatabaseBackup
         catch { c.Dispose(); throw; }
     }
 
-    internal static void RequireIdentity(SqliteConnection c, bool allowVersionFour = false)
+    internal static void RequireIdentity(SqliteConnection c, bool allowLegacyVersion = false)
     {
         using var cmd = c.CreateCommand();
         cmd.CommandText = "PRAGMA application_id;";
@@ -191,21 +191,21 @@ public static class DatabaseBackup
             throw new InvalidDataException("Backup belongs to another application.");
         cmd.CommandText = "PRAGMA user_version;";
         long version = (long)cmd.ExecuteScalar()!;
-        if (version != DatabaseStore.CurrentSchemaVersion && !(allowVersionFour && version == 4))
+        if (version != DatabaseStore.CurrentSchemaVersion && !(allowLegacyVersion && version is 4 or 5))
             throw new InvalidDataException("Backup schema version is not supported by this release.");
     }
 
-    internal static void ValidateSnapshot(string path, bool allowVersionFour = false)
+    internal static void ValidateSnapshot(string path, bool allowLegacyVersion = false)
     {
         EnsureStandalone(path);
         using var c = OpenRaw(path, SqliteOpenMode.ReadOnly);
-        ValidateConnection(c, fullIntegrityCheck: true, allowVersionFour);
+        ValidateConnection(c, fullIntegrityCheck: true, allowLegacyVersion);
     }
 
     // A live DB can legitimately have a WAL; do not require standalone mode at startup.
-    internal static void ValidateConnection(SqliteConnection c, bool fullIntegrityCheck, bool allowVersionFour = false)
+    internal static void ValidateConnection(SqliteConnection c, bool fullIntegrityCheck, bool allowLegacyVersion = false)
     {
-        RequireIdentity(c, allowVersionFour);
+        RequireIdentity(c, allowLegacyVersion);
         using var cmd = c.CreateCommand();
         cmd.CommandText = fullIntegrityCheck ? "PRAGMA integrity_check;" : "PRAGMA quick_check;";
         using (var r = cmd.ExecuteReader())
@@ -223,7 +223,8 @@ public static class DatabaseBackup
         if ((long)cmd.ExecuteScalar()! != 8)
             throw new InvalidDataException("Backup is missing required tables.");
         cmd.CommandText = "PRAGMA user_version;";
-        if ((long)cmd.ExecuteScalar()! == DatabaseStore.CurrentSchemaVersion)
+        long version = (long)cmd.ExecuteScalar()!;
+        if (version >= 5)
         {
             cmd.CommandText = """
                 SELECT count(*) FROM sqlite_schema WHERE
@@ -232,6 +233,16 @@ public static class DatabaseBackup
                 """;
             if ((long)cmd.ExecuteScalar()! != 4)
                 throw new InvalidDataException("Backup is missing UM6 creation journal objects.");
+        }
+        if (version >= 6)
+        {
+            cmd.CommandText = """
+                SELECT count(*) FROM sqlite_schema WHERE
+                    (type='table' AND name='router_targets') OR
+                    (type='trigger' AND name IN ('router_target_no_update','router_target_no_delete'));
+                """;
+            if ((long)cmd.ExecuteScalar()! != 3)
+                throw new InvalidDataException("Backup is missing router target objects.");
         }
     }
 
