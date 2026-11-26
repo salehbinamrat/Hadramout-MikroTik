@@ -1,4 +1,5 @@
 using System.Net;
+using System.Runtime.Versioning;
 using System.Net.Security;
 using System.Net.Sockets;
 using System.Security.Authentication;
@@ -1360,6 +1361,154 @@ public sealed class RouterOsTlsTransportTests(ITestOutputHelper output)
         finally { await serve; }
         Assert.False(server.HasPendingConnection);
     }
+
+    [Fact]
+    [SupportedOSPlatform("windows")]
+    public async Task BoundAccountReadUsesStoredTargetAndCredentials()
+    {
+        using var certificates = new Certificates();
+        using var server = new LoopbackServer(certificates.Leaf, certificates.Root, output);
+        var directory = Directory.CreateTempSubdirectory("hadramout-bound-test-");
+        try
+        {
+            string path = Path.Combine(directory.FullName, "test.db");
+            Guid id = SeedBoundRouter(path);
+            EnrollBoundRouter(path, id, server.Port, certificates);
+            new RouterCredentialStore(path).Save(id, "synthetic-user"u8, "synthetic-private-password"u8);
+            Task serve = server.RunAsync(reply: true, handler: async (tls, token) =>
+            {
+                await PrepareProbePeerAsync(tls, token, "6.49.19");
+                await AssertUm6AccountRequestAsync(tls, token);
+                await RouterOsWireCodec.WriteSentenceAsync(tls,
+                    ["!re"u8.ToArray(), "=customer=admin"u8.ToArray(), "=username=123456"u8.ToArray()], token);
+                await RouterOsWireCodec.WriteSentenceAsync(tls, ["!done"u8.ToArray()], token);
+            });
+            try
+            {
+                var account = await RouterOsReadRecovery.FindBoundUserManager6AccountAsync(path, id, "admin", "123456");
+                Assert.NotNull(account);
+                Assert.Equal("123456", account.Username);
+                Assert.Equal("admin", account.Customer);
+            }
+            finally { await serve; }
+            Assert.False(server.HasPendingConnection);
+        }
+        finally { directory.Delete(recursive: true); }
+    }
+
+    [Fact]
+    [SupportedOSPlatform("windows")]
+    public async Task BoundReadRetainsPinAndCredentialsAcrossOneReadReconnect()
+    {
+        using var certificates = new Certificates();
+        using var server = new LoopbackServer(certificates.Leaf, certificates.Root, output);
+        var directory = Directory.CreateTempSubdirectory("hadramout-bound-retry-");
+        try
+        {
+            string path = Path.Combine(directory.FullName, "test.db");
+            Guid id = SeedBoundRouter(path);
+            EnrollBoundRouter(path, id, server.Port, certificates);
+            new RouterCredentialStore(path).Save(id, "synthetic-user"u8, "synthetic-private-password"u8);
+            Task serve = ServeAsync();
+            async Task ServeAsync()
+            {
+                for (int i = 0; i < 2; i++)
+                {
+                    bool first = i == 0;
+                    await server.RunAsync(reply: true, handler: async (tls, token) =>
+                    {
+                        await AssertLoginAsync(tls, token);
+                        await RouterOsWireCodec.WriteSentenceAsync(tls, ["!done"u8.ToArray()], token);
+                        await AssertVersionRequestAsync(tls, token);
+                        await RouterOsWireCodec.WriteSentenceAsync(tls,
+                            ["!re"u8.ToArray(), Encoding.ASCII.GetBytes(first ? "=version=6.49.19" : "=version=6.49.18")], token);
+                        if (first) await tls.ShutdownAsync();
+                        else await RouterOsWireCodec.WriteSentenceAsync(tls, ["!done"u8.ToArray()], token);
+                    });
+                }
+            }
+            try { Assert.Equal("6.49.18", await RouterOsReadRecovery.ReadBoundVersionAsync(path, id)); }
+            finally { await serve; }
+            Assert.False(server.HasPendingConnection);
+        }
+        finally { directory.Delete(recursive: true); }
+    }
+
+    [Fact]
+    [SupportedOSPlatform("windows")]
+    public async Task BoundReadRejectsWrongPinBeforeSendingStoredCredentials()
+    {
+        using var certificates = new Certificates();
+        using var server = new LoopbackServer(certificates.Leaf, certificates.Root, output);
+        var directory = Directory.CreateTempSubdirectory("hadramout-bound-pin-");
+        try
+        {
+            string path = Path.Combine(directory.FullName, "test.db");
+            Guid id = SeedBoundRouter(path);
+            new RouterTargetStore(path).Enroll(id, "127.0.0.1", server.Port, "router.test",
+                new string('0', 64), certificates.Root.RawData);
+            new RouterCredentialStore(path).Save(id, "synthetic-user"u8, "synthetic-private-password"u8);
+            Task serve = server.RunAsync(reply: true, handler: async (tls, token) =>
+                Assert.Equal(0, await tls.ReadAsync(new byte[1], token)));
+            try
+            {
+                await Assert.ThrowsAsync<AuthenticationException>(() =>
+                    RouterOsReadRecovery.ReadBoundVersionAsync(path, id));
+            }
+            finally { await serve; }
+            Assert.False(server.HasPendingConnection);
+        }
+        finally { directory.Delete(recursive: true); }
+    }
+
+    [Theory]
+    [InlineData("no-target")]
+    [InlineData("no-credentials")]
+    [InlineData("corrupt")]
+    [InlineData("cancelled")]
+    [SupportedOSPlatform("windows")]
+    public async Task BoundReadFailsLocallyWithoutOpeningSocket(string condition)
+    {
+        using var certificates = new Certificates();
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        int port = ((IPEndPoint)listener.LocalEndpoint).Port;
+        var directory = Directory.CreateTempSubdirectory("hadramout-bound-local-");
+        try
+        {
+            string path = Path.Combine(directory.FullName, "test.db");
+            Guid id = SeedBoundRouter(path);
+            if (condition != "no-target") EnrollBoundRouter(path, id, port, certificates);
+            if (condition != "no-credentials")
+                new RouterCredentialStore(path).Save(id, "synthetic-user"u8, "synthetic-private-password"u8);
+            if (condition == "corrupt")
+            {
+                using var db = DatabaseStore.OpenExisting(path);
+                using var cmd = db.CreateCommand();
+                cmd.CommandText = "UPDATE router_credentials SET PasswordEnvelope=X'01';";
+                cmd.ExecuteNonQuery();
+            }
+            using var cancellation = new CancellationTokenSource();
+            if (condition == "cancelled") cancellation.Cancel();
+            Task<string> Read() => RouterOsReadRecovery.ReadBoundVersionAsync(path, id,
+                cancellationToken: cancellation.Token);
+            if (condition == "cancelled") await Assert.ThrowsAnyAsync<OperationCanceledException>(Read);
+            else if (condition == "corrupt") await Assert.ThrowsAsync<CryptographicException>(Read);
+            else await Assert.ThrowsAsync<InvalidOperationException>(Read);
+            Assert.False(listener.Pending());
+        }
+        finally { directory.Delete(recursive: true); }
+    }
+
+    private static Guid SeedBoundRouter(string path)
+    {
+        Guid reservation = DatabaseDurabilityTests.SeedReservation(path, BackendKind.UserManager6);
+        return new UserManager6CreateJournal(path).Prepare(reservation, "admin").RouterId;
+    }
+
+    private static void EnrollBoundRouter(string path, Guid id, int port, Certificates certificates) =>
+        new RouterTargetStore(path).Enroll(id, "127.0.0.1", port, "router.test",
+            Convert.ToHexString(SHA256.HashData(certificates.Leaf.RawData)), certificates.Root.RawData);
 
     private static Task<UserManager6Account?> FindUm6AccountAsync(LoopbackServer server, Certificates certificates) =>
         RouterOsReadRecovery.FindUserManager6AccountAsync("admin", "123456", "127.0.0.1", "router.test",

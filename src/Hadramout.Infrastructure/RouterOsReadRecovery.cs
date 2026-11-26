@@ -1,6 +1,7 @@
 using System.Globalization;
 using System.Net;
 using System.Net.Sockets;
+using System.Runtime.Versioning;
 using Hadramout.Core;
 
 namespace Hadramout.Infrastructure;
@@ -84,10 +85,50 @@ internal static class RouterOsReadRecovery
             cancellationToken);
     }
 
+    // Only known reads can enter the bound path. The caller must keep its managed
+    // database session alive and quiesce configuration/credential edits during the operation.
+    [SupportedOSPlatform("windows")]
+    internal static Task<string> ReadBoundVersionAsync(string databasePath, Guid routerId,
+        TimeSpan? timeout = null, CancellationToken cancellationToken = default) =>
+        ReadBoundAsync(databasePath, routerId, timeout,
+            (session, token) => session.ReadVersionAsync(timeout, token), cancellationToken);
+
+    [SupportedOSPlatform("windows")]
+    internal static Task<UserManager6Account?> FindBoundUserManager6AccountAsync(string databasePath,
+        Guid routerId, string customer, string username, TimeSpan? timeout = null,
+        CancellationToken cancellationToken = default)
+    {
+        UserManager6Records.ValidateKey(customer, nameof(customer));
+        UserManager6Records.ValidateKey(username, nameof(username));
+        return ReadBoundAsync(databasePath, routerId, timeout,
+            (session, token) => session.FindUserManager6AccountAsync(customer, username, timeout, token),
+            cancellationToken);
+    }
+
+    [SupportedOSPlatform("windows")]
+    private static async Task<T> ReadBoundAsync<T>(string databasePath, Guid routerId, TimeSpan? timeout,
+        Func<RouterOsSession, CancellationToken, Task<T>> operation, CancellationToken cancellationToken)
+    {
+        TimeSpan limit = timeout ?? TimeSpan.FromSeconds(15);
+        if (limit <= TimeSpan.Zero || limit > TimeSpan.FromMinutes(2))
+            throw new ArgumentOutOfRangeException(nameof(timeout));
+        cancellationToken.ThrowIfCancellationRequested();
+        var target = new RouterTargetStore(databasePath).Read(routerId)
+            ?? throw new InvalidOperationException("Router target is not enrolled.");
+        cancellationToken.ThrowIfCancellationRequested();
+        using var credential = new RouterCredentialStore(databasePath).LoadReadOnly(routerId)
+            ?? throw new InvalidOperationException("Router credentials are not configured.");
+        cancellationToken.ThrowIfCancellationRequested();
+        return await ReadAsync(target.Host, target.CertificateName, credential.UsernameMemory,
+            credential.PasswordMemory, target.Port, limit, target.TrustedRootDer, operation,
+            cancellationToken, expectedLeafSha256: target.LeafSha256).ConfigureAwait(false);
+    }
+
     private static async Task<T> ReadAsync<T>(string host, string certificateName,
         ReadOnlyMemory<byte> username, ReadOnlyMemory<byte> password, int port,
         TimeSpan? timeout, ReadOnlyMemory<byte> trustedRootDer,
-        Func<RouterOsSession, CancellationToken, Task<T>> operation, CancellationToken cancellationToken)
+        Func<RouterOsSession, CancellationToken, Task<T>> operation, CancellationToken cancellationToken,
+        string? expectedLeafSha256 = null)
     {
         TimeSpan limit = timeout ?? TimeSpan.FromSeconds(15);
         if (limit <= TimeSpan.Zero || limit > TimeSpan.FromMinutes(2))
@@ -104,8 +145,11 @@ internal static class RouterOsReadRecovery
                 deadline.Token.ThrowIfCancellationRequested();
                 // Outside the read-retry catch: TLS, login and initial connection failures
                 // are terminal even if they happen while establishing a replacement session.
-                using (var session = await RouterOsSession.ConnectAsync(host, certificateName,
-                    username, password, port, limit, trustedRootDer, deadline.Token).ConfigureAwait(false))
+                using (var session = expectedLeafSha256 is null
+                    ? await RouterOsSession.ConnectAsync(host, certificateName,
+                        username, password, port, limit, trustedRootDer, deadline.Token).ConfigureAwait(false)
+                    : await RouterOsSession.ConnectPinnedAsync(host, certificateName, expectedLeafSha256,
+                        username, password, port, limit, trustedRootDer, deadline.Token).ConfigureAwait(false))
                 {
                     try
                     {
