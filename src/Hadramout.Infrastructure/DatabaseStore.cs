@@ -6,7 +6,7 @@ namespace Hadramout.Infrastructure;
 /// <summary>Opens an owned local database with durable settings and atomic schema upgrades.</summary>
 public static class DatabaseStore
 {
-    public const int CurrentSchemaVersion = 6;
+    public const int CurrentSchemaVersion = 7;
     public const int ApplicationId = 0x484D4B54;
 
     public static SqliteConnection Open(string path) => OpenCore(path, SqliteOpenMode.ReadWriteCreate);
@@ -107,6 +107,13 @@ public static class DatabaseStore
             Execute(connection, tx, SchemaV6);
             Execute(connection, tx, "PRAGMA user_version=6;");
             version = 6;
+        }
+
+        if (version == 6)
+        {
+            Execute(connection, tx, SchemaV7);
+            Execute(connection, tx, "PRAGMA user_version=7;");
+            version = 7;
         }
 
         if (version != CurrentSchemaVersion)
@@ -251,5 +258,34 @@ public static class DatabaseStore
         BEGIN SELECT RAISE(ABORT,'Explicit target rotation is not implemented'); END;
         CREATE TRIGGER router_target_no_delete BEFORE DELETE ON router_targets
         BEGIN SELECT RAISE(ABORT,'Router target evidence is retained'); END;
+        """;
+
+    // Durable explicit profile and target intent. Not proof of remote assignment.
+    private const string SchemaV7 = """
+        CREATE TABLE um6_create_intents (
+            ReservationId TEXT NOT NULL PRIMARY KEY REFERENCES um6_create_journal(ReservationId) ON DELETE RESTRICT,
+            BatchId TEXT NOT NULL REFERENCES voucher_batches(Id) ON DELETE RESTRICT,
+            PlanId TEXT NOT NULL REFERENCES plans(Id) ON DELETE RESTRICT,
+            PlanName TEXT COLLATE BINARY NOT NULL CHECK(length(PlanName) BETWEEN 1 AND 128),
+            LeafSha256 TEXT COLLATE BINARY NOT NULL CHECK(length(LeafSha256)=64 AND LeafSha256 NOT GLOB '*[^0-9A-F]*'),
+            ProfileOwner TEXT COLLATE BINARY NOT NULL CHECK(length(ProfileOwner) BETWEEN 1 AND 128 AND ProfileOwner=trim(ProfileOwner)),
+            ProfileName TEXT COLLATE BINARY NOT NULL CHECK(length(ProfileName) BETWEEN 1 AND 128 AND ProfileName=trim(ProfileName))
+        );
+        CREATE TRIGGER um6_intent_insert_guard BEFORE INSERT ON um6_create_intents
+        WHEN NOT EXISTS (
+            SELECT 1 FROM um6_create_journal j
+            JOIN voucher_reservations v ON v.Id=j.ReservationId AND v.BackendId=j.BackendId AND v.Username=j.Username
+            JOIN backends b ON b.Id=j.BackendId AND b.RouterId=j.RouterId AND b.Kind=2
+            JOIN voucher_batches batch ON batch.Id=v.BatchId AND batch.BackendId=j.BackendId
+            JOIN plans p ON p.Id=batch.PlanId AND p.BackendId=j.BackendId
+            JOIN router_targets t ON t.RouterId=j.RouterId
+            WHERE j.ReservationId=NEW.ReservationId AND j.State=1
+              AND batch.Id=NEW.BatchId AND p.Id=NEW.PlanId AND p.Name=NEW.PlanName
+              AND t.LeafSha256=NEW.LeafSha256)
+        BEGIN SELECT RAISE(ABORT,'Invalid bound creation intent'); END;
+        CREATE TRIGGER um6_intent_no_update BEFORE UPDATE ON um6_create_intents
+        BEGIN SELECT RAISE(ABORT,'Creation intent is immutable'); END;
+        CREATE TRIGGER um6_intent_no_delete BEFORE DELETE ON um6_create_intents
+        BEGIN SELECT RAISE(ABORT,'Creation intent is retained'); END;
         """;
 }

@@ -191,7 +191,7 @@ public static class DatabaseBackup
             throw new InvalidDataException("Backup belongs to another application.");
         cmd.CommandText = "PRAGMA user_version;";
         long version = (long)cmd.ExecuteScalar()!;
-        if (version != DatabaseStore.CurrentSchemaVersion && !(allowLegacyVersion && version is 4 or 5))
+        if (version != DatabaseStore.CurrentSchemaVersion && !(allowLegacyVersion && version is 4 or 5 or 6))
             throw new InvalidDataException("Backup schema version is not supported by this release.");
     }
 
@@ -243,6 +243,16 @@ public static class DatabaseBackup
                 """;
             if ((long)cmd.ExecuteScalar()! != 3)
                 throw new InvalidDataException("Backup is missing router target objects.");
+        }
+        if (version >= 7)
+        {
+            cmd.CommandText = """
+                SELECT count(*) FROM sqlite_schema WHERE
+                    (type='table' AND name='um6_create_intents') OR
+                    (type='trigger' AND name IN ('um6_intent_insert_guard','um6_intent_no_update','um6_intent_no_delete'));
+                """;
+            if ((long)cmd.ExecuteScalar()! != 4)
+                throw new InvalidDataException("Backup is missing UM6 creation intent objects.");
         }
     }
 

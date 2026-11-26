@@ -7,6 +7,9 @@ internal enum UserManager6CreateState { Prepared = 1, DispatchStarted = 2, Indet
 internal sealed record UserManager6CreateEntry(Guid ReservationId, Guid BackendId, Guid RouterId,
     string Customer, string Username, UserManager6CreateState State);
 
+internal sealed record UserManager6CreateIntent(Guid ReservationId, Guid BatchId, Guid PlanId,
+    string PlanName, string LeafSha256, string ProfileOwner, string ProfileName);
+
 internal sealed record UserManager6CreationReviewRow(UserManager6CreateEntry Entry, bool LocalIdentityMatches);
 internal sealed record UserManager6CreationReviewPage(IReadOnlyList<UserManager6CreationReviewRow> Rows,
     Guid? NextAfterReservationId);
@@ -143,9 +146,85 @@ internal sealed class UserManager6CreateJournal(string databasePath)
         catch { connection.Dispose(); throw; }
     }
 
-    // True grants the one-shot local dispatch claim. False never authorizes a remote send.
+    // Attach an explicitly selected remote profile to a still-prepared local journal row.
+    // No remote proof or password is stored, and no command is sent.
+    internal void PrepareBoundIntent(Guid reservationId, string profileOwner, string profileName)
+    {
+        ValidateId(reservationId);
+        UserManager6Records.ValidateKey(profileOwner, nameof(profileOwner));
+        UserManager6Records.ValidateKey(profileName, nameof(profileName));
+        using var c = DatabaseStore.OpenExisting(databasePath);
+        using var tx = c.BeginTransaction(deferred: false);
+        using var cmd = c.CreateCommand();
+        cmd.Transaction = tx;
+        cmd.CommandText = """
+            INSERT INTO um6_create_intents(ReservationId,BatchId,PlanId,PlanName,LeafSha256,ProfileOwner,ProfileName)
+            SELECT j.ReservationId,batch.Id,p.Id,p.Name,t.LeafSha256,$owner,$profile
+            FROM um6_create_journal j
+            JOIN voucher_reservations v ON v.Id=j.ReservationId AND v.BackendId=j.BackendId AND v.Username=j.Username
+            JOIN backends b ON b.Id=j.BackendId AND b.RouterId=j.RouterId AND b.Kind=2
+            JOIN voucher_batches batch ON batch.Id=v.BatchId AND batch.BackendId=j.BackendId
+            JOIN plans p ON p.Id=batch.PlanId AND p.BackendId=j.BackendId
+            JOIN router_targets t ON t.RouterId=j.RouterId
+            WHERE j.ReservationId=$id AND j.State=1;
+            """;
+        cmd.Parameters.AddWithValue("$id", reservationId);
+        cmd.Parameters.AddWithValue("$owner", profileOwner);
+        cmd.Parameters.AddWithValue("$profile", profileName);
+        if (cmd.ExecuteNonQuery() != 1)
+            throw new InvalidOperationException("A prepared journal and enrolled matching target are required.");
+        tx.Commit();
+    }
+
+    internal UserManager6CreateIntent? ReadBoundIntent(Guid reservationId)
+    {
+        ValidateId(reservationId);
+        using var c = OpenReadOnly();
+        using var cmd = c.CreateCommand();
+        cmd.CommandText = """
+            SELECT BatchId,PlanId,PlanName,LeafSha256,ProfileOwner,ProfileName
+            FROM um6_create_intents WHERE ReservationId=$id;
+            """;
+        cmd.Parameters.AddWithValue("$id", reservationId);
+        using var reader = cmd.ExecuteReader();
+        return reader.Read() ? new(reservationId, reader.GetGuid(0), reader.GetGuid(1),
+            reader.GetString(2), reader.GetString(3), reader.GetString(4), reader.GetString(5)) : null;
+    }
+
+    // A local claim only. Never use the legacy unbound claim for remote dispatch.
     internal bool TryBeginDispatch(Guid reservationId) =>
         Transition(reservationId, UserManager6CreateState.Prepared, UserManager6CreateState.DispatchStarted);
+
+    // Compare immutable intent with current local relationships atomically before claiming.
+    // Remote checks, protected voucher credentials and authorization are still required.
+    internal bool TryBeginBoundDispatch(Guid reservationId)
+    {
+        ValidateId(reservationId);
+        using var c = DatabaseStore.OpenExisting(databasePath);
+        using var tx = c.BeginTransaction(deferred: false);
+        using var cmd = c.CreateCommand();
+        cmd.Transaction = tx;
+        cmd.CommandText = """
+            UPDATE um6_create_journal SET State=2 WHERE ReservationId=$id AND State=1
+            AND EXISTS (
+                SELECT 1 FROM um6_create_intents i
+                JOIN voucher_reservations v ON v.Id=i.ReservationId
+                JOIN backends b ON b.Id=v.BackendId
+                JOIN voucher_batches batch ON batch.Id=v.BatchId
+                JOIN plans p ON p.Id=batch.PlanId
+                JOIN router_targets t ON t.RouterId=b.RouterId
+                WHERE i.ReservationId=um6_create_journal.ReservationId
+                  AND v.BackendId=um6_create_journal.BackendId AND v.Username=um6_create_journal.Username
+                  AND b.RouterId=um6_create_journal.RouterId AND b.Kind=2
+                  AND batch.Id=i.BatchId AND batch.BackendId=v.BackendId
+                  AND p.Id=i.PlanId AND p.BackendId=v.BackendId AND p.Name=i.PlanName
+                  AND t.LeafSha256=i.LeafSha256);
+            """;
+        cmd.Parameters.AddWithValue("$id", reservationId);
+        bool changed = cmd.ExecuteNonQuery() == 1;
+        tx.Commit();
+        return changed;
+    }
 
     internal bool TryMarkIndeterminate(Guid reservationId) =>
         Transition(reservationId, UserManager6CreateState.DispatchStarted, UserManager6CreateState.Indeterminate);
@@ -162,6 +241,7 @@ internal sealed class UserManager6CreateJournal(string databasePath)
         cmd.Transaction = tx;
         cmd.CommandText = """
             UPDATE um6_create_journal SET State=$next WHERE ReservationId=$id AND State=$expected
+              AND ($expected<>1 OR NOT EXISTS (SELECT 1 FROM um6_create_intents i WHERE i.ReservationId=um6_create_journal.ReservationId))
               AND EXISTS (SELECT 1 FROM voucher_reservations v JOIN backends b ON b.Id=v.BackendId
                 WHERE v.Id=um6_create_journal.ReservationId AND v.BackendId=um6_create_journal.BackendId
                   AND b.RouterId=um6_create_journal.RouterId AND b.Kind=2 AND v.Username=um6_create_journal.Username);
@@ -220,6 +300,34 @@ internal sealed class UserManager6CreateJournal(string databasePath)
             if (a.GetInt32(12) != 1 || b.GetInt32(12) != 1) throw RestoreConflict();
             for (int i = 0; i < 12; i++)
                 if (a.IsDBNull(i) || b.IsDBNull(i) || !Equals(a.GetValue(i), b.GetValue(i)))
+                    throw RestoreConflict();
+        }
+    }
+
+    // Preserve exact immutable intent evidence, even on still-prepared rows.
+    internal static void RequireEquivalentIntentsForRestore(string currentPath, string candidatePath)
+    {
+        using var current = DatabaseBackup.OpenRaw(currentPath, SqliteOpenMode.ReadOnly);
+        using var candidate = DatabaseBackup.OpenRaw(candidatePath, SqliteOpenMode.ReadOnly);
+        DatabaseBackup.RequireIdentity(current);
+        DatabaseBackup.RequireIdentity(candidate);
+        using var a = current.CreateCommand();
+        using var b = candidate.CreateCommand();
+        const string query = """
+            SELECT ReservationId,BatchId,PlanId,PlanName,LeafSha256,ProfileOwner,ProfileName
+            FROM um6_create_intents ORDER BY ReservationId COLLATE BINARY;
+            """;
+        a.CommandText = query;
+        b.CommandText = query;
+        using var left = a.ExecuteReader();
+        using var right = b.ExecuteReader();
+        while (true)
+        {
+            bool hasLeft = left.Read(), hasRight = right.Read();
+            if (hasLeft != hasRight) throw RestoreConflict();
+            if (!hasLeft) return;
+            for (int i = 0; i < 7; i++)
+                if (left.IsDBNull(i) || right.IsDBNull(i) || !Equals(left.GetValue(i), right.GetValue(i)))
                     throw RestoreConflict();
         }
     }

@@ -133,6 +133,7 @@ public static class ManagedDatabase
             candidate, precautionPath, backupPassword, precautionPassword);
         UserManager6CreateJournal.RequireEquivalentForRestore(currentPath, candidate);
         RouterTargetStore.RequireEquivalentForRestore(currentPath, candidate);
+        UserManager6CreateJournal.RequireEquivalentIntentsForRestore(currentPath, candidate);
         var statuses = RestoreCredentialInspector.Inspect(candidate);
         if (!allowUnavailableCredentials && statuses.Any(s => s.State == RestoreCredentialState.Unavailable))
             throw new InvalidOperationException("Restored credentials require explicit review before activation.");
