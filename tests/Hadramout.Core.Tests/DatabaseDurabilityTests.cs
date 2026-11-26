@@ -157,6 +157,7 @@ public sealed class DatabaseDurabilityTests
     // Synthetic v1 fixture: remove the v3 table and both v2 indexes.
     private static void RecreateV1Fixture(SqliteConnection c) =>
         Execute(c, """
+            DROP TABLE audit_events;
             DROP TABLE router_credentials;
             DROP INDEX IX_voucher_batches_BackendId_PlanId;
             DROP INDEX IX_voucher_reservations_BackendId_BatchId;
