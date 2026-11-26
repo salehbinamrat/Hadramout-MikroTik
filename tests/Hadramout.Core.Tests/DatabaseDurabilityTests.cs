@@ -151,12 +151,154 @@ public sealed class DatabaseDurabilityTests
         Assert.Throws<DbUpdateException>(() => db.SaveChanges());
     }
 
+    [Fact]
+    public void JournalPersistsOneShotClaimAcrossReopenAndNeverRearms()
+    {
+        using var file = new TestFile();
+        Guid id = SeedReservation(file.Path, BackendKind.UserManager6);
+        var journal = new UserManager6CreateJournal(file.Path);
+        var entry = journal.Prepare(id, "admin");
+        Assert.Equal("001", entry.Username);
+        Assert.Equal(UserManager6CreateState.Prepared, entry.State);
+        Assert.False(journal.TryMarkAcknowledged(id));
+        Assert.True(journal.TryBeginDispatch(id));
+        var reopened = new UserManager6CreateJournal(file.Path);
+        Assert.Equal(UserManager6CreateState.DispatchStarted, reopened.Read(id)!.State);
+        Assert.False(reopened.TryBeginDispatch(id));
+        Assert.True(reopened.TryMarkIndeterminate(id));
+        Assert.False(reopened.TryBeginDispatch(id));
+        Assert.False(reopened.TryMarkAcknowledged(id));
+        Assert.Equal(UserManager6CreateState.Indeterminate, reopened.Read(id)!.State);
+    }
+
+    [Fact]
+    public void JournalAcknowledgementIsTerminalAndCannotBeReplayed()
+    {
+        using var file = new TestFile();
+        Guid id = SeedReservation(file.Path, BackendKind.UserManager6);
+        var journal = new UserManager6CreateJournal(file.Path);
+        journal.Prepare(id, "admin");
+        Assert.True(journal.TryBeginDispatch(id));
+        Assert.True(journal.TryMarkAcknowledged(id));
+        Assert.False(journal.TryBeginDispatch(id));
+        Assert.False(journal.TryMarkIndeterminate(id));
+        Assert.Equal(UserManager6CreateState.Acknowledged, journal.Read(id)!.State);
+        Assert.Throws<SqliteException>(() => journal.Prepare(id, "admin"));
+    }
+
+    [Fact]
+    public void ConcurrentDispatchClaimsHaveExactlyOneWinner()
+    {
+        using var file = new TestFile();
+        Guid id = SeedReservation(file.Path, BackendKind.UserManager6);
+        var journal = new UserManager6CreateJournal(file.Path);
+        journal.Prepare(id, "admin");
+        int winners = 0;
+        Parallel.For(0, 8, _ =>
+        {
+            if (new UserManager6CreateJournal(file.Path).TryBeginDispatch(id))
+                Interlocked.Increment(ref winners);
+        });
+        Assert.Equal(1, winners);
+        Assert.Equal(UserManager6CreateState.DispatchStarted, journal.Read(id)!.State);
+    }
+
+    [Theory]
+    [InlineData(BackendKind.Hotspot)]
+    [InlineData(BackendKind.UserManager7)]
+    [InlineData(BackendKind.Pppoe)]
+    public void JournalRejectsOtherBackendReservations(BackendKind kind)
+    {
+        using var file = new TestFile();
+        Guid id = SeedReservation(file.Path, kind);
+        var journal = new UserManager6CreateJournal(file.Path);
+        Assert.Throws<InvalidOperationException>(() => journal.Prepare(id, "admin"));
+        Assert.Null(journal.Read(id));
+        Assert.False(journal.TryBeginDispatch(id));
+    }
+
+    [Fact]
+    public void JournalRejectsRewrittenIdentityAndDirectRearmOrDeletion()
+    {
+        using var file = new TestFile();
+        Guid id = SeedReservation(file.Path, BackendKind.UserManager6);
+        var journal = new UserManager6CreateJournal(file.Path);
+        journal.Prepare(id, "admin");
+        using var c = DatabaseStore.Open(file.Path);
+        Execute(c, "UPDATE voucher_reservations SET Username='002';");
+        Assert.False(journal.TryBeginDispatch(id));
+        Execute(c, "UPDATE voucher_reservations SET Username='001';");
+        Assert.True(journal.TryBeginDispatch(id));
+        Assert.Throws<SqliteException>(() => Execute(c, "UPDATE um6_create_journal SET State=1;"));
+        Assert.Throws<SqliteException>(() => Execute(c, "UPDATE um6_create_journal SET Customer='other', State=3;"));
+        Assert.Throws<SqliteException>(() => Execute(c, "DELETE FROM um6_create_journal;"));
+        Assert.Throws<SqliteException>(() => Execute(c, """
+            INSERT OR REPLACE INTO um6_create_journal SELECT ReservationId,BackendId,RouterId,Customer,Username,1
+            FROM um6_create_journal;
+            """));
+        Assert.Equal(UserManager6CreateState.DispatchStarted, journal.Read(id)!.State);
+    }
+
+    [Fact]
+    public void JournalRestoreGuardNeverAllowsLossOfPreparedOrClaimedEvidence()
+    {
+        using var file = new TestFile();
+        Guid id = SeedReservation(file.Path, BackendKind.UserManager6);
+        UserManager6CreateJournal.RequireEmptyForRestore(file.Path);
+        var journal = new UserManager6CreateJournal(file.Path);
+        journal.Prepare(id, "admin");
+        Assert.Throws<InvalidOperationException>(() => UserManager6CreateJournal.RequireEmptyForRestore(file.Path));
+        Assert.True(journal.TryBeginDispatch(id));
+        Assert.Throws<InvalidOperationException>(() => UserManager6CreateJournal.RequireEmptyForRestore(file.Path));
+    }
+
+    [Fact]
+    public void VersionFourMigrationPreservesReservationAndCreatesEmptyJournal()
+    {
+        using var file = new TestFile();
+        Guid id = SeedReservation(file.Path, BackendKind.UserManager6);
+        using (var c = DatabaseStore.Open(file.Path))
+            Execute(c, "DROP TABLE um6_create_journal; PRAGMA user_version=4;");
+        using var upgraded = DatabaseStore.OpenExisting(file.Path);
+        Assert.Equal(5L, Scalar(upgraded, "PRAGMA user_version;"));
+        Assert.Equal(1L, Scalar(upgraded, "SELECT count(*) FROM voucher_reservations;"));
+        Assert.Equal(0L, Scalar(upgraded, "SELECT count(*) FROM um6_create_journal;"));
+        Assert.Equal("001", new UserManager6CreateJournal(file.Path).Prepare(id, "admin").Username);
+    }
+
+    [Fact]
+    public void OpenExistingCannotInitializeAnUnownedEmptyFile()
+    {
+        using var file = new TestFile();
+        using (var raw = file.OpenRaw()) Execute(raw, "PRAGMA user_version=0;");
+        Assert.Throws<InvalidOperationException>(() => DatabaseStore.OpenExisting(file.Path));
+        using var reopened = file.OpenRaw();
+        Assert.Equal(0L, Scalar(reopened, "PRAGMA application_id;"));
+        Assert.Equal(0L, Scalar(reopened, "PRAGMA user_version;"));
+    }
+
+    internal static Guid SeedReservation(string path, BackendKind kind)
+    {
+        using var c = DatabaseStore.Open(path);
+        using var db = Context(c);
+        var site = new Site { Name = "journal-site" };
+        var router = new Router { SiteId = site.Id, Name = "journal-router" };
+        var backend = new Backend { RouterId = router.Id, Kind = kind };
+        var plan = new Plan { BackendId = backend.Id, Name = "day" };
+        var batch = new VoucherBatch { BackendId = backend.Id, PlanId = plan.Id };
+        var reservation = new VoucherReservation { BackendId = backend.Id, BatchId = batch.Id, Username = "001" };
+        db.AddRange(site, router, backend, plan, batch, reservation);
+        db.SaveChanges();
+        return reservation.Id;
+    }
+
     private static NetworkDbContext Context(SqliteConnection c) =>
         new(new DbContextOptionsBuilder<NetworkDbContext>().UseSqlite(c).Options);
 
     // Synthetic v1 fixture: remove the v3 table and both v2 indexes.
     private static void RecreateV1Fixture(SqliteConnection c) =>
         Execute(c, """
+            DROP TABLE um6_create_journal;
             DROP TABLE audit_events;
             DROP TABLE router_credentials;
             DROP INDEX IX_voucher_batches_BackendId_PlanId;

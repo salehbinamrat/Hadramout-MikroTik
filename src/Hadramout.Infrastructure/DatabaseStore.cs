@@ -6,7 +6,7 @@ namespace Hadramout.Infrastructure;
 /// <summary>Opens an owned local database with durable settings and atomic schema upgrades.</summary>
 public static class DatabaseStore
 {
-    public const int CurrentSchemaVersion = 4;
+    public const int CurrentSchemaVersion = 5;
     public const int ApplicationId = 0x484D4B54;
 
     public static SqliteConnection Open(string path) => OpenCore(path, SqliteOpenMode.ReadWriteCreate);
@@ -31,7 +31,8 @@ public static class DatabaseStore
         {
             connection.Open();
             Execute(connection, null, "PRAGMA synchronous=FULL;");
-            Upgrade(connection);
+            Execute(connection, null, "PRAGMA recursive_triggers=ON;");
+            Upgrade(connection, allowInitialize: mode == SqliteOpenMode.ReadWriteCreate);
 
             // Journal mode is persistent; changing it is not permitted inside a transaction.
             using var journal = connection.CreateCommand();
@@ -48,7 +49,7 @@ public static class DatabaseStore
         }
     }
 
-    private static void Upgrade(SqliteConnection connection)
+    private static void Upgrade(SqliteConnection connection, bool allowInitialize)
     {
         // An immediate write transaction serializes schema initialization across processes.
         using var tx = connection.BeginTransaction(deferred: false);
@@ -57,7 +58,7 @@ public static class DatabaseStore
 
         if (version == 0)
         {
-            if (applicationId != 0 || ReadInt(connection, tx,
+            if (!allowInitialize || applicationId != 0 || ReadInt(connection, tx,
                 "SELECT count(*) FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%';") != 0)
                 throw new InvalidOperationException("An unrecognized unversioned database must not be overwritten.");
 
@@ -92,6 +93,13 @@ public static class DatabaseStore
             Execute(connection, tx, SchemaV4);
             Execute(connection, tx, "PRAGMA user_version=4;");
             version = 4;
+        }
+
+        if (version == 4)
+        {
+            Execute(connection, tx, SchemaV5);
+            Execute(connection, tx, "PRAGMA user_version=5;");
+            version = 5;
         }
 
         if (version != CurrentSchemaVersion)
@@ -192,5 +200,32 @@ public static class DatabaseStore
             BEGIN SELECT RAISE(ABORT, 'Audit events are append-only'); END;
         CREATE TRIGGER audit_no_delete BEFORE DELETE ON audit_events
             BEGIN SELECT RAISE(ABORT, 'Audit events are append-only'); END;
+        """;
+
+    // Durable one-shot dispatch claims. Acknowledged is NOT confirmed/printable.
+    private const string SchemaV5 = """
+        CREATE TABLE um6_create_journal (
+            ReservationId TEXT NOT NULL PRIMARY KEY REFERENCES voucher_reservations(Id) ON DELETE RESTRICT,
+            BackendId TEXT NOT NULL REFERENCES backends(Id) ON DELETE RESTRICT,
+            RouterId TEXT NOT NULL REFERENCES routers(Id) ON DELETE RESTRICT,
+            Customer TEXT COLLATE BINARY NOT NULL CHECK (length(Customer) BETWEEN 1 AND 128 AND Customer=trim(Customer)),
+            Username TEXT COLLATE BINARY NOT NULL CHECK (length(Username) BETWEEN 1 AND 128 AND Username=trim(Username)),
+            State INTEGER NOT NULL CHECK (State IN (1,2,3,4)),
+            UNIQUE(RouterId, Customer, Username)
+        );
+        CREATE TRIGGER um6_create_insert_guard BEFORE INSERT ON um6_create_journal
+        WHEN NEW.State != 1 OR NOT EXISTS (
+            SELECT 1 FROM voucher_reservations v JOIN backends b ON b.Id=v.BackendId
+            WHERE v.Id=NEW.ReservationId AND v.BackendId=NEW.BackendId
+              AND b.RouterId=NEW.RouterId AND b.Kind=2 AND v.Username=NEW.Username)
+        BEGIN SELECT RAISE(ABORT,'Invalid UM6 creation reservation'); END;
+        CREATE TRIGGER um6_create_update_guard BEFORE UPDATE ON um6_create_journal
+        WHEN NEW.ReservationId IS NOT OLD.ReservationId OR NEW.BackendId IS NOT OLD.BackendId
+          OR NEW.RouterId IS NOT OLD.RouterId OR NEW.Customer IS NOT OLD.Customer
+          OR NEW.Username IS NOT OLD.Username OR NOT (
+            (OLD.State=1 AND NEW.State=2) OR (OLD.State=2 AND NEW.State IN (3,4)))
+        BEGIN SELECT RAISE(ABORT,'Invalid UM6 creation transition'); END;
+        CREATE TRIGGER um6_create_no_delete BEFORE DELETE ON um6_create_journal
+        BEGIN SELECT RAISE(ABORT,'UM6 creation evidence is retained'); END;
         """;
 }
