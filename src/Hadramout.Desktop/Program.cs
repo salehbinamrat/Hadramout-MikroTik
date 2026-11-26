@@ -13,7 +13,7 @@ internal static class Program
         if (args is ["--smoke-test", var expected])
             return RuntimeCompatibility.MatchesArchitecture(expected, RuntimeInformation.ProcessArchitecture)
                 && window.FlowDirection == FlowDirection.RightToLeft && window.Content is not null
-                && DatabaseProbe.Verify() && CredentialProbe.Verify() && BackupProbe.Verify() && EncryptedBackupProbe.Verify() ? 0 : 1;
+                && DatabaseProbe.Verify() && CredentialProbe.Verify() && BackupProbe.Verify() && EncryptedBackupProbe.Verify() && RestoreCredentialProbe.Verify() ? 0 : 1;
         if (args.Length != 0) return 2;
         return app.Run(window);
     }

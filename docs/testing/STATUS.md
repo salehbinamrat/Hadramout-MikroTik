@@ -5,6 +5,7 @@
 - PR #4 merged b46e67bb926844c8e3d2dfe4b1df2b485d208c2f; Core 45854378233 / Release 45854378337 passed.
 - PR #5 merged ca51f65541a5e8b9ff8fd9e764d7deb14fd2e345; Core 45855443868 / Release 45855443886 passed on 8f3f2c5980b9f1f8cddc1c9ff1f506e9bb1d0645; artifact 15134878557. P10a hosted snapshot and audit checks passed.
 - PR #6 merged 10cdb2cbb3709c1257260c9734e1cfbf6cc884f2; Core 45856787075 / Release 45856787079 passed on fa13c67d13054e3d89c49f38b59d9ef68d03b1c8; artifact 15136855368. P10b hosted tests passed.
-- P10c proposed streaming backup v2, legacy v1 reader, seven additional test cases and multi-chunk published probe; CI pending.
-- P10 remaining: verify streaming tests, secure workspace and crash cleanup, cross-account re-entry/rekey, pre-activation safety snapshot, live activation, current-history preservation, full audit coverage/actor attribution, retention and scheduling. No live restore.
+- PR #7 merged 922ace11fc11b6a0f445c4db6830c45553603e19; Core 45857595270 / Release 45857595229 passed on c6b6f950f85263c5ae6c0dac1211d5104100deae; artifact 15136548580. Streaming and legacy tests passed in hosted CI; 16 GiB and real x86 OS not measured.
+- P10d proposed read-only credential classification, explicit transactional re-entry, nine new tests and both-architecture published probe. CI pending; actual different-account/device testing pending.
+- P10 remaining: verify re-entry tests, secure workspace and crash cleanup, real cross-account/device validation, pre-activation safety snapshot, live activation, current-history preservation, full audit coverage/actor attribution, retention and scheduling. No live restore.
 - P01 deeper per-feature audit; physical Windows, RouterOS, printers; hard-kill, power-loss and disk-full tests pending. main remains unprotected; exact-head manual gate enforced. No production DB or real router changes.
