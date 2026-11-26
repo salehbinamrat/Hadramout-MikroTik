@@ -16,6 +16,7 @@ internal static class RouterCredentialProtector
     private const int TagSize = 16;
     internal const int MaxSecretLength = 4096;
     private const int MaxWrappedKey = 16384;
+    internal const int MaxEnvelopeLength = Header + MaxWrappedKey + NonceSize + TagSize + MaxSecretLength;
 
     internal static byte[] Protect(Guid routerId, string purpose, ReadOnlySpan<byte> secret)
     {

@@ -115,7 +115,7 @@ public static class DatabaseBackup
                 throw new IOException("Unexpected SQLite sidecar; a standalone snapshot is required.");
     }
 
-    private static SqliteConnection OpenRaw(string path, SqliteOpenMode mode)
+    internal static SqliteConnection OpenRaw(string path, SqliteOpenMode mode)
     {
         var c = new SqliteConnection(new SqliteConnectionStringBuilder
         {
@@ -125,7 +125,7 @@ public static class DatabaseBackup
         catch { c.Dispose(); throw; }
     }
 
-    private static void RequireIdentity(SqliteConnection c)
+    internal static void RequireIdentity(SqliteConnection c)
     {
         using var cmd = c.CreateCommand();
         cmd.CommandText = "PRAGMA application_id;";

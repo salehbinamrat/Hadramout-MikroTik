@@ -9,7 +9,11 @@ public static class DatabaseStore
     public const int CurrentSchemaVersion = 4;
     public const int ApplicationId = 0x484D4B54;
 
-    public static SqliteConnection Open(string path)
+    public static SqliteConnection Open(string path) => OpenCore(path, SqliteOpenMode.ReadWriteCreate);
+
+    internal static SqliteConnection OpenExisting(string path) => OpenCore(path, SqliteOpenMode.ReadWrite);
+
+    private static SqliteConnection OpenCore(string path, SqliteOpenMode mode)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(path);
         if (!Path.IsPathFullyQualified(path))
@@ -18,7 +22,7 @@ public static class DatabaseStore
         var connection = new SqliteConnection(new SqliteConnectionStringBuilder
         {
             DataSource = path,
-            Mode = SqliteOpenMode.ReadWriteCreate,
+            Mode = mode,
             ForeignKeys = true,
             Pooling = false,
             DefaultTimeout = 10

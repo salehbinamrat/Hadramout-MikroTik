@@ -34,16 +34,40 @@ public sealed class RouterCredentialStore(string databasePath)
 {
     public void Save(Guid routerId, ReadOnlySpan<byte> username, ReadOnlySpan<byte> password)
     {
+        ValidateInput(routerId, username, password);
+        using var connection = DatabaseStore.Open(databasePath);
+        using var tx = connection.BeginTransaction(deferred: false);
+        WriteCredentials(connection, tx, routerId, username, password);
+        tx.Commit();
+    }
+
+    // Explicit re-entry for a trusted restored candidate only. Readable or absent records
+    // cannot be replaced by this recovery API. Check and replace in the same transaction.
+    public void ReenterUnavailable(Guid routerId, ReadOnlySpan<byte> username, ReadOnlySpan<byte> password)
+    {
+        ValidateInput(routerId, username, password);
+        using var connection = DatabaseStore.OpenExisting(databasePath);
+        using var tx = connection.BeginTransaction(deferred: false);
+        if (RestoreCredentialInspector.ReadStatus(connection, tx, routerId) != RestoreCredentialState.Unavailable)
+            throw new InvalidOperationException("Only unavailable restored credentials may be re-entered.");
+        WriteCredentials(connection, tx, routerId, username, password);
+        tx.Commit();
+    }
+
+    private static void ValidateInput(Guid routerId, ReadOnlySpan<byte> username, ReadOnlySpan<byte> password)
+    {
         ValidateId(routerId);
         if (username.IsEmpty) throw new ArgumentException("Username is required.", nameof(username));
         if (username.Length > RouterCredentialProtector.MaxSecretLength ||
             password.Length > RouterCredentialProtector.MaxSecretLength)
             throw new ArgumentException("Credential exceeds the supported length.");
+    }
 
+    private static void WriteCredentials(SqliteConnection connection, SqliteTransaction tx, Guid routerId,
+        ReadOnlySpan<byte> username, ReadOnlySpan<byte> password)
+    {
         byte[] userEnvelope = RouterCredentialProtector.Protect(routerId, "username", username);
         byte[] passEnvelope = RouterCredentialProtector.Protect(routerId, "password", password);
-        using var connection = DatabaseStore.Open(databasePath);
-        using var tx = connection.BeginTransaction(deferred: false);
         using var cmd = connection.CreateCommand();
         cmd.Transaction = tx;
         cmd.CommandText = """
@@ -57,7 +81,6 @@ public sealed class RouterCredentialStore(string databasePath)
         cmd.Parameters.Add("$password", SqliteType.Blob).Value = passEnvelope;
         cmd.ExecuteNonQuery();
         AuditStore.Append(connection, tx, AuditKind.CredentialSaved, routerId);
-        tx.Commit();
     }
 
     public RouterCredentialLease? Load(Guid routerId)
@@ -69,10 +92,16 @@ public sealed class RouterCredentialStore(string databasePath)
         cmd.Parameters.AddWithValue("$id", routerId);
         using var reader = cmd.ExecuteReader();
         if (!reader.Read()) return null;
-        byte[] user = RouterCredentialProtector.Unprotect(routerId, "username", reader.GetFieldValue<byte[]>(0));
+        return OpenLease(routerId, reader.GetFieldValue<byte[]>(0), reader.GetFieldValue<byte[]>(1));
+    }
+
+    internal static RouterCredentialLease OpenLease(Guid routerId, byte[] usernameEnvelope, byte[] passwordEnvelope)
+    {
+        byte[] user = RouterCredentialProtector.Unprotect(routerId, "username", usernameEnvelope);
         try
         {
-            byte[] pass = RouterCredentialProtector.Unprotect(routerId, "password", reader.GetFieldValue<byte[]>(1));
+            if (user.Length == 0) throw new CryptographicException("Stored router credential is unavailable or invalid.");
+            byte[] pass = RouterCredentialProtector.Unprotect(routerId, "password", passwordEnvelope);
             return new RouterCredentialLease(user, pass);
         }
         catch
