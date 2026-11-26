@@ -136,7 +136,7 @@ internal sealed class RouterOsSession : IDisposable
             await RequireUserManager6FamilyAsync(stream, token).ConfigureAwait(false);
             var rows = await ReadCommandAsync(stream,
                 ["/tool/user-manager/user/print"u8.ToArray(),
-                    "=.proplist=customer,username,disabled,actual-profile"u8.ToArray(),
+                    "=.proplist=customer,username,disabled,actual-profile,download-used,upload-used,uptime-used"u8.ToArray(),
                     UserManager6Records.Query("customer", customer), UserManager6Records.Query("username", username)],
                 words => UserManager6Records.ParseAccount(words, customer, username), 1, token).ConfigureAwait(false);
             return rows.Count == 0 ? null : rows[0];
@@ -156,6 +156,23 @@ internal sealed class RouterOsSession : IDisposable
                     "=.proplist=owner,name,validity,starts-at"u8.ToArray(),
                     UserManager6Records.Query("owner", owner), UserManager6Records.Query("name", name)],
                 words => UserManager6Records.ParseProfile(words, owner, name), 1, token).ConfigureAwait(false);
+            return rows.Count == 0 ? null : rows[0];
+        }, timeout, cancellationToken);
+    }
+
+    internal Task<UserManager6Limitation?> FindUserManager6LimitationAsync(string owner, string name,
+        TimeSpan? timeout = null, CancellationToken cancellationToken = default)
+    {
+        UserManager6Records.ValidateKey(owner, nameof(owner));
+        UserManager6Records.ValidateKey(name, nameof(name));
+        return WithReadSessionAsync<UserManager6Limitation?>(async (stream, token) =>
+        {
+            await RequireUserManager6FamilyAsync(stream, token).ConfigureAwait(false);
+            var rows = await ReadCommandAsync(stream,
+                ["/tool/user-manager/profile/limitation/print"u8.ToArray(),
+                    "=.proplist=owner,name,download-limit,upload-limit,transfer-limit,uptime-limit,rate-limit-rx,rate-limit-tx"u8.ToArray(),
+                    UserManager6Records.Query("owner", owner), UserManager6Records.Query("name", name)],
+                words => UserManager6Records.ParseLimitation(words, owner, name), 1, token).ConfigureAwait(false);
             return rows.Count == 0 ? null : rows[0];
         }, timeout, cancellationToken);
     }

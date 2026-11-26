@@ -438,6 +438,47 @@ public sealed class RouterOsWireCodecTests
             "admin", "123"));
     }
 
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("1.5MiB")]
+    [InlineData("2G")]
+    [InlineData("-1")]
+    [InlineData("+1")]
+    [InlineData(" 0")]
+    [InlineData("18446744073709551616")]
+    [InlineData("B")]
+    public void Um6ByteValuesNeverTurnUnknownIntoZero(string? raw)
+    {
+        var value = UserManager6ByteValue.FromRaw(raw);
+        Assert.Equal(raw, value.Raw);
+        Assert.Null(value.Bytes);
+    }
+
+    [Theory]
+    [InlineData("0")]
+    [InlineData("0B")]
+    [InlineData("4294967296")]
+    [InlineData("18446744073709551615B")]
+    public void Um6ByteValuesPreserveExactUnsignedCounters(string raw)
+    {
+        var value = UserManager6ByteValue.FromRaw(raw);
+        Assert.Equal(raw, value.Raw);
+        Assert.Equal(ulong.Parse(raw.TrimEnd('B'), System.Globalization.CultureInfo.InvariantCulture), value.Bytes);
+    }
+
+    [Fact]
+    public void Um6ObservedTransferCannotOverflowOrInferMissingCounter()
+    {
+        var maximum = UserManager6ByteValue.FromRaw("18446744073709551615");
+        var one = UserManager6ByteValue.FromRaw("1");
+        var zero = UserManager6ByteValue.FromRaw("0");
+        var missing = UserManager6ByteValue.FromRaw(null);
+        Assert.Null(new UserManager6Usage(maximum, one, null).ObservedTransferBytes);
+        Assert.Null(new UserManager6Usage(one, missing, null).ObservedTransferBytes);
+        Assert.Equal(ulong.MaxValue, new UserManager6Usage(maximum, zero, null).ObservedTransferBytes);
+    }
+
     private sealed class FragmentedStream(byte[] bytes) : MemoryStream(bytes)
     {
         public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default) =>
