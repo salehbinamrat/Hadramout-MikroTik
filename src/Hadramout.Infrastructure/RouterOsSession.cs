@@ -195,6 +195,32 @@ internal sealed class RouterOsSession : IDisposable
         }, timeout, cancellationToken);
     }
 
+    // Completed read observations only; no reservation or write authorization.
+    internal Task<UserManager6PreflightEvidence> ReadUserManager6CreationPreflightAsync(
+        string owner, string profile, string username, TimeSpan? timeout = null,
+        CancellationToken cancellationToken = default)
+    {
+        UserManager6Records.ValidateKey(owner, nameof(owner));
+        UserManager6Records.ValidateKey(profile, nameof(profile));
+        UserManager6Records.ValidateKey(username, nameof(username));
+        return WithReadSessionAsync(async (stream, token) =>
+        {
+            await RequireUserManager6FamilyAsync(stream, token).ConfigureAwait(false);
+            var profiles = await ReadUniqueVisibleUm6ProfileAsync(stream, owner, profile, token).ConfigureAwait(false);
+            if (profiles.Count == 0)
+                return new UserManager6PreflightEvidence(UserManager6PreflightState.ProfileNotVisible, null, null);
+            // No customer filter: any visible same-name account blocks creation.
+            var customers = await ReadCommandAsync(stream,
+                ["/tool/user-manager/user/print"u8.ToArray(),
+                    "=.proplist=customer,username"u8.ToArray(),
+                    UserManager6Records.Query("username", username)],
+                words => UserManager6Records.ParseVisibleUsernameCustomer(words, username), 1, token).ConfigureAwait(false);
+            return customers.Count == 0
+                ? new UserManager6PreflightEvidence(UserManager6PreflightState.NoVisibleUsernameMatch, profiles[0], null)
+                : new UserManager6PreflightEvidence(UserManager6PreflightState.UsernameAlreadyVisible, profiles[0], customers[0]);
+        }, timeout, cancellationToken);
+    }
+
     // First verify a unique visible profile name and its owner. Legacy mapping rows
     // expose profile names but not owners; return explicitly non-authoritative evidence.
     internal Task<UserManager6ProfileMappingEvidence?> ReadUserManager6ProfileMappingAsync(
@@ -207,11 +233,7 @@ internal sealed class RouterOsSession : IDisposable
             await RequireUserManager6FamilyAsync(stream, token).ConfigureAwait(false);
             // Do not filter by owner here: that could hide a visible same-name collision.
             // Only the expected owner's exact row may pass the projector.
-            var profiles = await ReadCommandAsync(stream,
-                ["/tool/user-manager/profile/print"u8.ToArray(),
-                    "=.proplist=owner,name,validity,starts-at"u8.ToArray(),
-                    UserManager6Records.Query("name", name)],
-                words => UserManager6Records.ParseProfile(words, owner, name), 1, token).ConfigureAwait(false);
+            var profiles = await ReadUniqueVisibleUm6ProfileAsync(stream, owner, name, token).ConfigureAwait(false);
             if (profiles.Count == 0) return null;
             var links = await ReadCommandAsync(stream,
                 ["/tool/user-manager/profile/profile-limitation/print"u8.ToArray(),
@@ -221,6 +243,14 @@ internal sealed class RouterOsSession : IDisposable
             return new UserManager6ProfileMappingEvidence(profiles[0], links);
         }, timeout, cancellationToken);
     }
+
+    private static Task<IReadOnlyList<UserManager6Profile>> ReadUniqueVisibleUm6ProfileAsync(
+        Stream stream, string owner, string name, CancellationToken token) =>
+        ReadCommandAsync(stream,
+            ["/tool/user-manager/profile/print"u8.ToArray(),
+                "=.proplist=owner,name,validity,starts-at"u8.ToArray(),
+                UserManager6Records.Query("name", name)],
+            words => UserManager6Records.ParseProfile(words, owner, name), 1, token);
 
     private static async Task RequireUserManager6FamilyAsync(Stream stream, CancellationToken token)
     {

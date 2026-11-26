@@ -11,6 +11,9 @@ internal sealed record UserManager6CreateEntry(Guid ReservationId, Guid BackendI
 internal sealed record UserManager6CreateIntent(Guid ReservationId, Guid BatchId, Guid PlanId,
     string PlanName, string LeafSha256, string ProfileOwner, string ProfileName);
 
+internal sealed record UserManager6PreflightScope(Guid ReservationId, Guid RouterId,
+    string LeafSha256, string ProfileOwner, string ProfileName, string Username);
+
 internal sealed record UserManager6CreationReviewRow(UserManager6CreateEntry Entry, bool LocalIdentityMatches);
 internal sealed record UserManager6CreationReviewPage(IReadOnlyList<UserManager6CreationReviewRow> Rows,
     Guid? NextAfterReservationId);
@@ -190,6 +193,40 @@ internal sealed class UserManager6CreateJournal(string databasePath)
         using var reader = cmd.ExecuteReader();
         return reader.Read() ? new(reservationId, reader.GetGuid(0), reader.GetGuid(1),
             reader.GetString(2), reader.GetString(3), reader.GetString(4), reader.GetString(5)) : null;
+    }
+
+    // Consistent local read snapshot; no dispatch claim or mutation.
+    [SupportedOSPlatform("windows")]
+    internal UserManager6PreflightScope ReadPreparedPreflightScope(Guid reservationId)
+    {
+        ValidateId(reservationId);
+        using var c = OpenReadOnly();
+        using var tx = c.BeginTransaction(deferred: true);
+        using var cmd = c.CreateCommand();
+        cmd.Transaction = tx;
+        cmd.CommandText = """
+            SELECT j.RouterId,i.LeafSha256,i.ProfileOwner,i.ProfileName,j.Username
+            FROM um6_create_journal j
+            JOIN um6_create_intents i ON i.ReservationId=j.ReservationId
+            JOIN voucher_reservations v ON v.Id=j.ReservationId AND v.BackendId=j.BackendId AND v.Username=j.Username
+            JOIN backends b ON b.Id=j.BackendId AND b.RouterId=j.RouterId AND b.Kind=2
+            JOIN voucher_batches batch ON batch.Id=v.BatchId AND batch.Id=i.BatchId AND batch.BackendId=j.BackendId
+            JOIN plans p ON p.Id=batch.PlanId AND p.Id=i.PlanId AND p.BackendId=j.BackendId AND p.Name=i.PlanName
+            JOIN router_targets t ON t.RouterId=j.RouterId AND t.LeafSha256=i.LeafSha256
+            WHERE j.ReservationId=$id AND j.State=1;
+            """;
+        cmd.Parameters.AddWithValue("$id", reservationId);
+        UserManager6PreflightScope scope;
+        using (var reader = cmd.ExecuteReader())
+        {
+            if (!reader.Read()) throw new InvalidOperationException("A matching prepared creation intent is required.");
+            scope = new(reservationId, reader.GetGuid(0), reader.GetString(1), reader.GetString(2),
+                reader.GetString(3), reader.GetString(4));
+        }
+        using var secret = UserManager6VoucherSecretStore.Load(c, tx, reservationId)
+            ?? throw new InvalidOperationException("Voucher password has not been configured.");
+        tx.Commit();
+        return scope;
     }
 
     // A local claim only. Never use the legacy unbound claim for remote dispatch.
