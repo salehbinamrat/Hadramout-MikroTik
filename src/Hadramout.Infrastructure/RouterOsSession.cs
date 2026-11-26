@@ -89,39 +89,17 @@ internal sealed class RouterOsSession : IDisposable
                 await RouterOsWireCodec.WriteSentenceAsync(connection.Stream,
                     ["/system/resource/print"u8.ToArray(), "=.proplist=version"u8.ToArray()], deadline.Token)
                     .ConfigureAwait(false);
-                string? version = null;
-                // Exactly one data row followed by completion; no unbounded reply collection.
-                for (int i = 0; i < 2; i++)
-                {
-                    byte[][] reply = await RouterOsWireCodec.ReadSentenceAsync(connection.Stream, deadline.Token)
-                        .ConfigureAwait(false);
-                    try
+                var reply = await RouterOsReplyReader.ReadAsync(connection.Stream, ParseVersion,
+                    maxRows: 1, deadline.Token).ConfigureAwait(false);
+                if (reply.Outcome != RouterOsReplyOutcome.Completed || reply.Rows.Count != 1)
+                    throw new InvalidDataException(reply.Outcome switch
                     {
-                        if (reply.Length == 1 && reply[0].AsSpan().SequenceEqual("!done"u8) && version is not null)
-                        {
-                            deadline.Token.ThrowIfCancellationRequested();
-                            return version;
-                        }
-                        if (reply.Length == 0 || !reply[0].AsSpan().SequenceEqual("!re"u8) || version is not null)
-                            throw new InvalidDataException("Unexpected RouterOS version response.");
-                        foreach (byte[] word in reply.Skip(1))
-                        {
-                            if (!word.AsSpan().StartsWith("=version="u8)) continue;
-                            if (version is not null || word.Length is < 10 or > 137)
-                                throw new InvalidDataException("Invalid RouterOS version field.");
-                            for (int j = 9; j < word.Length; j++)
-                                if (word[j] is < 0x20 or > 0x7E)
-                                    throw new InvalidDataException("Invalid RouterOS version encoding.");
-                            version = Encoding.ASCII.GetString(word, 9, word.Length - 9);
-                            if (string.IsNullOrWhiteSpace(version))
-                                throw new InvalidDataException("Empty RouterOS version.");
-                        }
-                        if (version is null)
-                            throw new InvalidDataException("Missing RouterOS version field.");
-                    }
-                    finally { ClearWords(reply); }
-                }
-                throw new InvalidDataException("RouterOS version command did not complete.");
+                        RouterOsReplyOutcome.Rejected => "RouterOS rejected the version command.",
+                        RouterOsReplyOutcome.Fatal => "RouterOS closed the command session.",
+                        _ => "RouterOS version response must contain exactly one row."
+                    });
+                deadline.Token.ThrowIfCancellationRequested();
+                return reply.Rows[0];
             }
             catch (Exception ex)
             {
@@ -136,6 +114,24 @@ internal sealed class RouterOsSession : IDisposable
             }
         }
         finally { Volatile.Write(ref busy, 0); }
+    }
+
+    private static string ParseVersion(byte[][] words)
+    {
+        string? version = null;
+        foreach (byte[] word in words.Skip(1))
+        {
+            if (!word.AsSpan().StartsWith("=version="u8)) continue;
+            if (version is not null || word.Length is < 10 or > 137)
+                throw new InvalidDataException("Invalid RouterOS version field.");
+            for (int j = 9; j < word.Length; j++)
+                if (word[j] is < 0x20 or > 0x7E)
+                    throw new InvalidDataException("Invalid RouterOS version encoding.");
+            version = Encoding.ASCII.GetString(word, 9, word.Length - 9);
+            if (string.IsNullOrWhiteSpace(version))
+                throw new InvalidDataException("Empty RouterOS version.");
+        }
+        return version ?? throw new InvalidDataException("Missing RouterOS version field.");
     }
 
     private static TimeSpan ValidateTimeout(TimeSpan? timeout)
