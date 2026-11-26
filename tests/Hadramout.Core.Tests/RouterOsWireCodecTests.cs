@@ -409,6 +409,35 @@ public sealed class RouterOsWireCodecTests
         Assert.Equal(RouterOsReplyOutcome.Completed, result.Outcome);
     }
 
+    [Theory]
+    [InlineData("")]
+    [InlineData(" ")]
+    [InlineData(" card")]
+    [InlineData("card ")]
+    [InlineData("card\nnext")]
+    [InlineData("card\0next")]
+    public void UserManager6RejectsInvalidLookupIdentity(string value) =>
+        Assert.Throws<ArgumentException>(() => UserManager6Records.ValidateKey(value, "username"));
+
+    [Fact]
+    public void UserManager6LookupIdentityUsesByteLimitNotJustCharacterCount()
+    {
+        UserManager6Records.ValidateKey(new string('ع', 64), "name");
+        Assert.Throws<ArgumentException>(() => UserManager6Records.ValidateKey(new string('ع', 65), "name"));
+    }
+
+    [Fact]
+    public void UserManager6RejectsInvalidUtf8AndUnknownDisabledFlag()
+    {
+        Assert.Throws<InvalidDataException>(() => UserManager6Records.ParseAccount(
+            ["!re"u8.ToArray(), "=customer=admin"u8.ToArray(), "=username=123"u8.ToArray(),
+                "=disabled=maybe"u8.ToArray()], "admin", "123"));
+        Assert.Throws<InvalidDataException>(() => UserManager6Records.ParseAccount(
+            ["!re"u8.ToArray(), "=customer=admin"u8.ToArray(), "=username=123"u8.ToArray(),
+                [0x3D, 0x61, 0x63, 0x74, 0x75, 0x61, 0x6C, 0x2D, 0x70, 0x72, 0x6F, 0x66, 0x69, 0x6C, 0x65, 0x3D, 0xFF]],
+            "admin", "123"));
+    }
+
     private sealed class FragmentedStream(byte[] bytes) : MemoryStream(bytes)
     {
         public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default) =>

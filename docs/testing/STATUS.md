@@ -19,7 +19,8 @@
 - PR #18 merged 73c02545c188c0ecfceee1d340e275cf7ab79246; Core 45872954012 / Release 45872953981 passed on bbf50b9a7ce75dcafe42eea9a7469ac68a90b4d7; artifact 15143059943. P13b hosted checks passed.
 - PR #19 merged a2effd1812415531e178b7600ea5ee31cc9931b2; Core 45873962380 / Release 45873962468 passed on b0fd80e7e7341ccf810d5fa2317e7eaae7c99b7f; artifact 15144552048. P14a hosted checks passed.
 - PR #20 merged b50b6b30bf6b2771720f051525410974a494cbc2; Core 45874881694 / Release 45874881536 passed on 3c477ab64baec071881384506f11060527303a54; artifact 15145306221. P14b hosted checks passed.
-- P15 proposed integrated simulated RouterOS compatibility matrix and field acceptance checklist, 6 new cases; CI pending. No production code changes, no new files or dependencies. Physical RouterOS/Windows validation remains open.
+- PR #21 merged 224e6128e05094cdfbb9f260af97590209fbf776; Core 45876165166 / Release 45876165073 passed on 119836cc6b79581121d96815c97941400ae8dcd6; artifact 15145495015. P15 hosted simulation passed; physical qualification remains open.
+- P16a proposed scoped UM6 account/profile reads, 20 new cases; CI pending. No new packages, no live router access or write operations.
 - P10 remaining: restore UI and RBAC, managed crash cleanup, real cross-account/device validation, full audit coverage/actor attribution, retention and scheduling. No production restore.
 - P01 deeper per-feature audit; physical Windows, RouterOS, printers; hard-kill, power-loss and disk-full tests pending. main remains unprotected; exact-head manual gate enforced. No production DB or real router changes.
 

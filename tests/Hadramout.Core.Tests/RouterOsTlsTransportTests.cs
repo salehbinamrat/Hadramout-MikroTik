@@ -918,6 +918,148 @@ public sealed class RouterOsTlsTransportTests(ITestOutputHelper output)
             ["!re"u8.ToArray(), Encoding.ASCII.GetBytes("=name=" + name),
                 Encoding.ASCII.GetBytes("=version=" + version), "=disabled=false"u8.ToArray()], token);
 
+    [Theory]
+    [InlineData("yes", "", true)]
+    [InlineData("no", "باقة=يوم", false)]
+    [InlineData("", null, null)]
+    public async Task UserManager6ReadsExactAccountWithoutInferringExpiry(string disabled, string? profile, bool? expected)
+    {
+        using var certificates = new Certificates();
+        using var server = new LoopbackServer(certificates.Leaf, certificates.Root, output);
+        Task serve = server.RunAsync(reply: true, handler: async (tls, token) =>
+        {
+            await PrepareProbePeerAsync(tls, token, "6.49.19");
+            await AssertUm6AccountRequestAsync(tls, token);
+            var reply = new List<ReadOnlyMemory<byte>>
+            {
+                "!re"u8.ToArray(), "=customer=admin"u8.ToArray(), "=username=123456"u8.ToArray(),
+                Encoding.UTF8.GetBytes("=disabled=" + disabled)
+            };
+            if (profile is not null) reply.Add(Encoding.UTF8.GetBytes("=actual-profile=" + profile));
+            await RouterOsWireCodec.WriteSentenceAsync(tls, reply, token);
+            await RouterOsWireCodec.WriteSentenceAsync(tls, ["!done"u8.ToArray()], token);
+        });
+        try
+        {
+            var account = await FindUm6AccountAsync(server, certificates);
+            Assert.NotNull(account);
+            Assert.Equal("admin", account.Customer);
+            Assert.Equal("123456", account.Username);
+            Assert.Equal(expected, account.Disabled);
+            Assert.Equal(profile, account.ActualProfile);
+        }
+        finally { await serve; }
+    }
+
+    [Theory]
+    [InlineData("absent")]
+    [InlineData("wrong-customer")]
+    [InlineData("wrong-user")]
+    [InlineData("duplicate")]
+    [InlineData("legacy-name-only")]
+    [InlineData("trap")]
+    public async Task UserManager6AccountLookupDistinguishesAbsenceFromInvalidOrRejectedRead(string condition)
+    {
+        using var certificates = new Certificates();
+        using var server = new LoopbackServer(certificates.Leaf, certificates.Root, output);
+        Task serve = server.RunAsync(reply: true, handler: async (tls, token) =>
+        {
+            await PrepareProbePeerAsync(tls, token, "6.49.19");
+            await AssertUm6AccountRequestAsync(tls, token);
+            if (condition == "trap")
+            {
+                await RouterOsWireCodec.WriteSentenceAsync(tls, ["!trap"u8.ToArray()], token);
+                return;
+            }
+            if (condition != "absent")
+            {
+                ReadOnlyMemory<byte>[] row =
+                [
+                    "!re"u8.ToArray(),
+                    Encoding.ASCII.GetBytes(condition == "wrong-customer" ? "=customer=other" : "=customer=admin"),
+                    Encoding.ASCII.GetBytes(condition == "legacy-name-only" ? "=name=123456" :
+                        condition == "wrong-user" ? "=username=123457" : "=username=123456")
+                ];
+                await RouterOsWireCodec.WriteSentenceAsync(tls, row, token);
+                if (condition == "duplicate")
+                    await RouterOsWireCodec.WriteSentenceAsync(tls, row, token);
+                // Invalid rows are rejected immediately; do not race a closed client by writing again.
+                return;
+            }
+            await RouterOsWireCodec.WriteSentenceAsync(tls, ["!done"u8.ToArray()], token);
+        });
+        try
+        {
+            if (condition == "absent") Assert.Null(await FindUm6AccountAsync(server, certificates));
+            else await Assert.ThrowsAsync<InvalidDataException>(() => FindUm6AccountAsync(server, certificates));
+        }
+        finally { await serve; }
+        Assert.False(server.HasPendingConnection);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task UserManager6ProfileLookupVerifiesOwnerAndPreservesRawValidity(bool wrongOwner)
+    {
+        using var certificates = new Certificates();
+        using var server = new LoopbackServer(certificates.Leaf, certificates.Root, output);
+        Task serve = server.RunAsync(reply: true, handler: async (tls, token) =>
+        {
+            await PrepareProbePeerAsync(tls, token, "6.49.19");
+            byte[][] words = await RouterOsWireCodec.ReadSentenceAsync(tls, token);
+            Assert.Equal(new[] { "/tool/user-manager/profile/print", "=.proplist=owner,name,validity,starts-at",
+                "?owner=admin", "?name=باقة=يوم" }, words.Select(word => Encoding.UTF8.GetString(word)).ToArray());
+            await RouterOsWireCodec.WriteSentenceAsync(tls,
+                ["!re"u8.ToArray(), Encoding.ASCII.GetBytes(wrongOwner ? "=owner=other" : "=owner=admin"),
+                    Encoding.UTF8.GetBytes("=name=باقة=يوم"), "=validity=0s"u8.ToArray(), "=starts-at=logon"u8.ToArray()], token);
+            if (!wrongOwner) await RouterOsWireCodec.WriteSentenceAsync(tls, ["!done"u8.ToArray()], token);
+        });
+        Task<UserManager6Profile?> Find() => RouterOsReadRecovery.FindUserManager6ProfileAsync("admin", "باقة=يوم",
+            "127.0.0.1", "router.test", "synthetic-user"u8.ToArray(), "synthetic-private-password"u8.ToArray(),
+            server.Port, trustedRootDer: certificates.Root.RawData);
+        try
+        {
+            if (wrongOwner) await Assert.ThrowsAsync<InvalidDataException>(Find);
+            else
+            {
+                var profile = await Find();
+                Assert.NotNull(profile);
+                Assert.Equal("admin", profile.Owner);
+                Assert.Equal("باقة=يوم", profile.Name);
+                Assert.Equal("0s", profile.Validity);
+                Assert.Equal("logon", profile.StartsAt);
+            }
+        }
+        finally { await serve; }
+    }
+
+    [Fact]
+    public async Task UserManager6LookupNeverSendsLegacyMenuToV7()
+    {
+        using var certificates = new Certificates();
+        using var server = new LoopbackServer(certificates.Leaf, certificates.Root, output);
+        Task serve = server.RunAsync(reply: true, handler: async (tls, token) =>
+        {
+            await PrepareProbePeerAsync(tls, token, "7.21.1");
+            Assert.Equal(0, await tls.ReadAsync(new byte[1], token));
+        });
+        try { await Assert.ThrowsAsync<NotSupportedException>(() => FindUm6AccountAsync(server, certificates)); }
+        finally { await serve; }
+    }
+
+    private static Task<UserManager6Account?> FindUm6AccountAsync(LoopbackServer server, Certificates certificates) =>
+        RouterOsReadRecovery.FindUserManager6AccountAsync("admin", "123456", "127.0.0.1", "router.test",
+            "synthetic-user"u8.ToArray(), "synthetic-private-password"u8.ToArray(), server.Port,
+            trustedRootDer: certificates.Root.RawData);
+
+    private static async Task AssertUm6AccountRequestAsync(SslStream tls, CancellationToken token)
+    {
+        byte[][] words = await RouterOsWireCodec.ReadSentenceAsync(tls, token);
+        Assert.Equal(new[] { "/tool/user-manager/user/print", "=.proplist=customer,username,disabled,actual-profile",
+            "?customer=admin", "?username=123456" }, words.Select(word => Encoding.UTF8.GetString(word)).ToArray());
+    }
+
     private static async Task PrepareProbePeerAsync(SslStream tls, CancellationToken token, string version)
     {
         await AssertLoginAsync(tls, token);
