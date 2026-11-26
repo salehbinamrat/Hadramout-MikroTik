@@ -141,11 +141,29 @@ public sealed class BackupAuditTests
     {
         using var f = new Fixture();
         using (var c = DatabaseStore.Open(f.Source))
-            Execute(c, "DROP TABLE audit_events; PRAGMA user_version=3;");
+            DatabaseDurabilityTests.RecreateLegacyFixture(c, 3);
         using var upgraded = DatabaseStore.Open(f.Source);
-        Assert.Equal(4L, Scalar(upgraded, "PRAGMA user_version;"));
+        Assert.Equal((long)DatabaseStore.CurrentSchemaVersion, Scalar(upgraded, "PRAGMA user_version;"));
         Assert.Equal(1L, Scalar(upgraded, "SELECT count(*) FROM routers;"));
         Assert.Empty(AuditStore.ReadRecent(f.Source));
+    }
+
+    [Fact]
+    public void VerifiedVersionFourBackupUpgradesOnlyStagedCandidate()
+    {
+        using var f = new Fixture();
+        using (var c = DatabaseStore.Open(f.Source))
+        {
+            DatabaseDurabilityTests.RecreateLegacyFixture(c, 4);
+            DatabaseBackup.MakeStandalone(c);
+        }
+        byte[] before = SHA256.HashData(File.ReadAllBytes(f.Source));
+        DatabaseBackup.PrepareRestore(f.Source, f.Candidate, Convert.ToHexString(before));
+        Assert.Equal(before, SHA256.HashData(File.ReadAllBytes(f.Source)));
+        using var candidate = DatabaseStore.OpenExisting(f.Candidate);
+        Assert.Equal(5L, Scalar(candidate, "PRAGMA user_version;"));
+        Assert.Equal(1L, Scalar(candidate, "SELECT count(*) FROM routers;"));
+        Assert.Equal(0L, Scalar(candidate, "SELECT count(*) FROM um6_create_journal;"));
     }
 
     private static object Scalar(SqliteConnection c, string sql)

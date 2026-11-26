@@ -54,8 +54,9 @@ public static class DatabaseBackup
                 if (!CryptographicOperations.FixedTimeEquals(SHA256.HashData(input), expected))
                     throw new InvalidDataException("Backup digest does not match.");
             }
-            ValidateSnapshot(staged);
-            using (var target = DatabaseStore.Open(staged))
+            // Verify a supported legacy snapshot before upgrading the authenticated copy.
+            ValidateSnapshot(staged, allowVersionFour: true);
+            using (var target = DatabaseStore.OpenExisting(staged))
             {
                 using var tx = target.BeginTransaction(deferred: false);
                 AuditStore.Append(target, tx, AuditKind.RestoreCandidatePrepared, null);
@@ -182,28 +183,29 @@ public static class DatabaseBackup
         catch { c.Dispose(); throw; }
     }
 
-    internal static void RequireIdentity(SqliteConnection c)
+    internal static void RequireIdentity(SqliteConnection c, bool allowVersionFour = false)
     {
         using var cmd = c.CreateCommand();
         cmd.CommandText = "PRAGMA application_id;";
         if ((long)cmd.ExecuteScalar()! != DatabaseStore.ApplicationId)
             throw new InvalidDataException("Backup belongs to another application.");
         cmd.CommandText = "PRAGMA user_version;";
-        if ((long)cmd.ExecuteScalar()! != DatabaseStore.CurrentSchemaVersion)
+        long version = (long)cmd.ExecuteScalar()!;
+        if (version != DatabaseStore.CurrentSchemaVersion && !(allowVersionFour && version == 4))
             throw new InvalidDataException("Backup schema version is not supported by this release.");
     }
 
-    internal static void ValidateSnapshot(string path)
+    internal static void ValidateSnapshot(string path, bool allowVersionFour = false)
     {
         EnsureStandalone(path);
         using var c = OpenRaw(path, SqliteOpenMode.ReadOnly);
-        ValidateConnection(c, fullIntegrityCheck: true);
+        ValidateConnection(c, fullIntegrityCheck: true, allowVersionFour);
     }
 
     // A live DB can legitimately have a WAL; do not require standalone mode at startup.
-    internal static void ValidateConnection(SqliteConnection c, bool fullIntegrityCheck)
+    internal static void ValidateConnection(SqliteConnection c, bool fullIntegrityCheck, bool allowVersionFour = false)
     {
-        RequireIdentity(c);
+        RequireIdentity(c, allowVersionFour);
         using var cmd = c.CreateCommand();
         cmd.CommandText = fullIntegrityCheck ? "PRAGMA integrity_check;" : "PRAGMA quick_check;";
         using (var r = cmd.ExecuteReader())
@@ -220,6 +222,17 @@ public static class DatabaseBackup
             """;
         if ((long)cmd.ExecuteScalar()! != 8)
             throw new InvalidDataException("Backup is missing required tables.");
+        cmd.CommandText = "PRAGMA user_version;";
+        if ((long)cmd.ExecuteScalar()! == DatabaseStore.CurrentSchemaVersion)
+        {
+            cmd.CommandText = """
+                SELECT count(*) FROM sqlite_schema WHERE
+                    (type='table' AND name='um6_create_journal') OR
+                    (type='trigger' AND name IN ('um6_create_insert_guard','um6_create_update_guard','um6_create_no_delete'));
+                """;
+            if ((long)cmd.ExecuteScalar()! != 4)
+                throw new InvalidDataException("Backup is missing UM6 creation journal objects.");
+        }
     }
 
     internal static void MakeStandalone(SqliteConnection c)

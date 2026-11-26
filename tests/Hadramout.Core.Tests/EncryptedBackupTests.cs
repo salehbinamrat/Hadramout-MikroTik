@@ -615,6 +615,55 @@ public sealed class EncryptedBackupTests
         Assert.Single(Directory.GetFiles(Path.GetDirectoryName(path)!, "generation-*.db"));
     }
 
+    [Fact]
+    [SupportedOSPlatform("windows")]
+    public void ManagedStartupUpgradesVersionFourWithoutChangingGeneration()
+    {
+        using var f = new Fixture();
+        Guid generation;
+        string path;
+        using (var session = ManagedDatabase.OpenApplicationSessionAt(f.Root))
+        {
+            generation = session.Generation;
+            path = session.DatabasePath;
+        }
+        using (var c = DatabaseStore.Open(path))
+            DatabaseDurabilityTests.RecreateLegacyFixture(c, 4);
+        using var upgraded = ManagedDatabase.OpenApplicationSessionAt(f.Root);
+        Assert.Equal(generation, upgraded.Generation);
+        using var db = DatabaseStore.OpenExisting(upgraded.DatabasePath);
+        using var version = db.CreateCommand();
+        version.CommandText = "PRAGMA user_version;";
+        Assert.Equal(5L, (long)version.ExecuteScalar()!);
+    }
+
+    [Fact]
+    [SupportedOSPlatform("windows")]
+    public void ManagedRestoreCannotRollBackCreationClaim()
+    {
+        using var f = new Fixture();
+        EncryptedDatabaseBackup.Create(f.Source, f.Encrypted, Password);
+        string root = Path.Combine(f.Root, "managed-journal");
+        Directory.CreateDirectory(root);
+        Guid generation, id;
+        using (var session = ManagedDatabase.OpenSession(root))
+        {
+            generation = session.Generation;
+            id = DatabaseDurabilityTests.SeedReservation(session.DatabasePath, BackendKind.UserManager6);
+            var journal = new UserManager6CreateJournal(session.DatabasePath);
+            journal.Prepare(id, "admin");
+            Assert.True(journal.TryBeginDispatch(id));
+        }
+        string precaution = Path.Combine(f.Root, "journal-precaution.hmk");
+        Assert.Throws<InvalidOperationException>(() => ManagedDatabase.ActivateRestore(root, generation,
+            f.Encrypted, precaution, Password, Password, allowUnavailableCredentials: false));
+        Assert.False(File.Exists(precaution));
+        using var active = ManagedDatabase.OpenSession(root);
+        Assert.Equal(generation, active.Generation);
+        Assert.Equal(UserManager6CreateState.DispatchStarted,
+            new UserManager6CreateJournal(active.DatabasePath).Read(id)!.State);
+    }
+
     private static void AddPayload(string path, int size)
     {
         using var c = DatabaseStore.Open(path);
