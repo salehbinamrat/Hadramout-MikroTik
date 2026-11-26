@@ -9,8 +9,9 @@
 - PR #8 merged f293f3fb4d3f19523e58bea699c9d302bfd048c2; Core 45859016379 / Release 45859016325 passed on 02e845e36e3adaba0f49c4bb66d598c0ee354132; artifact 15138440387. P10d hosted checks passed; actual different-account/device testing pending.
 - PR #9 merged b4dd68b579817f6bc0aa5bb31670f99692474eb1; Core 45861158859 / Release 45861158853 passed on e337fe4575ad104954def110f9c4f51adcf92531; artifact 15137074541. P10e verified protected preparation in hosted CI.
 - PR #10 merged 60e4edf14e3f348d32371b4038653b8cd844c8cb; Core 45862815816 / Release 45862815764 passed on aa990131648f891ba86c09a1244b8b2977284a46; artifact 15138029536. P10f hosted checks passed.
-- P10g proposed managed-generation activation under an exclusive cooperative session gate; fresh precaution, merged audit history, verified candidate and non-destructive pointer replacement. Five new cases; CI pending. One new implementation file, no new dependencies.
-- P10 remaining: verify managed activation, integration with actual application session and RBAC, private managed root, managed crash cleanup, real cross-account/device validation, full audit coverage/actor attribution, retention and scheduling. No production restore.
+- PR #11 merged acb04abd8b7c77797b9633a49644c5def8e21ab1; Core 45863703419 / Release 45863703588 passed on 91b36a1f65f894028f97f75975789cd3066a15dc; artifact 15139088739. P10g managed activation hosted checks passed.
+- P10h proposed private per-user application root and managed WPF lifecycle, startup validation and isolated reopen probe, four new test cases. CI pending. No new files or dependencies.
+- P10 remaining: verify application startup, restore UI and RBAC, managed crash cleanup, real cross-account/device validation, full audit coverage/actor attribution, retention and scheduling. No production restore.
 - P01 deeper per-feature audit; physical Windows, RouterOS, printers; hard-kill, power-loss and disk-full tests pending. main remains unprotected; exact-head manual gate enforced. No production DB or real router changes.
 
 ## PR #8 build failure — 2026-11-26

@@ -561,6 +561,60 @@ public sealed class EncryptedBackupTests
         Assert.Equal(result.Generation, active.Generation);
     }
 
+    [Fact]
+    [SupportedOSPlatform("windows")]
+    public void ManagedStartupProbeReopensSameGeneration() => Assert.True(DatabaseProbe.VerifyManagedStartup());
+
+    [Fact]
+    [SupportedOSPlatform("windows")]
+    public void ManagedStartupUsesPrivateRootAndBlocksSecondLaunch()
+    {
+        using var f = new Fixture();
+        using var session = ManagedDatabase.OpenApplicationSessionAt(f.Root);
+        string root = Path.Combine(f.Root, "HadramoutMikroTik.Data");
+        Assert.Equal(root, Path.GetDirectoryName(session.DatabasePath));
+        var policy = new DirectoryInfo(root).GetAccessControl(AccessControlSections.Access);
+        Assert.True(policy.AreAccessRulesProtected);
+        Assert.Single(policy.GetAccessRules(true, true, typeof(SecurityIdentifier)));
+        Assert.Throws<IOException>(() => ManagedDatabase.OpenApplicationSessionAt(f.Root));
+    }
+
+    [Fact]
+    [SupportedOSPlatform("windows")]
+    public void ManagedStartupRejectsBroadExistingRootWithoutChangingIt()
+    {
+        using var f = new Fixture();
+        string root = Path.Combine(f.Root, "HadramoutMikroTik.Data");
+        Directory.CreateDirectory(root);
+        var directory = new DirectoryInfo(root);
+        var policy = directory.GetAccessControl(AccessControlSections.Access);
+        var everyone = new SecurityIdentifier(WellKnownSidType.WorldSid, null);
+        policy.AddAccessRule(new FileSystemAccessRule(everyone, FileSystemRights.ReadAndExecute, AccessControlType.Allow));
+        directory.SetAccessControl(policy);
+        string sentinel = Path.Combine(root, "keep.txt");
+        File.WriteAllText(sentinel, "keep");
+        Assert.Throws<UnauthorizedAccessException>(() => ManagedDatabase.OpenApplicationSessionAt(f.Root));
+        Assert.Equal("keep", File.ReadAllText(sentinel));
+        Assert.Empty(Directory.GetFiles(root, "generation-*.db"));
+    }
+
+    [Fact]
+    [SupportedOSPlatform("windows")]
+    public void ManagedStartupRejectsMissingRequiredTableWithoutCreatingNewGeneration()
+    {
+        using var f = new Fixture();
+        string path;
+        using (var session = ManagedDatabase.OpenApplicationSessionAt(f.Root)) path = session.DatabasePath;
+        using (var c = DatabaseStore.Open(path))
+        using (var cmd = c.CreateCommand())
+        {
+            cmd.CommandText = "DROP TABLE audit_events;";
+            cmd.ExecuteNonQuery();
+        }
+        Assert.Throws<InvalidDataException>(() => ManagedDatabase.OpenApplicationSessionAt(f.Root));
+        Assert.Single(Directory.GetFiles(Path.GetDirectoryName(path)!, "generation-*.db"));
+    }
+
     private static void AddPayload(string path, int size)
     {
         using var c = DatabaseStore.Open(path);

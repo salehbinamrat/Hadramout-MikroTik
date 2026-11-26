@@ -89,29 +89,7 @@ public static class DatabaseBackup
 
         if (OperatingSystem.IsWindows())
         {
-            using var identity = WindowsIdentity.GetCurrent();
-            var user = identity.User ?? throw new UnauthorizedAccessException("Windows user identity unavailable.");
-            var policy = new DirectorySecurity();
-            policy.SetOwner(user);
-            policy.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
-            policy.AddAccessRule(new FileSystemAccessRule(user, FileSystemRights.FullControl,
-                InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit,
-                PropagationFlags.None, AccessControlType.Allow));
-            // Supply the ACL to the creation call rather than hardening after creation.
-            DirectoryInfo directory = policy.CreateDirectory(path);
-            if ((directory.Attributes & FileAttributes.ReparsePoint) != 0)
-                throw new IOException("Temporary workspace is a reparse point.");
-            var actual = directory.GetAccessControl(AccessControlSections.Access | AccessControlSections.Owner);
-            var rules = actual.GetAccessRules(true, true, typeof(SecurityIdentifier))
-                .Cast<FileSystemAccessRule>().ToArray();
-            if (!actual.AreAccessRulesProtected || !user.Equals(actual.GetOwner(typeof(SecurityIdentifier))) ||
-                rules.Length != 1 || !user.Equals(rules[0].IdentityReference) ||
-                rules[0].AccessControlType != AccessControlType.Allow ||
-                (rules[0].FileSystemRights & FileSystemRights.FullControl) != FileSystemRights.FullControl ||
-                (rules[0].InheritanceFlags & (InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit)) !=
-                    (InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit) ||
-                rules[0].PropagationFlags != PropagationFlags.None || rules[0].IsInherited)
-                throw new UnauthorizedAccessException("Private workspace permissions could not be verified.");
+            EnsurePrivateWindowsDirectory(path);
         }
         else
         {
@@ -122,6 +100,34 @@ public static class DatabaseBackup
                 throw new UnauthorizedAccessException("Private workspace permissions could not be verified.");
         }
         return path;
+    }
+
+    [System.Runtime.Versioning.SupportedOSPlatform("windows")]
+    internal static void EnsurePrivateWindowsDirectory(string path)
+    {
+        using var identity = WindowsIdentity.GetCurrent();
+        var user = identity.User ?? throw new UnauthorizedAccessException("Windows user identity unavailable.");
+        var policy = new DirectorySecurity();
+        policy.SetOwner(user);
+        policy.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
+        policy.AddAccessRule(new FileSystemAccessRule(user, FileSystemRights.FullControl,
+            InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit,
+            PropagationFlags.None, AccessControlType.Allow));
+        // Supply the ACL to the creation call rather than hardening after creation.
+        DirectoryInfo directory = Directory.Exists(path) ? new DirectoryInfo(path) : policy.CreateDirectory(path);
+        if ((directory.Attributes & FileAttributes.ReparsePoint) != 0)
+            throw new IOException("Temporary workspace is a reparse point.");
+        var actual = directory.GetAccessControl(AccessControlSections.Access | AccessControlSections.Owner);
+        var rules = actual.GetAccessRules(true, true, typeof(SecurityIdentifier))
+            .Cast<FileSystemAccessRule>().ToArray();
+        if (!actual.AreAccessRulesProtected || !user.Equals(actual.GetOwner(typeof(SecurityIdentifier))) ||
+            rules.Length != 1 || !user.Equals(rules[0].IdentityReference) ||
+            rules[0].AccessControlType != AccessControlType.Allow ||
+            (rules[0].FileSystemRights & FileSystemRights.FullControl) != FileSystemRights.FullControl ||
+            (rules[0].InheritanceFlags & (InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit)) !=
+                (InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit) ||
+            rules[0].PropagationFlags != PropagationFlags.None || rules[0].IsInherited)
+            throw new UnauthorizedAccessException("Private workspace permissions could not be verified.");
     }
 
     internal static BackupReceipt PublishStandalone(string staged, string destination)
@@ -191,9 +197,15 @@ public static class DatabaseBackup
     {
         EnsureStandalone(path);
         using var c = OpenRaw(path, SqliteOpenMode.ReadOnly);
+        ValidateConnection(c, fullIntegrityCheck: true);
+    }
+
+    // A live DB can legitimately have a WAL; do not require standalone mode at startup.
+    internal static void ValidateConnection(SqliteConnection c, bool fullIntegrityCheck)
+    {
         RequireIdentity(c);
         using var cmd = c.CreateCommand();
-        cmd.CommandText = "PRAGMA integrity_check;";
+        cmd.CommandText = fullIntegrityCheck ? "PRAGMA integrity_check;" : "PRAGMA quick_check;";
         using (var r = cmd.ExecuteReader())
         {
             if (!r.Read() || r.GetString(0) != "ok" || r.Read())
