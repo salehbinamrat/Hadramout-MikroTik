@@ -1,9 +1,40 @@
 using System.Text;
+using System.Globalization;
 
 namespace Hadramout.Infrastructure;
 
 // Remote observations only, not authoritative entitlement/expiry or write permission.
-internal sealed record UserManager6Account(string Customer, string Username, bool? Disabled, string? ActualProfile);
+internal sealed record UserManager6ByteValue(string? Raw, ulong? Bytes)
+{
+    // Retain unknown formats; never interpret absent, scaled or malformed values as zero.
+    internal static UserManager6ByteValue FromRaw(string? raw)
+    {
+        if (string.IsNullOrEmpty(raw)) return new(raw, null);
+        ReadOnlySpan<char> number = raw.AsSpan();
+        if (number[^1] == 'B') number = number[..^1];
+        if (number.IsEmpty) return new(raw, null);
+        foreach (char ch in number)
+            if (!char.IsAsciiDigit(ch)) return new(raw, null);
+        return new(raw, ulong.TryParse(number, NumberStyles.None, CultureInfo.InvariantCulture,
+            out ulong bytes) ? bytes : null);
+    }
+}
+
+internal sealed record UserManager6Usage(UserManager6ByteValue DownloadUsed,
+    UserManager6ByteValue UploadUsed, string? UptimeUsed)
+{
+    internal ulong? ObservedTransferBytes =>
+        DownloadUsed.Bytes is ulong download && UploadUsed.Bytes is ulong upload &&
+        download <= ulong.MaxValue - upload ? download + upload : null;
+}
+
+internal sealed record UserManager6Account(string Customer, string Username, bool? Disabled,
+    string? ActualProfile, UserManager6Usage Usage);
+
+internal sealed record UserManager6Limitation(string Owner, string Name,
+    UserManager6ByteValue DownloadLimit, UserManager6ByteValue UploadLimit,
+    UserManager6ByteValue TransferLimit, string? UptimeLimit,
+    string? RateLimitRx, string? RateLimitTx);
 internal sealed record UserManager6Profile(string Owner, string Name, string? Validity, string? StartsAt);
 
 internal static class UserManager6Records
@@ -39,12 +70,23 @@ internal static class UserManager6Records
             null or "" => null,
             _ => throw new InvalidDataException("Invalid User Manager disabled flag.")
         };
-        return new(actualCustomer, actualUsername, disabled, ReadText(words, "actual-profile", 512));
+        return new(actualCustomer, actualUsername, disabled, ReadText(words, "actual-profile", 512),
+            new UserManager6Usage(ReadBytes(words, "download-used"), ReadBytes(words, "upload-used"),
+                ReadText(words, "uptime-used", 128)));
     }
 
     internal static UserManager6Profile ParseProfile(byte[][] words, string owner, string name) =>
         new(RequiredMatch(words, "owner", owner), RequiredMatch(words, "name", name),
             ReadText(words, "validity", 128), ReadText(words, "starts-at", 128));
+
+    internal static UserManager6Limitation ParseLimitation(byte[][] words, string owner, string name) =>
+        new(RequiredMatch(words, "owner", owner), RequiredMatch(words, "name", name),
+            ReadBytes(words, "download-limit"), ReadBytes(words, "upload-limit"),
+            ReadBytes(words, "transfer-limit"), ReadText(words, "uptime-limit", 128),
+            ReadText(words, "rate-limit-rx", 128), ReadText(words, "rate-limit-tx", 128));
+
+    private static UserManager6ByteValue ReadBytes(byte[][] words, string field) =>
+        UserManager6ByteValue.FromRaw(ReadText(words, field, 64));
 
     private static string RequiredMatch(byte[][] words, string field, string expected)
     {

@@ -936,6 +936,9 @@ public sealed class RouterOsTlsTransportTests(ITestOutputHelper output)
                 Encoding.UTF8.GetBytes("=disabled=" + disabled)
             };
             if (profile is not null) reply.Add(Encoding.UTF8.GetBytes("=actual-profile=" + profile));
+            reply.Add("=download-used=4294967296"u8.ToArray());
+            reply.Add("=upload-used=128B"u8.ToArray());
+            reply.Add("=uptime-used=1d2h"u8.ToArray());
             await RouterOsWireCodec.WriteSentenceAsync(tls, reply, token);
             await RouterOsWireCodec.WriteSentenceAsync(tls, ["!done"u8.ToArray()], token);
         });
@@ -947,6 +950,10 @@ public sealed class RouterOsTlsTransportTests(ITestOutputHelper output)
             Assert.Equal("123456", account.Username);
             Assert.Equal(expected, account.Disabled);
             Assert.Equal(profile, account.ActualProfile);
+            Assert.Equal(4294967296UL, account.Usage.DownloadUsed.Bytes);
+            Assert.Equal(128UL, account.Usage.UploadUsed.Bytes);
+            Assert.Equal(4294967424UL, account.Usage.ObservedTransferBytes);
+            Assert.Equal("1d2h", account.Usage.UptimeUsed);
         }
         finally { await serve; }
     }
@@ -1048,6 +1055,63 @@ public sealed class RouterOsTlsTransportTests(ITestOutputHelper output)
         finally { await serve; }
     }
 
+    [Theory]
+    [InlineData("present")]
+    [InlineData("absent")]
+    [InlineData("wrong-owner")]
+    [InlineData("trap")]
+    public async Task Um6LimitationReadKeepsScopeAndZeroDistinctFromMissing(string condition)
+    {
+        using var certificates = new Certificates();
+        using var server = new LoopbackServer(certificates.Leaf, certificates.Root, output);
+        Task serve = server.RunAsync(reply: true, handler: async (tls, token) =>
+        {
+            await PrepareProbePeerAsync(tls, token, "6.49.19");
+            byte[][] words = await RouterOsWireCodec.ReadSentenceAsync(tls, token);
+            Assert.Equal(new[] { "/tool/user-manager/profile/limitation/print",
+                "=.proplist=owner,name,download-limit,upload-limit,transfer-limit,uptime-limit,rate-limit-rx,rate-limit-tx",
+                "?owner=admin", "?name=day" }, words.Select(word => Encoding.UTF8.GetString(word)).ToArray());
+            if (condition == "trap")
+            {
+                await RouterOsWireCodec.WriteSentenceAsync(tls, ["!trap"u8.ToArray()], token);
+                return;
+            }
+            if (condition != "absent")
+            {
+                await RouterOsWireCodec.WriteSentenceAsync(tls,
+                    ["!re"u8.ToArray(), Encoding.ASCII.GetBytes(condition == "wrong-owner" ? "=owner=other" : "=owner=admin"),
+                        "=name=day"u8.ToArray(), "=download-limit=0B"u8.ToArray(), "=transfer-limit=5368709120B"u8.ToArray(),
+                        "=uptime-limit=2h"u8.ToArray(), "=rate-limit-rx=512k"u8.ToArray()], token);
+                if (condition == "wrong-owner") return;
+            }
+            await RouterOsWireCodec.WriteSentenceAsync(tls, ["!done"u8.ToArray()], token);
+        });
+        Task<UserManager6Limitation?> Find() => RouterOsReadRecovery.FindUserManager6LimitationAsync("admin", "day",
+            "127.0.0.1", "router.test", "synthetic-user"u8.ToArray(), "synthetic-private-password"u8.ToArray(),
+            server.Port, trustedRootDer: certificates.Root.RawData);
+        try
+        {
+            if (condition == "wrong-owner" || condition == "trap")
+                await Assert.ThrowsAsync<InvalidDataException>(Find);
+            else if (condition == "absent") Assert.Null(await Find());
+            else
+            {
+                var limit = await Find();
+                Assert.NotNull(limit);
+                Assert.Equal("admin", limit.Owner);
+                Assert.Equal("day", limit.Name);
+                Assert.Equal(0UL, limit.DownloadLimit.Bytes);
+                Assert.Null(limit.UploadLimit.Bytes);
+                Assert.Null(limit.UploadLimit.Raw);
+                Assert.Equal(5368709120UL, limit.TransferLimit.Bytes);
+                Assert.Equal("2h", limit.UptimeLimit);
+                Assert.Equal("512k", limit.RateLimitRx);
+                Assert.Null(limit.RateLimitTx);
+            }
+        }
+        finally { await serve; }
+    }
+
     private static Task<UserManager6Account?> FindUm6AccountAsync(LoopbackServer server, Certificates certificates) =>
         RouterOsReadRecovery.FindUserManager6AccountAsync("admin", "123456", "127.0.0.1", "router.test",
             "synthetic-user"u8.ToArray(), "synthetic-private-password"u8.ToArray(), server.Port,
@@ -1056,7 +1120,7 @@ public sealed class RouterOsTlsTransportTests(ITestOutputHelper output)
     private static async Task AssertUm6AccountRequestAsync(SslStream tls, CancellationToken token)
     {
         byte[][] words = await RouterOsWireCodec.ReadSentenceAsync(tls, token);
-        Assert.Equal(new[] { "/tool/user-manager/user/print", "=.proplist=customer,username,disabled,actual-profile",
+        Assert.Equal(new[] { "/tool/user-manager/user/print", "=.proplist=customer,username,disabled,actual-profile,download-used,upload-used,uptime-used",
             "?customer=admin", "?username=123456" }, words.Select(word => Encoding.UTF8.GetString(word)).ToArray());
     }
 
