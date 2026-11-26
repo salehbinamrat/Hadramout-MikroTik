@@ -222,6 +222,25 @@ public sealed class EncryptedBackupTests
         f.AssertClean();
     }
 
+    [Fact]
+    public void ChunkFromAnotherBackupFailsAuthentication()
+    {
+        using var f = new Fixture();
+        AddPayload(f.Source, 3 * 1024 * 1024);
+        string other = Path.Combine(f.Root, "other.hmk");
+        EncryptedDatabaseBackup.Create(f.Source, f.Encrypted, Password);
+        EncryptedDatabaseBackup.Create(f.Source, other, Password);
+        byte[] first = File.ReadAllBytes(f.Encrypted);
+        byte[] second = File.ReadAllBytes(other);
+        const int record = 1024 * 1024 + 16;
+        second.AsSpan(40 + record, record).CopyTo(first.AsSpan(40 + record, record));
+        File.WriteAllBytes(f.Encrypted, first);
+        Assert.Throws<CryptographicException>(() =>
+            EncryptedDatabaseBackup.PrepareRestore(f.Encrypted, f.Candidate, Password));
+        Assert.False(File.Exists(f.Candidate));
+        f.AssertClean();
+    }
+
     private static void AddPayload(string path, int size)
     {
         using var c = DatabaseStore.Open(path);
