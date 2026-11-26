@@ -6,26 +6,35 @@ using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using Hadramout.Infrastructure;
 using Xunit;
+using Xunit.Abstractions;
 
 namespace Hadramout.Core.Tests;
 
-public sealed class RouterOsTlsTransportTests
+public sealed class RouterOsTlsTransportTests(ITestOutputHelper output)
 {
     [Fact]
     public async Task TrustedPrivateCaAuthenticatesAndExchangesFramedData()
     {
         using var certificates = new Certificates();
-        using var server = new LoopbackServer(certificates.Leaf);
+        using var server = new LoopbackServer(certificates.Leaf, certificates.Root, output);
         Task serve = server.RunAsync(reply: true);
-        using var transport = await RouterOsTlsTransport.ConnectAsync("127.0.0.1", "router.test",
-            server.Port, trustedRootDer: certificates.Root.RawData);
-        Assert.True(transport.Stream.IsEncrypted);
-        Assert.Equal(SslProtocols.Tls12, transport.Stream.SslProtocol);
-        await RouterOsWireCodec.WriteSentenceAsync(transport.Stream, ["/system/resource/print"u8.ToArray()],
-            CancellationToken.None);
-        byte[][] reply = await RouterOsWireCodec.ReadSentenceAsync(transport.Stream, CancellationToken.None);
-        Assert.True(Assert.Single(reply).AsSpan().SequenceEqual("!done"u8));
-        await serve;
+        try
+        {
+            using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+            using var transport = await RouterOsTlsTransport.ConnectAsync("127.0.0.1", "router.test",
+                server.Port, trustedRootDer: certificates.Root.RawData, cancellationToken: deadline.Token);
+            Assert.True(transport.Stream.IsEncrypted);
+            Assert.Equal(SslProtocols.Tls12, transport.Stream.SslProtocol);
+            await RouterOsWireCodec.WriteSentenceAsync(transport.Stream, ["/system/resource/print"u8.ToArray()],
+                deadline.Token);
+            byte[][] reply = await RouterOsWireCodec.ReadSentenceAsync(transport.Stream, deadline.Token);
+            Assert.True(Assert.Single(reply).AsSpan().SequenceEqual("!done"u8));
+        }
+        finally
+        {
+            // Always observe the server task, even if the client reports EOF during TLS.
+            await serve;
+        }
     }
 
     [Theory]
@@ -37,7 +46,7 @@ public sealed class RouterOsTlsTransportTests
     {
         using var certificates = new Certificates(expired: condition == "expired-leaf");
         using var other = new Certificates();
-        using var server = new LoopbackServer(certificates.Leaf);
+        using var server = new LoopbackServer(certificates.Leaf, certificates.Root, output);
         Task serve = server.RunAsync(reply: false);
         string name = condition == "wrong-name" ? "other.test" : "router.test";
         byte[] trust = condition switch
@@ -136,7 +145,18 @@ public sealed class RouterOsTlsTransportTests
             request.CertificateExtensions.Add(san.Build());
             using var issued = request.Create(Root, now.AddDays(-10), expired ? now.AddDays(-1) : now.AddDays(10),
                 RandomNumberGenerator.GetBytes(16));
-            Leaf = issued.CopyWithPrivateKey(leafKey);
+            using var withKey = issued.CopyWithPrivateKey(leafKey);
+            // Schannel requires a usable on-disk key container. Import a short-lived PFX
+            // into the user key set rather than retaining CopyWithPrivateKey's key handle.
+            // Do not specify PersistKeySet; disposal releases the imported temporary key.
+            string password = Convert.ToHexString(RandomNumberGenerator.GetBytes(32));
+            byte[] pfx = withKey.Export(X509ContentType.Pkcs12, password);
+            try
+            {
+                Leaf = X509CertificateLoader.LoadPkcs12(pfx, password,
+                    OperatingSystem.IsWindows() ? X509KeyStorageFlags.UserKeySet : X509KeyStorageFlags.EphemeralKeySet);
+            }
+            finally { CryptographicOperations.ZeroMemory(pfx); }
         }
 
         public void Dispose()
@@ -151,13 +171,16 @@ public sealed class RouterOsTlsTransportTests
     private sealed class LoopbackServer : IDisposable
     {
         private readonly TcpListener listener = new(IPAddress.Loopback, 0);
-        private readonly X509Certificate2 certificate;
+        private readonly SslStreamCertificateContext context;
+        private readonly ITestOutputHelper output;
         private readonly CancellationTokenSource deadline = new(TimeSpan.FromSeconds(20));
         public int Port => ((IPEndPoint)listener.LocalEndpoint).Port;
 
-        public LoopbackServer(X509Certificate2 certificate)
+        public LoopbackServer(X509Certificate2 certificate, X509Certificate2 root, ITestOutputHelper output)
         {
-            this.certificate = certificate;
+            this.output = output;
+            context = SslStreamCertificateContext.Create(certificate,
+                new X509Certificate2Collection(root), offline: true);
             listener.Start();
         }
 
@@ -169,7 +192,7 @@ public sealed class RouterOsTlsTransportTests
             {
                 await tls.AuthenticateAsServerAsync(new SslServerAuthenticationOptions
                 {
-                    ServerCertificate = certificate,
+                    ServerCertificateContext = context,
                     EnabledSslProtocols = SslProtocols.Tls12
                 }, deadline.Token);
                 if (reply)
@@ -178,9 +201,20 @@ public sealed class RouterOsTlsTransportTests
                     Assert.True(Assert.Single(command).AsSpan().SequenceEqual("/system/resource/print"u8));
                     await RouterOsWireCodec.WriteSentenceAsync(tls, ["!done"u8.ToArray()], deadline.Token);
                 }
+                else
+                {
+                    // Keep the peer alive until the client accepts or rejects the handshake.
+                    // No application data is allowed in negative authentication cases.
+                    byte[] buffer = new byte[1];
+                    int read = await tls.ReadAsync(buffer, deadline.Token);
+                    Assert.Equal(0, read);
+                }
             }
-            catch (AuthenticationException) when (!reply) { }
-            catch (IOException) when (!reply) { }
+            catch (Exception ex)
+            {
+                output.WriteLine("Loopback TLS server: " + ex);
+                if (reply || ex is not (AuthenticationException or IOException)) throw;
+            }
         }
 
         public void Dispose()
