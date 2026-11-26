@@ -339,6 +339,120 @@ public sealed class DatabaseDurabilityTests
         Assert.Equal(0L, Scalar(reopened, "PRAGMA user_version;"));
     }
 
+    [Fact]
+    public void RecoveryReviewIsRouterScopedAndPaginatesWithoutRearming()
+    {
+        using var file = new TestFile();
+        Guid first = SeedReservation(file.Path, BackendKind.UserManager6);
+        var journal = new UserManager6CreateJournal(file.Path);
+        var initial = journal.Prepare(first, "admin");
+        Guid[] additional = new Guid[4];
+        using (var c = DatabaseStore.OpenExisting(file.Path))
+        using (var db = Context(c))
+        {
+            var original = db.Reservations.Single();
+            for (int i = 0; i < additional.Length; i++)
+            {
+                var reservation = new VoucherReservation
+                {
+                    BackendId = original.BackendId, BatchId = original.BatchId, Username = "extra-" + i
+                };
+                additional[i] = reservation.Id;
+                db.Reservations.Add(reservation);
+            }
+            var router = new Router { SiteId = db.Sites.Single().Id, Name = "other-router" };
+            var backend = new Backend { RouterId = router.Id, Kind = BackendKind.UserManager6 };
+            var plan = new Plan { BackendId = backend.Id, Name = "day" };
+            var batch = new VoucherBatch { BackendId = backend.Id, PlanId = plan.Id };
+            var other = new VoucherReservation { BackendId = backend.Id, BatchId = batch.Id, Username = "001" };
+            db.AddRange(router, backend, plan, batch, other);
+            db.SaveChanges();
+            journal.Prepare(other.Id, "admin");
+            Assert.True(journal.TryBeginDispatch(other.Id));
+            Assert.Equal(1L, journal.ReadCounts(router.Id).RequiresReview);
+        }
+        foreach (Guid id in additional) journal.Prepare(id, "admin");
+        Assert.True(journal.TryBeginDispatch(first));
+        Assert.True(journal.TryBeginDispatch(additional[0]));
+        Assert.True(journal.TryMarkIndeterminate(additional[0]));
+        Assert.True(journal.TryBeginDispatch(additional[1]));
+        Assert.True(journal.TryMarkAcknowledged(additional[1]));
+        Assert.True(journal.TryBeginDispatch(additional[2]));
+        var counts = journal.ReadCounts(initial.RouterId);
+        Assert.Equal(new UserManager6CreationCounts(1, 2, 1, 1), counts);
+        Assert.Equal(4L, counts.RequiresReview);
+
+        var page = journal.ReadReviewPage(initial.RouterId, pageSize: 2);
+        Assert.Equal(2, page.Rows.Count);
+        Assert.NotNull(page.NextAfterReservationId);
+        var next = journal.ReadReviewPage(initial.RouterId, page.NextAfterReservationId, 2);
+        Assert.Equal(2, next.Rows.Count);
+        Assert.Null(next.NextAfterReservationId);
+        var rows = page.Rows.Concat(next.Rows).ToArray();
+        Assert.Equal(4, rows.Select(row => row.Entry.ReservationId).Distinct().Count());
+        Assert.All(rows, row =>
+        {
+            Assert.Equal(initial.RouterId, row.Entry.RouterId);
+            Assert.True(row.LocalIdentityMatches);
+            Assert.False(journal.TryBeginDispatch(row.Entry.ReservationId));
+        });
+        Assert.DoesNotContain(rows, row => row.Entry.ReservationId == additional[3]);
+        Assert.Equal(counts, journal.ReadCounts(initial.RouterId));
+    }
+
+    [Fact]
+    public void RecoveryReviewReportsDriftInsteadOfHidingClaimedRow()
+    {
+        using var file = new TestFile();
+        Guid id = SeedReservation(file.Path, BackendKind.UserManager6);
+        var journal = new UserManager6CreateJournal(file.Path);
+        var entry = journal.Prepare(id, "admin");
+        Assert.True(journal.TryBeginDispatch(id));
+        using (var c = DatabaseStore.OpenExisting(file.Path))
+            Execute(c, "UPDATE voucher_reservations SET Username='changed';");
+        var row = Assert.Single(journal.ReadReviewPage(entry.RouterId).Rows);
+        Assert.Equal("001", row.Entry.Username);
+        Assert.False(row.LocalIdentityMatches);
+        Assert.Equal(UserManager6CreateState.DispatchStarted, row.Entry.State);
+        Assert.False(journal.TryBeginDispatch(id));
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(501)]
+    public void RecoveryReviewRejectsUnboundedPages(int pageSize)
+    {
+        using var file = new TestFile();
+        var journal = new UserManager6CreateJournal(file.Path);
+        Assert.Throws<ArgumentOutOfRangeException>(() => journal.ReadReviewPage(Guid.NewGuid(), pageSize: pageSize));
+    }
+
+    [Fact]
+    public void RecoveryReviewDoesNotCreateOrMigrateDatabase()
+    {
+        using var file = new TestFile();
+        var journal = new UserManager6CreateJournal(file.Path);
+        Assert.Throws<SqliteException>(() => journal.ReadCounts(Guid.NewGuid()));
+        Assert.False(File.Exists(file.Path));
+        using (var c = DatabaseStore.Open(file.Path)) RecreateLegacyFixture(c, 4);
+        Assert.Throws<InvalidDataException>(() => journal.ReadReviewPage(Guid.NewGuid()));
+        using var raw = file.OpenRaw();
+        Assert.Equal(4L, Scalar(raw, "PRAGMA user_version;"));
+    }
+
+    [Fact]
+    public void RecoveryReviewEmptyScopeIsNotAnErrorAndDoesNotCountPreparedAsUncertain()
+    {
+        using var file = new TestFile();
+        Guid id = SeedReservation(file.Path, BackendKind.UserManager6);
+        var journal = new UserManager6CreateJournal(file.Path);
+        var entry = journal.Prepare(id, "admin");
+        Assert.Empty(journal.ReadReviewPage(entry.RouterId).Rows);
+        Assert.Null(journal.ReadReviewPage(entry.RouterId).NextAfterReservationId);
+        Assert.Equal(new UserManager6CreationCounts(1, 0, 0, 0), journal.ReadCounts(entry.RouterId));
+        Assert.Equal(new UserManager6CreationCounts(0, 0, 0, 0), journal.ReadCounts(Guid.NewGuid()));
+    }
+
     internal static Guid SeedReservation(string path, BackendKind kind)
     {
         using var c = DatabaseStore.Open(path);
