@@ -1,6 +1,5 @@
 using System.Security.Authentication;
 using System.Security.Cryptography;
-using System.Text;
 
 namespace Hadramout.Infrastructure;
 
@@ -70,9 +69,26 @@ internal sealed class RouterOsSession : IDisposable
         finally { connection?.Dispose(); }
     }
 
-    // First bounded read-only command. General command adapters are added separately.
-    internal async Task<string> ReadVersionAsync(TimeSpan? timeout = null,
-        CancellationToken cancellationToken = default)
+    internal Task<string> ReadVersionAsync(TimeSpan? timeout = null,
+        CancellationToken cancellationToken = default) =>
+        WithReadSessionAsync(ReadVersionCoreAsync, timeout, cancellationToken);
+
+    // Both reads share a session gate and a single deadline. Not an atomic remote snapshot.
+    internal Task<RouterOsInventory> DiscoverAsync(TimeSpan? timeout = null,
+        CancellationToken cancellationToken = default) =>
+        WithReadSessionAsync(async (stream, token) =>
+        {
+            string version = await ReadVersionCoreAsync(stream, token).ConfigureAwait(false);
+            if (RouterOsInventory.ClassifyVersion(version) == RouterOsFamily.Unsupported)
+                return RouterOsInventory.Classify(version, [], inventoryRead: false);
+            var packages = await ReadCommandAsync(stream,
+                ["/system/package/print"u8.ToArray(), "=.proplist=name,version,disabled,scheduled"u8.ToArray()],
+                RouterOsInventory.ParsePackage, 256, token).ConfigureAwait(false);
+            return RouterOsInventory.Classify(version, packages, inventoryRead: true);
+        }, timeout, cancellationToken);
+
+    private async Task<T> WithReadSessionAsync<T>(Func<Stream, CancellationToken, Task<T>> read,
+        TimeSpan? timeout, CancellationToken cancellationToken)
     {
         TimeSpan limit = ValidateTimeout(timeout);
         cancellationToken.ThrowIfCancellationRequested();
@@ -86,29 +102,17 @@ internal sealed class RouterOsSession : IDisposable
             deadline.CancelAfter(limit);
             try
             {
-                await RouterOsWireCodec.WriteSentenceAsync(connection.Stream,
-                    ["/system/resource/print"u8.ToArray(), "=.proplist=version"u8.ToArray()], deadline.Token)
-                    .ConfigureAwait(false);
-                var reply = await RouterOsReplyReader.ReadAsync(connection.Stream, ParseVersion,
-                    maxRows: 1, deadline.Token).ConfigureAwait(false);
-                if (reply.Outcome != RouterOsReplyOutcome.Completed || reply.Rows.Count != 1)
-                    throw new InvalidDataException(reply.Outcome switch
-                    {
-                        RouterOsReplyOutcome.Rejected => "RouterOS rejected the version command.",
-                        RouterOsReplyOutcome.Fatal => "RouterOS closed the command session.",
-                        _ => "RouterOS version response must contain exactly one row."
-                    });
+                T result = await read(connection.Stream, deadline.Token).ConfigureAwait(false);
                 deadline.Token.ThrowIfCancellationRequested();
-                return reply.Rows[0];
+                return result;
             }
             catch (Exception ex)
             {
-                // Do not reuse a stream with an uncertain command boundary.
                 Dispose();
                 if (deadline.IsCancellationRequested)
                 {
                     cancellationToken.ThrowIfCancellationRequested();
-                    throw new TimeoutException("RouterOS version command deadline exceeded.", ex);
+                    throw new TimeoutException("RouterOS read command deadline exceeded.", ex);
                 }
                 throw;
             }
@@ -116,22 +120,27 @@ internal sealed class RouterOsSession : IDisposable
         finally { Volatile.Write(ref busy, 0); }
     }
 
-    private static string ParseVersion(byte[][] words)
+    private static async Task<string> ReadVersionCoreAsync(Stream stream, CancellationToken token)
     {
-        string? version = null;
-        foreach (byte[] word in words.Skip(1))
-        {
-            if (!word.AsSpan().StartsWith("=version="u8)) continue;
-            if (version is not null || word.Length is < 10 or > 137)
-                throw new InvalidDataException("Invalid RouterOS version field.");
-            for (int j = 9; j < word.Length; j++)
-                if (word[j] is < 0x20 or > 0x7E)
-                    throw new InvalidDataException("Invalid RouterOS version encoding.");
-            version = Encoding.ASCII.GetString(word, 9, word.Length - 9);
-            if (string.IsNullOrWhiteSpace(version))
-                throw new InvalidDataException("Empty RouterOS version.");
-        }
-        return version ?? throw new InvalidDataException("Missing RouterOS version field.");
+        var rows = await ReadCommandAsync(stream,
+            ["/system/resource/print"u8.ToArray(), "=.proplist=version"u8.ToArray()],
+            words => RouterOsInventory.ReadAscii(words, "version", 128, required: true)!, 1, token)
+            .ConfigureAwait(false);
+        if (rows.Count != 1 || string.IsNullOrWhiteSpace(rows[0]))
+            throw new InvalidDataException("RouterOS version response must contain exactly one valid row.");
+        return rows[0];
+    }
+
+    private static async Task<IReadOnlyList<T>> ReadCommandAsync<T>(Stream stream,
+        IReadOnlyList<ReadOnlyMemory<byte>> command, Func<byte[][], T> project,
+        int maxRows, CancellationToken token)
+    {
+        await RouterOsWireCodec.WriteSentenceAsync(stream, command, token).ConfigureAwait(false);
+        var reply = await RouterOsReplyReader.ReadAsync(stream, project, maxRows, token).ConfigureAwait(false);
+        if (reply.Outcome != RouterOsReplyOutcome.Completed)
+            throw new InvalidDataException(reply.Outcome == RouterOsReplyOutcome.Rejected
+                ? "RouterOS rejected the read command." : "RouterOS closed the command session.");
+        return reply.Rows;
     }
 
     private static TimeSpan ValidateTimeout(TimeSpan? timeout)

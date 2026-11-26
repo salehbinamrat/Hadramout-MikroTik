@@ -281,6 +281,69 @@ public sealed class RouterOsWireCodecTests
             words.Select(word => (ReadOnlyMemory<byte>)Encoding.ASCII.GetBytes(word)).ToArray(),
             CancellationToken.None);
 
+    [Theory]
+    [InlineData("6.49.19 (long-term)", 1)]
+    [InlineData("6.49.11", 1)]
+    [InlineData("7.18 (stable)", 2)]
+    [InlineData("7.21.1 (stable)", 2)]
+    [InlineData("6.48.7", 0)]
+    [InlineData("8.0", 0)]
+    [InlineData("7.22beta1 (testing)", 0)]
+    [InlineData("7.21.1 (testing)", 0)]
+    [InlineData("07.21.1", 0)]
+    [InlineData("7", 0)]
+    [InlineData("7.21.1.2", 0)]
+    public void VersionClassificationIsConservative(string version, int expected) =>
+        Assert.Equal((RouterOsFamily)expected, RouterOsInventory.ClassifyVersion(version));
+
+    [Theory]
+    [InlineData("7.21.1", "false", "", 3)]
+    [InlineData("7.21.1", "no", null, 3)]
+    [InlineData("", "true", "", 2)]
+    [InlineData("7.21.1", "yes", "", 2)]
+    [InlineData("7.21.1", null, "", 0)]
+    [InlineData("7.20", "false", "", 0)]
+    [InlineData("7.21.1", "false", "disable", 0)]
+    [InlineData("", "false", "", 0)]
+    public void PackageEvidenceCannotBeConfusedWithServiceAvailability(
+        string version, string? disabled, string? scheduled, int expected)
+    {
+        var fields = new List<string> { "!re", "=name=user-manager", "=version=" + version };
+        if (disabled is not null) fields.Add("=disabled=" + disabled);
+        if (scheduled is not null) fields.Add("=scheduled=" + scheduled);
+        var package = RouterOsInventory.ParsePackage(fields.Select(Encoding.ASCII.GetBytes).ToArray());
+        var inventory = RouterOsInventory.Classify("7.21.1 (stable)", [package], inventoryRead: true);
+        Assert.Equal((UserManagerPackageState)expected, inventory.UserManagerPackage);
+        Assert.Equal(RouterOsFamily.V7, inventory.Family);
+    }
+
+    [Fact]
+    public void MissingPackageAndUnreadInventoryAreDistinct()
+    {
+        Assert.Equal(UserManagerPackageState.NotListed,
+            RouterOsInventory.Classify("6.49.19", [], true).UserManagerPackage);
+        Assert.Equal(UserManagerPackageState.Unknown,
+            RouterOsInventory.Classify("6.49.19", [], false).UserManagerPackage);
+    }
+
+    [Fact]
+    public void DuplicatePackageNamesAreRejected()
+    {
+        var package = new RouterOsPackage("user-manager", "6.49.19", false, null);
+        Assert.Throws<InvalidDataException>(() =>
+            RouterOsInventory.Classify("6.49.19", [package, package], true));
+    }
+
+    [Theory]
+    [InlineData("=name=", "=disabled=no")]
+    [InlineData("=name=user-manager", "=disabled=maybe")]
+    [InlineData("=name=user manager", "=disabled=false")]
+    public void MalformedPackageRowsFailClosed(string name, string disabled)
+    {
+        Assert.Throws<InvalidDataException>(() => RouterOsInventory.ParsePackage(
+            ["!re"u8.ToArray(), Encoding.ASCII.GetBytes(name), Encoding.ASCII.GetBytes(disabled)]));
+    }
+
     private sealed class FragmentedStream(byte[] bytes) : MemoryStream(bytes)
     {
         public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default) =>
