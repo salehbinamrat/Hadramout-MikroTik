@@ -8,8 +8,9 @@
 - PR #7 merged 922ace11fc11b6a0f445c4db6830c45553603e19; Core 45857595270 / Release 45857595229 passed on c6b6f950f85263c5ae6c0dac1211d5104100deae; artifact 15136548580. Streaming and legacy tests passed in hosted CI; 16 GiB and real x86 OS not measured.
 - PR #8 merged f293f3fb4d3f19523e58bea699c9d302bfd048c2; Core 45859016379 / Release 45859016325 passed on 02e845e36e3adaba0f49c4bb66d598c0ee354132; artifact 15138440387. P10d hosted checks passed; actual different-account/device testing pending.
 - PR #9 merged b4dd68b579817f6bc0aa5bb31670f99692474eb1; Core 45861158859 / Release 45861158853 passed on e337fe4575ad104954def110f9c4f51adcf92531; artifact 15137074541. P10e verified protected preparation in hosted CI.
-- P10f proposed shared restricted temporary workspace creation and verification, two new tests (Windows ACL inheritance and parallel isolation); all existing backup probes exercise the helper on x86/x64. CI pending. No new files or external dependencies.
-- P10 remaining: verify workspace restrictions, managed crash cleanup, real cross-account/device validation, live activation with writer exclusion and fresh history, full audit coverage/actor attribution, retention and scheduling. No live restore.
+- PR #10 merged 60e4edf14e3f348d32371b4038653b8cd844c8cb; Core 45862815816 / Release 45862815764 passed on aa990131648f891ba86c09a1244b8b2977284a46; artifact 15138029536. P10f hosted checks passed.
+- P10g proposed managed-generation activation under an exclusive cooperative session gate; fresh precaution, merged audit history, verified candidate and non-destructive pointer replacement. Five new cases; CI pending. One new implementation file, no new dependencies.
+- P10 remaining: verify managed activation, integration with actual application session and RBAC, private managed root, managed crash cleanup, real cross-account/device validation, full audit coverage/actor attribution, retention and scheduling. No production restore.
 - P01 deeper per-feature audit; physical Windows, RouterOS, printers; hard-kill, power-loss and disk-full tests pending. main remains unprotected; exact-head manual gate enforced. No production DB or real router changes.
 
 ## PR #8 build failure — 2026-11-26

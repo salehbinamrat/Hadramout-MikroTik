@@ -425,6 +425,142 @@ public sealed class EncryptedBackupTests
         f.AssertClean();
     }
 
+    [Fact]
+    [SupportedOSPlatform("windows")]
+    public void ManagedActivationPreservesOldDatabaseAndSwitchesOnlyAfterPrecaution()
+    {
+        using var f = new Fixture();
+        EncryptedDatabaseBackup.Create(f.Source, f.Encrypted, Password);
+        string root = Path.Combine(f.Root, "managed");
+        Directory.CreateDirectory(root);
+        Guid previous;
+        string oldPath;
+        Guid currentEvent = Guid.NewGuid();
+        using (var session = ManagedDatabase.OpenSession(root))
+        {
+            previous = session.Generation;
+            oldPath = session.DatabasePath;
+            using var c = DatabaseStore.Open(oldPath);
+            using var cmd = c.CreateCommand();
+            cmd.CommandText = "INSERT INTO sites VALUES('11111111-1111-1111-1111-111111111111','current-only');";
+            cmd.ExecuteNonQuery();
+            AppendAudit(oldPath, currentEvent, "2026-01-01T00:00:00.0000000+00:00");
+        }
+        string precaution = Path.Combine(f.Root, "precaution.hmk");
+        byte[] before = SHA256.HashData(File.ReadAllBytes(oldPath));
+        var result = ManagedDatabase.ActivateRestore(root, previous, f.Encrypted, precaution,
+            Password, Password, allowUnavailableCredentials: false);
+        Assert.NotEqual(previous, result.Generation);
+        Assert.True(File.Exists(precaution));
+        Assert.True(before.AsSpan().SequenceEqual(SHA256.HashData(File.ReadAllBytes(oldPath))));
+        using (var session = ManagedDatabase.OpenSession(root))
+        {
+            Assert.Equal(result.Generation, session.Generation);
+            Assert.NotEqual(oldPath, session.DatabasePath);
+            using var c = DatabaseStore.Open(session.DatabasePath);
+            using var db = new NetworkDbContext(new DbContextOptionsBuilder<NetworkDbContext>().UseSqlite(c).Options);
+            Assert.Equal("synthetic-private-site", db.Sites.Single().Name);
+            Assert.Contains(AuditStore.ReadRecent(session.DatabasePath), x => x.Id == currentEvent);
+        }
+        f.AssertClean();
+    }
+
+    [Fact]
+    [SupportedOSPlatform("windows")]
+    public void ActiveSessionBlocksAnotherSessionAndRestore()
+    {
+        using var f = new Fixture();
+        string root = Path.Combine(f.Root, "managed");
+        Directory.CreateDirectory(root);
+        EncryptedDatabaseBackup.Create(f.Source, f.Encrypted, Password);
+        string precaution = Path.Combine(f.Root, "precaution.hmk");
+        using (var session = ManagedDatabase.OpenSession(root))
+        {
+            Assert.Throws<IOException>(() => ManagedDatabase.OpenSession(root));
+            Assert.Throws<IOException>(() => ManagedDatabase.ActivateRestore(root, session.Generation,
+                f.Encrypted, precaution, Password, Password, allowUnavailableCredentials: false));
+            Assert.False(File.Exists(precaution));
+        }
+        using var reopened = ManagedDatabase.OpenSession(root);
+        Assert.True(File.Exists(reopened.DatabasePath));
+    }
+
+    [Fact]
+    [SupportedOSPlatform("windows")]
+    public void StaleRequestOrWrongPasswordDoesNotSwitchGeneration()
+    {
+        using var f = new Fixture();
+        string root = Path.Combine(f.Root, "managed");
+        Directory.CreateDirectory(root);
+        EncryptedDatabaseBackup.Create(f.Source, f.Encrypted, Password);
+        string precaution = Path.Combine(f.Root, "precaution.hmk");
+        Guid id;
+        using (var session = ManagedDatabase.OpenSession(root)) id = session.Generation;
+        Assert.Throws<InvalidOperationException>(() => ManagedDatabase.ActivateRestore(root, Guid.NewGuid(),
+            f.Encrypted, precaution, Password, Password, allowUnavailableCredentials: false));
+        Assert.Throws<CryptographicException>(() => ManagedDatabase.ActivateRestore(root, id,
+            f.Encrypted, precaution, "incorrect-password"u8, Password, allowUnavailableCredentials: false));
+        Assert.False(File.Exists(precaution));
+        using var reopened = ManagedDatabase.OpenSession(root);
+        Assert.Equal(id, reopened.Generation);
+    }
+
+    [Fact]
+    [SupportedOSPlatform("windows")]
+    public void MissingOrMalformedPointerNeverInitializesOverExistingGeneration()
+    {
+        using var f = new Fixture();
+        string root = Path.Combine(f.Root, "managed");
+        Directory.CreateDirectory(root);
+        string previous;
+        using (var session = ManagedDatabase.OpenSession(root)) previous = session.DatabasePath;
+        string pointer = Path.Combine(root, "active-generation");
+        File.Delete(pointer);
+        Assert.Throws<InvalidDataException>(() => ManagedDatabase.OpenSession(root));
+        File.WriteAllText(pointer, "../outside.db");
+        Assert.Throws<InvalidDataException>(() => ManagedDatabase.OpenSession(root));
+        Assert.True(File.Exists(previous));
+        Assert.Single(Directory.GetFiles(root, "generation-*.db"));
+    }
+
+    [Fact]
+    [SupportedOSPlatform("windows")]
+    public void UnavailableCredentialsRequireExplicitActivationConsent()
+    {
+        using var f = new Fixture();
+        Router router;
+        using (var c = DatabaseStore.Open(f.Source))
+        using (var db = new NetworkDbContext(new DbContextOptionsBuilder<NetworkDbContext>().UseSqlite(c).Options))
+        {
+            router = new Router { SiteId = db.Sites.Single().Id, Name = "restore-router" };
+            db.Routers.Add(router);
+            db.SaveChanges();
+        }
+        new RouterCredentialStore(f.Source).Save(router.Id, "synthetic-user"u8, "synthetic-password"u8);
+        using (var c = DatabaseStore.Open(f.Source))
+        using (var cmd = c.CreateCommand())
+        {
+            cmd.CommandText = "UPDATE router_credentials SET PasswordEnvelope=X'01';";
+            cmd.ExecuteNonQuery();
+        }
+        EncryptedDatabaseBackup.Create(f.Source, f.Encrypted, Password);
+        string root = Path.Combine(f.Root, "managed");
+        Directory.CreateDirectory(root);
+        Guid id;
+        using (var session = ManagedDatabase.OpenSession(root)) id = session.Generation;
+        string precaution = Path.Combine(f.Root, "precaution.hmk");
+        Assert.Throws<InvalidOperationException>(() => ManagedDatabase.ActivateRestore(root, id, f.Encrypted,
+            precaution, Password, Password, allowUnavailableCredentials: false));
+        Assert.True(File.Exists(precaution));
+        using (var session = ManagedDatabase.OpenSession(root)) Assert.Equal(id, session.Generation);
+        string secondPrecaution = Path.Combine(f.Root, "second-precaution.hmk");
+        var result = ManagedDatabase.ActivateRestore(root, id, f.Encrypted, secondPrecaution,
+            Password, Password, allowUnavailableCredentials: true);
+        Assert.Contains(result.Credentials, x => x.RouterId == router.Id && x.State == RestoreCredentialState.Unavailable);
+        using var active = ManagedDatabase.OpenSession(root);
+        Assert.Equal(result.Generation, active.Generation);
+    }
+
     private static void AddPayload(string path, int size)
     {
         using var c = DatabaseStore.Open(path);
