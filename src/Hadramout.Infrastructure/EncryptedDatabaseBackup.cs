@@ -15,7 +15,7 @@ public static class EncryptedDatabaseBackup
     {
         ValidatePassword(password);
         DatabaseBackup.ValidatePaths(sourcePath, encryptedPath);
-        string workspace = CreateWorkspace(Path.GetDirectoryName(sourcePath)!);
+        string workspace = DatabaseBackup.CreatePrivateWorkspace(Path.GetDirectoryName(sourcePath)!);
         try
         {
             string snapshot = Path.Combine(workspace, "snapshot.db");
@@ -28,8 +28,8 @@ public static class EncryptedDatabaseBackup
     private static BackupReceipt EncryptSnapshot(string snapshot, string encryptedPath,
         ReadOnlySpan<byte> password, bool verify)
     {
-        string temporaryOutput = Path.Combine(Path.GetDirectoryName(encryptedPath)!,
-            ".hmk-" + Guid.NewGuid().ToString("N") + ".tmp");
+        string outputWorkspace = DatabaseBackup.CreatePrivateWorkspace(Path.GetDirectoryName(encryptedPath)!);
+        string temporaryOutput = Path.Combine(outputWorkspace, "encrypted.tmp");
         try
         {
             using (var input = new FileStream(snapshot, FileMode.Open, FileAccess.Read, FileShare.Read))
@@ -46,14 +46,14 @@ public static class EncryptedDatabaseBackup
             }
             return DatabaseBackup.PublishStandalone(temporaryOutput, encryptedPath);
         }
-        finally { File.Delete(temporaryOutput); }
+        finally { Directory.Delete(outputWorkspace, recursive: true); }
     }
 
     public static BackupReceipt PrepareRestore(string encryptedPath, string candidatePath, ReadOnlySpan<byte> password)
     {
         ValidatePassword(password);
         DatabaseBackup.ValidatePaths(encryptedPath, candidatePath);
-        string workspace = CreateWorkspace(Path.GetDirectoryName(candidatePath)!);
+        string workspace = DatabaseBackup.CreatePrivateWorkspace(Path.GetDirectoryName(candidatePath)!);
         try
         {
             string snapshot = Path.Combine(workspace, "snapshot.db");
@@ -93,13 +93,13 @@ public static class EncryptedDatabaseBackup
             OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal))
             throw new IOException("Candidate and precaution destinations must differ.");
 
-        string candidateWorkspace = CreateWorkspace(Path.GetDirectoryName(candidatePath)!);
+        string candidateWorkspace = DatabaseBackup.CreatePrivateWorkspace(Path.GetDirectoryName(candidatePath)!);
         try
         {
             string staged = Path.Combine(candidateWorkspace, "candidate.db");
             // Authenticate incoming backup before creating a safety copy or opening its SQLite data.
             PrepareRestore(encryptedPath, staged, backupPassword);
-            string currentWorkspace = CreateWorkspace(Path.GetDirectoryName(currentPath)!);
+            string currentWorkspace = DatabaseBackup.CreatePrivateWorkspace(Path.GetDirectoryName(currentPath)!);
             try
             {
                 string history = Path.Combine(currentWorkspace, "current.db");
@@ -122,13 +122,6 @@ public static class EncryptedDatabaseBackup
             finally { Directory.Delete(currentWorkspace, recursive: true); }
         }
         finally { Directory.Delete(candidateWorkspace, recursive: true); }
-    }
-
-    private static string CreateWorkspace(string parent)
-    {
-        string path = Path.Combine(parent, ".hmk-private-" + Guid.NewGuid().ToString("N"));
-        Directory.CreateDirectory(path);
-        return path;
     }
 
     private static void ValidatePassword(ReadOnlySpan<byte> password)

@@ -1,4 +1,7 @@
 using System.Security.Cryptography;
+using System.Runtime.Versioning;
+using System.Security.AccessControl;
+using System.Security.Principal;
 using Hadramout.Core;
 using Hadramout.Infrastructure;
 using Microsoft.EntityFrameworkCore;
@@ -366,6 +369,60 @@ public sealed class EncryptedBackupTests
         cmd.Parameters.AddWithValue("$id", id);
         cmd.Parameters.AddWithValue("$utc", utc);
         cmd.ExecuteNonQuery();
+    }
+
+    [Fact]
+    [SupportedOSPlatform("windows")]
+    public void PrivateWorkspaceHasRestrictedInheritedAccessBeforeWritingData()
+    {
+        using var f = new Fixture();
+        string path = DatabaseBackup.CreatePrivateWorkspace(f.Root);
+        try
+        {
+            using var identity = WindowsIdentity.GetCurrent();
+            var user = identity.User;
+            Assert.NotNull(user);
+            var acl = new DirectoryInfo(path).GetAccessControl(AccessControlSections.Access | AccessControlSections.Owner);
+            Assert.True(acl.AreAccessRulesProtected);
+            Assert.Equal(user, acl.GetOwner(typeof(SecurityIdentifier)));
+            var rule = Assert.Single(acl.GetAccessRules(true, true, typeof(SecurityIdentifier)).Cast<FileSystemAccessRule>());
+            Assert.Equal(user, rule.IdentityReference);
+            Assert.Equal(AccessControlType.Allow, rule.AccessControlType);
+            Assert.False(rule.IsInherited);
+            Assert.Equal(InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit, rule.InheritanceFlags);
+            string child = Path.Combine(path, "test.db");
+            File.WriteAllText(child, "synthetic-only");
+            var childRules = new FileInfo(child).GetAccessControl(AccessControlSections.Access)
+                .GetAccessRules(true, true, typeof(SecurityIdentifier)).Cast<FileSystemAccessRule>();
+            Assert.All(childRules, item => Assert.Equal(user, item.IdentityReference));
+            Assert.NotEmpty(childRules);
+        }
+        finally { Directory.Delete(path, recursive: true); }
+        f.AssertClean();
+    }
+
+    [Fact]
+    public void ParallelPrivateWorkspacesAreDistinctAndDoNotTouchExistingFiles()
+    {
+        using var f = new Fixture();
+        string existing = Path.Combine(f.Root, ".hmk-private-existing");
+        Directory.CreateDirectory(existing);
+        string sentinel = Path.Combine(existing, "keep.txt");
+        File.WriteAllText(sentinel, "keep");
+        var created = new System.Collections.Concurrent.ConcurrentBag<string>();
+        try
+        {
+            Parallel.For(0, 4, _ => created.Add(DatabaseBackup.CreatePrivateWorkspace(f.Root)));
+            Assert.Equal(4, created.Distinct().Count());
+            Assert.All(created, path => Assert.True(Directory.Exists(path)));
+            Assert.Equal("keep", File.ReadAllText(sentinel));
+        }
+        finally
+        {
+            foreach (string path in created) Directory.Delete(path, recursive: true);
+            Directory.Delete(existing, recursive: true);
+        }
+        f.AssertClean();
     }
 
     private static void AddPayload(string path, int size)
