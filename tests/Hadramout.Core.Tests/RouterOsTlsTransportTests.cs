@@ -283,6 +283,100 @@ public sealed class RouterOsTlsTransportTests(ITestOutputHelper output)
         }
     }
 
+    [Theory]
+    [InlineData("6.49.19 (long-term)", "6.49.19", "no", 1, 3)]
+    [InlineData("7.21.1 (stable)", "7.21.1", "false", 2, 3)]
+    [InlineData("7.21.1 (stable)", "", "true", 2, 2)]
+    public async Task DiscoveryReadsVersionAndPackageEvidenceWithoutMutation(
+        string version, string packageVersion, string disabled, int family, int expected)
+    {
+        using var certificates = new Certificates();
+        using var server = new LoopbackServer(certificates.Leaf, certificates.Root, output);
+        Task serve = server.RunAsync(reply: true, handler: async (tls, token) =>
+        {
+            await AssertLoginAsync(tls, token);
+            await RouterOsWireCodec.WriteSentenceAsync(tls, ["!done"u8.ToArray()], token);
+            await AssertVersionRequestAsync(tls, token);
+            await RouterOsWireCodec.WriteSentenceAsync(tls,
+                ["!re"u8.ToArray(), Encoding.ASCII.GetBytes("=version=" + version)], token);
+            await RouterOsWireCodec.WriteSentenceAsync(tls, ["!done"u8.ToArray()], token);
+            await AssertPackageRequestAsync(tls, token);
+            await RouterOsWireCodec.WriteSentenceAsync(tls,
+                ["!re"u8.ToArray(), "=name=user-manager"u8.ToArray(),
+                    Encoding.ASCII.GetBytes("=version=" + packageVersion),
+                    Encoding.ASCII.GetBytes("=disabled=" + disabled)], token);
+            await RouterOsWireCodec.WriteSentenceAsync(tls, ["!done"u8.ToArray()], token);
+        });
+        try
+        {
+            using var session = await ConnectSessionAsync(server, certificates);
+            var result = await session.DiscoverAsync();
+            Assert.Equal((RouterOsFamily)family, result.Family);
+            Assert.Equal((UserManagerPackageState)expected, result.UserManagerPackage);
+            Assert.Equal("user-manager", Assert.Single(result.Packages).Name);
+        }
+        finally { await serve; }
+    }
+
+    [Fact]
+    public async Task UnsupportedVersionDoesNotQueryPackages()
+    {
+        using var certificates = new Certificates();
+        using var server = new LoopbackServer(certificates.Leaf, certificates.Root, output);
+        Task serve = server.RunAsync(reply: true, handler: async (tls, token) =>
+        {
+            await AssertLoginAsync(tls, token);
+            await RouterOsWireCodec.WriteSentenceAsync(tls, ["!done"u8.ToArray()], token);
+            await AssertVersionRequestAsync(tls, token);
+            await RouterOsWireCodec.WriteSentenceAsync(tls,
+                ["!re"u8.ToArray(), "=version=8.0"u8.ToArray()], token);
+            await RouterOsWireCodec.WriteSentenceAsync(tls, ["!done"u8.ToArray()], token);
+            byte[] buffer = new byte[1];
+            Assert.Equal(0, await tls.ReadAsync(buffer, token));
+        });
+        try
+        {
+            using var session = await ConnectSessionAsync(server, certificates);
+            var result = await session.DiscoverAsync();
+            Assert.Equal(RouterOsFamily.Unsupported, result.Family);
+            Assert.Equal(UserManagerPackageState.Unknown, result.UserManagerPackage);
+        }
+        finally { await serve; }
+    }
+
+    [Fact]
+    public async Task RejectedPackageReadNeverReportsPackageAbsent()
+    {
+        using var certificates = new Certificates();
+        using var server = new LoopbackServer(certificates.Leaf, certificates.Root, output);
+        Task serve = server.RunAsync(reply: true, handler: async (tls, token) =>
+        {
+            await AssertLoginAsync(tls, token);
+            await RouterOsWireCodec.WriteSentenceAsync(tls, ["!done"u8.ToArray()], token);
+            await AssertVersionRequestAsync(tls, token);
+            await RouterOsWireCodec.WriteSentenceAsync(tls,
+                ["!re"u8.ToArray(), "=version=6.49.19"u8.ToArray()], token);
+            await RouterOsWireCodec.WriteSentenceAsync(tls, ["!done"u8.ToArray()], token);
+            await AssertPackageRequestAsync(tls, token);
+            await RouterOsWireCodec.WriteSentenceAsync(tls, ["!trap"u8.ToArray(), "=category=0"u8.ToArray()], token);
+        });
+        try
+        {
+            using var session = await ConnectSessionAsync(server, certificates);
+            await Assert.ThrowsAsync<InvalidDataException>(() => session.DiscoverAsync());
+            await Assert.ThrowsAsync<ObjectDisposedException>(() => session.ReadVersionAsync());
+        }
+        finally { await serve; }
+    }
+
+    private static async Task AssertPackageRequestAsync(SslStream tls, CancellationToken token)
+    {
+        byte[][] words = await RouterOsWireCodec.ReadSentenceAsync(tls, token);
+        Assert.Collection(words,
+            word => Assert.True(word.AsSpan().SequenceEqual("/system/package/print"u8)),
+            word => Assert.True(word.AsSpan().SequenceEqual("=.proplist=name,version,disabled,scheduled"u8)));
+    }
+
     private static Task<RouterOsSession> ConnectSessionAsync(LoopbackServer server, Certificates certificates) =>
         RouterOsSession.ConnectAsync("127.0.0.1", "router.test", "synthetic-user"u8.ToArray(),
             "synthetic-private-password"u8.ToArray(), server.Port, trustedRootDer: certificates.Root.RawData);
