@@ -17,6 +17,37 @@ jobs:
       - uses: actions/setup-dotnet@v5
         with:
           global-json-file: global.json
+      - name: Validate packaging script syntax and structure
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $path = (Resolve-Path 'packaging/verify-and-package.ps1').Path
+          $tokens = $null
+          $parseErrors = $null
+          $null = [System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [ref]$parseErrors)
+          if ($parseErrors.Count -ne 0) {
+            $parseErrors | ForEach-Object { Write-Host ("Line {0}: {1}" -f $_.Extent.StartLineNumber, $_.Message) }
+            throw 'Packaging script contains syntax errors.'
+          }
+          $source = Get-Content -LiteralPath $path -Raw
+          $requiredOnce = @(
+            'function Invoke-Smoke(',
+            "Invoke-Checked 'dotnet' @('test'",
+            "Invoke-Checked 'dotnet' @('build'",
+            "Invoke-Checked 'dotnet' @('publish'",
+            "'SHA256SUMS.txt'",
+            '$expectedSmokeLabels = @('
+          )
+          foreach ($anchor in $requiredOnce) {
+            if ([regex]::Matches($source, [regex]::Escape($anchor)).Count -ne 1) {
+              throw "Duplicate or missing packaging step: $anchor"
+            }
+          }
+          $archLoop = 'foreach ($arch in @(''x86'',''x64''))'
+          if ([regex]::Matches($source, [regex]::Escape($archLoop)).Count -ne 2) {
+            throw 'Expected exactly two architecture loops.'
+          }
+          Write-Host 'Packaging script syntax and structure verified.'
       - name: Restore
         run: dotnet restore Hadramout.slnx
       - name: Build
