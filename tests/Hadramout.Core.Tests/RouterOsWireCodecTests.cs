@@ -565,6 +565,138 @@ public sealed class RouterOsWireCodecTests
                 Encoding.ASCII.GetBytes("=active-sessions=" + new string('x', 4097))], "admin", "123"));
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Um6CreateWireEncodesOnlyOneDisabledAccountWithUniqueMarker(bool empty)
+    {
+        using var reply = new MemoryStream();
+        await ReplyAsync(reply, "!done", "=ret=*1A");
+        using var wire = new CreateExchangeStream(reply.ToArray());
+        var exchange = new UserManager6CreateWire(wire);
+        Guid id = Guid.Parse("aabbccdd-1122-3344-5566-778899aabbcc");
+        byte[] password = empty ? [] : Encoding.UTF8.GetBytes("synthetic=كرت");
+        var result = await exchange.CreateDisabledOnceAsync(id, "admin", "001", password, CancellationToken.None);
+        Assert.Equal(UserManager6CreateWireOutcome.Acknowledged, result.Outcome);
+        Assert.Equal("*1A", result.ReturnedId);
+        using var sent = new MemoryStream(wire.ToArray());
+        byte[][] words = await RouterOsWireCodec.ReadSentenceAsync(sent, CancellationToken.None);
+        Assert.Equal(new[] { "/tool/user-manager/user/add", "=customer=admin", "=username=001",
+            "=password=" + Encoding.UTF8.GetString(password), "=disabled=yes",
+            "=comment=hmk-create:aabbccdd112233445566778899aabbcc" },
+            words.Select(word => Encoding.UTF8.GetString(word)).ToArray());
+        Assert.Equal(sent.Length, sent.Position);
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            exchange.CreateDisabledOnceAsync(id, "admin", "001", password, CancellationToken.None));
+        Assert.Equal(sent.Length, wire.Length);
+    }
+
+    [Theory]
+    [InlineData("bare", true)]
+    [InlineData("trap", false)]
+    [InlineData("fatal", false)]
+    [InlineData("data", false)]
+    [InlineData("unknown", false)]
+    [InlineData("missing", false)]
+    [InlineData("truncated", false)]
+    [InlineData("malformed-id", false)]
+    [InlineData("extra-attribute", false)]
+    [InlineData("duplicate-ret", false)]
+    [InlineData("empty", false)]
+    public async Task Um6CreateWireNeverTreatsUncertainReplyAsAcknowledged(string kind, bool acknowledged)
+    {
+        using var reply = new MemoryStream();
+        switch (kind)
+        {
+            case "bare": await ReplyAsync(reply, "!done"); break;
+            case "trap": await ReplyAsync(reply, "!trap", "=message=synthetic"); await ReplyAsync(reply, "!done"); break;
+            case "fatal": await ReplyAsync(reply, "!fatal"); break;
+            case "data": await ReplyAsync(reply, "!re", "=.id=*1"); await ReplyAsync(reply, "!done"); break;
+            case "unknown": await ReplyAsync(reply, "!unknown"); break;
+            case "truncated": reply.Write(new byte[] { 5, (byte)'!' }); break;
+            case "malformed-id": await ReplyAsync(reply, "!done", "=ret=not-an-id"); break;
+            case "extra-attribute": await ReplyAsync(reply, "!done", "=ret=*1", "=other=1"); break;
+            case "duplicate-ret": await ReplyAsync(reply, "!done", "=ret=*1", "=ret=*2"); break;
+            case "empty": await ReplyAsync(reply, "!empty"); await ReplyAsync(reply, "!done"); break;
+        }
+        using var wire = new CreateExchangeStream(reply.ToArray());
+        var exchange = new UserManager6CreateWire(wire);
+        Guid id = Guid.NewGuid();
+        var result = await exchange.CreateDisabledOnceAsync(id, "admin", "001", "synthetic"u8.ToArray(), CancellationToken.None);
+        Assert.Equal(acknowledged ? UserManager6CreateWireOutcome.Acknowledged : UserManager6CreateWireOutcome.Indeterminate, result.Outcome);
+        Assert.Null(result.ReturnedId);
+        long length = wire.Length;
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            exchange.CreateDisabledOnceAsync(id, "admin", "001", "synthetic"u8.ToArray(), CancellationToken.None));
+        Assert.Equal(length, wire.Length);
+    }
+
+    [Theory]
+    [InlineData("invalid-utf8")]
+    [InlineData("control")]
+    [InlineData("too-long")]
+    [InlineData("empty-id")]
+    [InlineData("invalid-user")]
+    public async Task Um6CreateWireRejectsInvalidInputBeforeWriting(string kind)
+    {
+        using var wire = new CreateExchangeStream([]);
+        var exchange = new UserManager6CreateWire(wire);
+        byte[] password = kind switch
+        {
+            "invalid-utf8" => [0xff], "control" => [0], "too-long" => new byte[4097], _ => []
+        };
+        await Assert.ThrowsAnyAsync<ArgumentException>(() => exchange.CreateDisabledOnceAsync(
+            kind == "empty-id" ? Guid.Empty : Guid.NewGuid(), "admin",
+            kind == "invalid-user" ? " 001" : "001", password, CancellationToken.None));
+        Assert.Equal(0L, wire.Length);
+    }
+
+    [Fact]
+    public async Task Um6CreateWirePartialWriteIsIndeterminateAndCannotRepeat()
+    {
+        using var wire = new CreateExchangeStream([], failAfterFirstWrite: true);
+        var exchange = new UserManager6CreateWire(wire);
+        Guid id = Guid.NewGuid();
+        var receipt = await exchange.CreateDisabledOnceAsync(id, "admin", "001", ReadOnlyMemory<byte>.Empty, CancellationToken.None);
+        Assert.Equal(UserManager6CreateWireOutcome.Indeterminate, receipt.Outcome);
+        Assert.True(wire.Length > 0);
+        long length = wire.Length;
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            exchange.CreateDisabledOnceAsync(id, "admin", "001", ReadOnlyMemory<byte>.Empty, CancellationToken.None));
+        Assert.Equal(length, wire.Length);
+    }
+
+    [Fact]
+    public async Task Um6CreateWirePreCancelledDoesNotWrite()
+    {
+        using var wire = new CreateExchangeStream([]);
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            new UserManager6CreateWire(wire).CreateDisabledOnceAsync(Guid.NewGuid(), "admin", "001",
+                ReadOnlyMemory<byte>.Empty, cts.Token));
+        Assert.Equal(0L, wire.Length);
+    }
+
+    // Separate in/out buffers model the duplex exchange without a real router.
+    private sealed class CreateExchangeStream(byte[] response, bool failAfterFirstWrite = false) : MemoryStream
+    {
+        private readonly MemoryStream input = new(response);
+        private int writes;
+        public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default) =>
+            input.ReadAsync(buffer, cancellationToken);
+        public override ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            if (failAfterFirstWrite && ++writes > 1) return ValueTask.FromException(new IOException("Synthetic write failure."));
+            return base.WriteAsync(buffer, cancellationToken);
+        }
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing) input.Dispose();
+            base.Dispose(disposing);
+        }
+    }
+
     private sealed class FragmentedStream(byte[] bytes) : MemoryStream(bytes)
     {
         public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default) =>
