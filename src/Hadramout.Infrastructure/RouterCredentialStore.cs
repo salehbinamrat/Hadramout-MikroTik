@@ -19,6 +19,10 @@ public sealed class RouterCredentialLease : IDisposable
     public ReadOnlySpan<byte> Username => username ?? throw new ObjectDisposedException(nameof(RouterCredentialLease));
     public ReadOnlySpan<byte> Password => password ?? throw new ObjectDisposedException(nameof(RouterCredentialLease));
 
+    // Async transport borrows these buffers only while the owning lease is alive.
+    internal ReadOnlyMemory<byte> UsernameMemory => username ?? throw new ObjectDisposedException(nameof(RouterCredentialLease));
+    internal ReadOnlyMemory<byte> PasswordMemory => password ?? throw new ObjectDisposedException(nameof(RouterCredentialLease));
+
     public void Dispose()
     {
         if (username is not null) CryptographicOperations.ZeroMemory(username);
@@ -92,6 +96,32 @@ public sealed class RouterCredentialStore(string databasePath)
         cmd.Parameters.AddWithValue("$id", routerId);
         using var reader = cmd.ExecuteReader();
         if (!reader.Read()) return null;
+        return OpenLease(routerId, reader.GetFieldValue<byte[]>(0), reader.GetFieldValue<byte[]>(1));
+    }
+
+    // Bound operations must not initialize or migrate a database during a read.
+    // Bound blob sizes before materializing them, including on a damaged database.
+    internal RouterCredentialLease? LoadReadOnly(Guid routerId)
+    {
+        ValidateId(routerId);
+        if (!Path.IsPathFullyQualified(databasePath))
+            throw new ArgumentException("Absolute database path required.", nameof(databasePath));
+        using var c = DatabaseBackup.OpenRaw(databasePath, SqliteOpenMode.ReadOnly);
+        DatabaseBackup.RequireIdentity(c);
+        using var cmd = c.CreateCommand();
+        cmd.CommandText = """
+            SELECT CASE WHEN typeof(UsernameEnvelope)='blob' AND length(UsernameEnvelope) BETWEEN 1 AND $max
+                         THEN UsernameEnvelope END,
+                   CASE WHEN typeof(PasswordEnvelope)='blob' AND length(PasswordEnvelope) BETWEEN 1 AND $max
+                         THEN PasswordEnvelope END
+            FROM router_credentials WHERE RouterId=$id;
+            """;
+        cmd.Parameters.AddWithValue("$id", routerId);
+        cmd.Parameters.AddWithValue("$max", RouterCredentialProtector.MaxEnvelopeLength);
+        using var reader = cmd.ExecuteReader();
+        if (!reader.Read()) return null;
+        if (reader.IsDBNull(0) || reader.IsDBNull(1))
+            throw new CryptographicException("Stored router credential is unavailable or invalid.");
         return OpenLease(routerId, reader.GetFieldValue<byte[]>(0), reader.GetFieldValue<byte[]>(1));
     }
 
