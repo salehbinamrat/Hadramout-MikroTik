@@ -1,0 +1,5 @@
+<Solution>
+ <Project Path="src/Hadramout.Core/Hadramout.Core.csproj" />
+ <Project Path="src/Hadramout.Desktop/Hadramout.Desktop.csproj" />
+ <Project Path="tests/Hadramout.Core.Tests/Hadramout.Core.Tests.csproj" />
+</Solution>
