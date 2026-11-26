@@ -1,0 +1,13 @@
+<Window x:Class="Hadramout.Desktop.MainWindow"
+ xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+ xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+ Title="حضرموت مايكروتيك" Height="440" Width="760" MinHeight="320" MinWidth="520"
+ FlowDirection="RightToLeft" WindowStartupLocation="CenterScreen" FontFamily="Arial" Background="#F1F5F9">
+ <Border Margin="24" Padding="32" Background="White" CornerRadius="12">
+  <StackPanel VerticalAlignment="Center">
+   <TextBlock Text="حضرموت مايكروتيك" FontSize="30" FontWeight="Bold" Foreground="#0F172A"/>
+   <TextBlock Text="Hadramout MikroTik" FlowDirection="LeftToRight" HorizontalAlignment="Right" FontSize="16" Foreground="#475569"/>
+   <TextBlock Text="مرحلة التأسيس — اختبار التشغيل فقط" TextWrapping="Wrap" Margin="0,24,0,0" FontSize="18" Foreground="#0F766E"/>
+  </StackPanel>
+ </Border>
+</Window>
