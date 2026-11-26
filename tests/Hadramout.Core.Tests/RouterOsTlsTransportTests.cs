@@ -752,6 +752,172 @@ public sealed class RouterOsTlsTransportTests(ITestOutputHelper output)
         finally { await next; }
     }
 
+    // P15: exercise the actual recovery facade, not just individual protocol components.
+    [Theory]
+    [InlineData("6.49.19 (long-term)", "6.49.19", 1, 2, "/tool/user-manager/user/print")]
+    [InlineData("7.21.1 (stable)", "7.21.1", 2, 3, "/user-manager/user/print")]
+    public async Task CompatibilityMatrixUsesCorrectBackendAcrossCompleteAuthenticatedReads(
+        string version, string packageVersion, int family, int umBackend, string umPath)
+    {
+        using var certificates = new Certificates();
+        using var server = new LoopbackServer(certificates.Leaf, certificates.Root, output);
+        Task inventoryPeer = server.RunAsync(reply: true, handler: async (tls, token) =>
+        {
+            await PrepareProbePeerAsync(tls, token, version);
+            await AssertPackageRequestAsync(tls, token);
+            await WritePackageAsync(tls, token, "user-manager", packageVersion);
+            await RouterOsWireCodec.WriteSentenceAsync(tls, ["!done"u8.ToArray()], token);
+        });
+        try
+        {
+            var inventory = await RouterOsReadRecovery.DiscoverAsync("127.0.0.1", "router.test",
+                "synthetic-user"u8.ToArray(), "synthetic-private-password"u8.ToArray(), server.Port,
+                trustedRootDer: certificates.Root.RawData);
+            Assert.Equal((RouterOsFamily)family, inventory.Family);
+            Assert.Equal(UserManagerPackageState.InstalledEnabled, inventory.UserManagerPackage);
+            Assert.Equal(packageVersion, Assert.Single(inventory.Packages).Version);
+        }
+        finally { await inventoryPeer; }
+
+        (BackendKind Kind, string[] Words, long Count)[] probes =
+        [
+            ((BackendKind)umBackend, [umPath, "=count-only="], 15000L),
+            (BackendKind.Hotspot, ["/ip/hotspot/user/print", "=count-only="], 0L),
+            (BackendKind.Pppoe, ["/ppp/secret/print", "=count-only=", "?service=pppoe", "?service=any", "?#|"], 100000L)
+        ];
+        foreach (var probe in probes)
+        {
+            Task peer = server.RunAsync(reply: true, handler: async (tls, token) =>
+            {
+                await PrepareProbePeerAsync(tls, token, version);
+                byte[][] words = await RouterOsWireCodec.ReadSentenceAsync(tls, token);
+                Assert.Equal(probe.Words, words.Select(word => Encoding.ASCII.GetString(word)).ToArray());
+                if (family == 2 && probe.Count == 0)
+                    await RouterOsWireCodec.WriteSentenceAsync(tls, ["!empty"u8.ToArray()], token);
+                await RouterOsWireCodec.WriteSentenceAsync(tls,
+                    ["!done"u8.ToArray(), Encoding.ASCII.GetBytes("=ret=" +
+                        probe.Count.ToString(System.Globalization.CultureInfo.InvariantCulture))], token);
+            });
+            try
+            {
+                var result = await RouterOsReadRecovery.ProbeServiceAsync(probe.Kind, "127.0.0.1", "router.test",
+                    "synthetic-user"u8.ToArray(), "synthetic-private-password"u8.ToArray(), server.Port,
+                    trustedRootDer: certificates.Root.RawData);
+                Assert.Equal((RouterOsFamily)family, result.Family);
+                Assert.Equal(probe.Kind, result.Backend);
+                Assert.Equal(RouterOsServiceProbeState.Readable, result.State);
+                Assert.Equal(probe.Count, result.AccountCount);
+            }
+            finally { await peer; }
+        }
+        Assert.False(server.HasPendingConnection);
+    }
+
+    [Fact]
+    public async Task DiscoveryRecoveryNeverCombinesPackagesFromDifferentConnections()
+    {
+        using var certificates = new Certificates();
+        using var server = new LoopbackServer(certificates.Leaf, certificates.Root, output);
+        Task serve = ServeAsync();
+        async Task ServeAsync()
+        {
+            await server.RunAsync(reply: true, handler: async (tls, token) =>
+            {
+                await PrepareProbePeerAsync(tls, token, "6.49.19");
+                await AssertPackageRequestAsync(tls, token);
+                await WritePackageAsync(tls, token, "user-manager", "6.49.19");
+                await tls.ShutdownAsync();
+            });
+            await server.RunAsync(reply: true, handler: async (tls, token) =>
+            {
+                await PrepareProbePeerAsync(tls, token, "7.21.1");
+                await AssertPackageRequestAsync(tls, token);
+                await WritePackageAsync(tls, token, "routeros", "7.21.1");
+                await RouterOsWireCodec.WriteSentenceAsync(tls, ["!done"u8.ToArray()], token);
+            });
+        }
+        try
+        {
+            var inventory = await RouterOsReadRecovery.DiscoverAsync("127.0.0.1", "router.test",
+                "synthetic-user"u8.ToArray(), "synthetic-private-password"u8.ToArray(), server.Port,
+                trustedRootDer: certificates.Root.RawData);
+            Assert.Equal("7.21.1", inventory.Version);
+            Assert.Equal(RouterOsFamily.V7, inventory.Family);
+            Assert.Equal(UserManagerPackageState.NotListed, inventory.UserManagerPackage);
+            Assert.Equal("routeros", Assert.Single(inventory.Packages).Name);
+        }
+        finally { await serve; }
+        Assert.False(server.HasPendingConnection);
+    }
+
+    [Fact]
+    public async Task ServiceRecoveryRechecksFamilyBeforeSendingBackendCommand()
+    {
+        using var certificates = new Certificates();
+        using var server = new LoopbackServer(certificates.Leaf, certificates.Root, output);
+        Task serve = ServeAsync();
+        async Task ServeAsync()
+        {
+            await server.RunAsync(reply: true, handler: async (tls, token) =>
+            {
+                await PrepareProbePeerAsync(tls, token, "6.49.19");
+                byte[][] words = await RouterOsWireCodec.ReadSentenceAsync(tls, token);
+                Assert.Equal(new[] { "/tool/user-manager/user/print", "=count-only=" },
+                    words.Select(word => Encoding.ASCII.GetString(word)).ToArray());
+                await tls.ShutdownAsync();
+            });
+            await server.RunAsync(reply: true, handler: async (tls, token) =>
+            {
+                await PrepareProbePeerAsync(tls, token, "7.21.1");
+                Assert.Equal(0, await tls.ReadAsync(new byte[1], token));
+            });
+        }
+        try
+        {
+            var result = await RouterOsReadRecovery.ProbeServiceAsync(BackendKind.UserManager6,
+                "127.0.0.1", "router.test", "synthetic-user"u8.ToArray(),
+                "synthetic-private-password"u8.ToArray(), server.Port, trustedRootDer: certificates.Root.RawData);
+            Assert.Equal(RouterOsFamily.V7, result.Family);
+            Assert.Equal(RouterOsServiceProbeState.NotApplicable, result.State);
+            Assert.Null(result.AccountCount);
+        }
+        finally { await serve; }
+        Assert.False(server.HasPendingConnection);
+    }
+
+    [Theory]
+    [InlineData("!trap", 2)]
+    [InlineData("!fatal", 3)]
+    public async Task RecoveryFacadeDoesNotReplayExplicitServiceFailure(string replyKind, int state)
+    {
+        using var certificates = new Certificates();
+        using var server = new LoopbackServer(certificates.Leaf, certificates.Root, output);
+        Task serve = server.RunAsync(reply: true, handler: async (tls, token) =>
+        {
+            await PrepareProbePeerAsync(tls, token, "7.21.1");
+            byte[][] words = await RouterOsWireCodec.ReadSentenceAsync(tls, token);
+            Assert.Equal(new[] { "/user-manager/user/print", "=count-only=" },
+                words.Select(word => Encoding.ASCII.GetString(word)).ToArray());
+            await RouterOsWireCodec.WriteSentenceAsync(tls,
+                [Encoding.ASCII.GetBytes(replyKind), "=message=synthetic-rejection"u8.ToArray()], token);
+        });
+        try
+        {
+            var result = await RouterOsReadRecovery.ProbeServiceAsync(BackendKind.UserManager7,
+                "127.0.0.1", "router.test", "synthetic-user"u8.ToArray(),
+                "synthetic-private-password"u8.ToArray(), server.Port, trustedRootDer: certificates.Root.RawData);
+            Assert.Equal((RouterOsServiceProbeState)state, result.State);
+            Assert.Null(result.AccountCount);
+        }
+        finally { await serve; }
+        Assert.False(server.HasPendingConnection);
+    }
+
+    private static ValueTask WritePackageAsync(SslStream tls, CancellationToken token, string name, string version) =>
+        RouterOsWireCodec.WriteSentenceAsync(tls,
+            ["!re"u8.ToArray(), Encoding.ASCII.GetBytes("=name=" + name),
+                Encoding.ASCII.GetBytes("=version=" + version), "=disabled=false"u8.ToArray()], token);
+
     private static async Task PrepareProbePeerAsync(SslStream tls, CancellationToken token, string version)
     {
         await AssertLoginAsync(tls, token);
