@@ -1,4 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
  <PropertyGroup><OutputType>WinExe</OutputType><TargetFramework>net11.0-windows</TargetFramework><UseWPF>true</UseWPF><AssemblyName>HadramoutMikroTik</AssemblyName><Version>0.1.0</Version></PropertyGroup>
- <ItemGroup><ProjectReference Include="../Hadramout.Core/Hadramout.Core.csproj" /></ItemGroup>
+ <ItemGroup>
+  <ProjectReference Include="../Hadramout.Core/Hadramout.Core.csproj"/>
+  <ProjectReference Include="../Hadramout.Infrastructure/Hadramout.Infrastructure.csproj"/>
+ </ItemGroup>
 </Project>

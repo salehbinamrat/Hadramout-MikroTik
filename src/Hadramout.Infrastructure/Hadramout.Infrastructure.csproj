@@ -1,0 +1,7 @@
+<Project Sdk="Microsoft.NET.Sdk">
+ <PropertyGroup><TargetFramework>net11.0</TargetFramework></PropertyGroup>
+ <ItemGroup>
+  <ProjectReference Include="../Hadramout.Core/Hadramout.Core.csproj"/>
+  <PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite"/>
+ </ItemGroup>
+</Project>
