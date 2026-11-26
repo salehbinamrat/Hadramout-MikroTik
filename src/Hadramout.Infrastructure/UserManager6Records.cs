@@ -66,6 +66,10 @@ internal sealed record UserManager6ProfileLink(string Profile, string Limitation
 internal sealed record UserManager6ProfileMappingEvidence(UserManager6Profile Profile,
     IReadOnlyList<UserManager6ProfileLink> VisibleNameMatches);
 
+internal enum UserManager6PreflightState { ProfileNotVisible, UsernameAlreadyVisible, NoVisibleUsernameMatch }
+internal sealed record UserManager6PreflightEvidence(UserManager6PreflightState State,
+    UserManager6Profile? Profile, string? ExistingCustomer);
+
 internal static class UserManager6Records
 {
     private static readonly UTF8Encoding Utf8 = new(false, true);
@@ -105,6 +109,16 @@ internal static class UserManager6Records
             new UserManager6ActivityEvidence(ReadText(words, "active", 128),
                 ReadText(words, "incomplete", 128), ReadText(words, "last-seen", 128),
                 ReadText(words, "active-sessions", 4096)));
+    }
+
+    internal static string ParseVisibleUsernameCustomer(byte[][] words, string username)
+    {
+        RequiredMatch(words, "username", username);
+        string? customer = ReadText(words, "customer", 128);
+        if (customer is null) throw new InvalidDataException("User Manager account has no customer identity.");
+        try { ValidateKey(customer, nameof(customer)); }
+        catch (ArgumentException) { throw new InvalidDataException("Invalid User Manager customer identity."); }
+        return customer;
     }
 
     internal static UserManager6Profile ParseProfile(byte[][] words, string owner, string name) =>

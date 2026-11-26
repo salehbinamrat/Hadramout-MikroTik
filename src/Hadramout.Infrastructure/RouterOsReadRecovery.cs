@@ -106,8 +106,22 @@ internal static class RouterOsReadRecovery
     }
 
     [SupportedOSPlatform("windows")]
+    internal static Task<UserManager6PreflightEvidence> ReadPreparedUm6PreflightAsync(
+        string databasePath, Guid reservationId, TimeSpan? timeout = null,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var scope = new UserManager6CreateJournal(databasePath).ReadPreparedPreflightScope(reservationId);
+        return ReadBoundAsync(databasePath, scope.RouterId, timeout,
+            (session, token) => session.ReadUserManager6CreationPreflightAsync(
+                scope.ProfileOwner, scope.ProfileName, scope.Username, timeout, token),
+            cancellationToken, requiredPin: scope.LeafSha256);
+    }
+
+    [SupportedOSPlatform("windows")]
     private static async Task<T> ReadBoundAsync<T>(string databasePath, Guid routerId, TimeSpan? timeout,
-        Func<RouterOsSession, CancellationToken, Task<T>> operation, CancellationToken cancellationToken)
+        Func<RouterOsSession, CancellationToken, Task<T>> operation, CancellationToken cancellationToken,
+        string? requiredPin = null)
     {
         TimeSpan limit = timeout ?? TimeSpan.FromSeconds(15);
         if (limit <= TimeSpan.Zero || limit > TimeSpan.FromMinutes(2))
@@ -115,6 +129,8 @@ internal static class RouterOsReadRecovery
         cancellationToken.ThrowIfCancellationRequested();
         var target = new RouterTargetStore(databasePath).Read(routerId)
             ?? throw new InvalidOperationException("Router target is not enrolled.");
+        if (requiredPin is not null && !string.Equals(requiredPin, target.LeafSha256, StringComparison.Ordinal))
+            throw new InvalidOperationException("Prepared creation target no longer matches.");
         cancellationToken.ThrowIfCancellationRequested();
         using var credential = new RouterCredentialStore(databasePath).LoadReadOnly(routerId)
             ?? throw new InvalidOperationException("Router credentials are not configured.");

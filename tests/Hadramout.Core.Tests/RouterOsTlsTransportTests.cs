@@ -1500,6 +1500,143 @@ public sealed class RouterOsTlsTransportTests(ITestOutputHelper output)
         finally { directory.Delete(recursive: true); }
     }
 
+    [Theory]
+    [InlineData("clear")]
+    [InlineData("existing")]
+    [InlineData("other-customer")]
+    [InlineData("missing-profile")]
+    [InlineData("wrong-owner")]
+    [InlineData("duplicate-profile")]
+    [InlineData("account-trap")]
+    [InlineData("wrong-username")]
+    [InlineData("duplicate-account")]
+    [SupportedOSPlatform("windows")]
+    public async Task PreparedCreationPreflightUsesOnlyScopedReadsAndNeverClaims(string condition)
+    {
+        using var certificates = new Certificates();
+        using var server = new LoopbackServer(certificates.Leaf, certificates.Root, output);
+        var directory = Directory.CreateTempSubdirectory("hadramout-preflight-");
+        try
+        {
+            string path = Path.Combine(directory.FullName, "test.db");
+            Guid id = PreparePreflightFixture(path, server.Port, certificates, true);
+            Task serve = server.RunAsync(reply: true, handler: async (tls, token) =>
+            {
+                await PrepareProbePeerAsync(tls, token, "6.49.19");
+                byte[][] request = await RouterOsWireCodec.ReadSentenceAsync(tls, token);
+                Assert.Equal(new[] { "/tool/user-manager/profile/print", "=.proplist=owner,name,validity,starts-at",
+                    "?name=remote-day" }, request.Select(word => Encoding.UTF8.GetString(word)).ToArray());
+                if (condition == "missing-profile")
+                {
+                    await RouterOsWireCodec.WriteSentenceAsync(tls, ["!done"u8.ToArray()], token);
+                    return;
+                }
+                ReadOnlyMemory<byte>[] profile = ["!re"u8.ToArray(),
+                    condition == "wrong-owner" ? "=owner=other"u8.ToArray() : "=owner=owner"u8.ToArray(),
+                    "=name=remote-day"u8.ToArray()];
+                await RouterOsWireCodec.WriteSentenceAsync(tls, profile, token);
+                if (condition == "wrong-owner") return;
+                if (condition == "duplicate-profile")
+                {
+                    await RouterOsWireCodec.WriteSentenceAsync(tls, profile, token);
+                    return;
+                }
+                await RouterOsWireCodec.WriteSentenceAsync(tls, ["!done"u8.ToArray()], token);
+                request = await RouterOsWireCodec.ReadSentenceAsync(tls, token);
+                Assert.Equal(new[] { "/tool/user-manager/user/print", "=.proplist=customer,username", "?username=001" },
+                    request.Select(word => Encoding.UTF8.GetString(word)).ToArray());
+                if (condition == "account-trap")
+                {
+                    await RouterOsWireCodec.WriteSentenceAsync(tls, ["!trap"u8.ToArray()], token);
+                    return;
+                }
+                if (condition != "clear")
+                {
+                    ReadOnlyMemory<byte>[] row = ["!re"u8.ToArray(),
+                        condition == "other-customer" ? "=customer=other"u8.ToArray() : "=customer=admin"u8.ToArray(),
+                        condition == "wrong-username" ? "=username=002"u8.ToArray() : "=username=001"u8.ToArray()];
+                    await RouterOsWireCodec.WriteSentenceAsync(tls, row, token);
+                    if (condition == "wrong-username") return;
+                    if (condition == "duplicate-account")
+                    {
+                        await RouterOsWireCodec.WriteSentenceAsync(tls, row, token);
+                        return;
+                    }
+                }
+                await RouterOsWireCodec.WriteSentenceAsync(tls, ["!done"u8.ToArray()], token);
+                Assert.Equal(0, await tls.ReadAsync(new byte[1], token));
+            });
+            try
+            {
+                if (condition is "wrong-owner" or "duplicate-profile" or "account-trap" or "wrong-username" or "duplicate-account")
+                    await Assert.ThrowsAsync<InvalidDataException>(() => RouterOsReadRecovery.ReadPreparedUm6PreflightAsync(path, id));
+                else
+                {
+                    var evidence = await RouterOsReadRecovery.ReadPreparedUm6PreflightAsync(path, id);
+                    Assert.Equal(condition switch
+                    {
+                        "clear" => UserManager6PreflightState.NoVisibleUsernameMatch,
+                        "missing-profile" => UserManager6PreflightState.ProfileNotVisible,
+                        _ => UserManager6PreflightState.UsernameAlreadyVisible
+                    }, evidence.State);
+                    Assert.Equal(condition switch { "existing" => "admin", "other-customer" => "other", _ => null },
+                        evidence.ExistingCustomer);
+                }
+                Assert.Equal(UserManager6CreateState.Prepared, new UserManager6CreateJournal(path).Read(id)!.State);
+            }
+            finally { await serve; }
+            Assert.False(server.HasPendingConnection);
+        }
+        finally { directory.Delete(recursive: true); }
+    }
+
+    [Theory]
+    [InlineData("missing-secret")]
+    [InlineData("changed-plan")]
+    [InlineData("already-claimed")]
+    [SupportedOSPlatform("windows")]
+    public async Task PreparedPreflightRejectsLocalFailureBeforeConnecting(string condition)
+    {
+        using var certificates = new Certificates();
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        int port = ((IPEndPoint)listener.LocalEndpoint).Port;
+        var directory = Directory.CreateTempSubdirectory("hadramout-preflight-local-");
+        try
+        {
+            string path = Path.Combine(directory.FullName, "test.db");
+            Guid id = PreparePreflightFixture(path, port, certificates, condition != "missing-secret");
+            var journal = new UserManager6CreateJournal(path);
+            if (condition == "already-claimed") Assert.True(journal.TryBeginBoundDispatch(id));
+            if (condition == "changed-plan")
+            {
+                using var db = DatabaseStore.OpenExisting(path);
+                using var cmd = db.CreateCommand();
+                cmd.CommandText = "UPDATE plans SET Name='changed';";
+                cmd.ExecuteNonQuery();
+            }
+            await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+                await RouterOsReadRecovery.ReadPreparedUm6PreflightAsync(path, id));
+            Assert.False(listener.Pending());
+            Assert.Equal(condition == "already-claimed" ? UserManager6CreateState.DispatchStarted :
+                UserManager6CreateState.Prepared, journal.Read(id)!.State);
+        }
+        finally { directory.Delete(recursive: true); }
+    }
+
+    [SupportedOSPlatform("windows")]
+    private static Guid PreparePreflightFixture(string path, int port, Certificates certificates, bool saveSecret)
+    {
+        Guid id = DatabaseDurabilityTests.SeedReservation(path, BackendKind.UserManager6);
+        var journal = new UserManager6CreateJournal(path);
+        var entry = journal.Prepare(id, "admin");
+        EnrollBoundRouter(path, entry.RouterId, port, certificates);
+        new RouterCredentialStore(path).Save(entry.RouterId, "synthetic-user"u8, "synthetic-private-password"u8);
+        journal.PrepareBoundIntent(id, "owner", "remote-day");
+        if (saveSecret) new UserManager6VoucherSecretStore(path).Save(id, "synthetic-voucher"u8);
+        return id;
+    }
+
     private static Guid SeedBoundRouter(string path)
     {
         Guid reservation = DatabaseDurabilityTests.SeedReservation(path, BackendKind.UserManager6);
