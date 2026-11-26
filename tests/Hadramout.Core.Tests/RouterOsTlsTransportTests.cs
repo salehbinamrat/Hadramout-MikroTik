@@ -1112,6 +1112,167 @@ public sealed class RouterOsTlsTransportTests(ITestOutputHelper output)
         finally { await serve; }
     }
 
+    [Theory]
+    [InlineData("multiple")]
+    [InlineData("empty")]
+    [InlineData("absent-profile")]
+    [InlineData("wrong-owner")]
+    [InlineData("duplicate-profile")]
+    [InlineData("wrong-link")]
+    [InlineData("missing-limitation")]
+    [InlineData("rejected")]
+    public async Task Um6ProfileMappingRequiresCompleteUniqueProfileAndMatchingLinks(string condition)
+    {
+        using var certificates = new Certificates();
+        using var server = new LoopbackServer(certificates.Leaf, certificates.Root, output);
+        Task serve = server.RunAsync(reply: true, handler: async (tls, token) =>
+        {
+            await PrepareProbePeerAsync(tls, token, "6.49.19");
+            byte[][] profileRequest = await RouterOsWireCodec.ReadSentenceAsync(tls, token);
+            Assert.Equal(new[] { "/tool/user-manager/profile/print",
+                "=.proplist=owner,name,validity,starts-at", "?name=day" },
+                profileRequest.Select(word => Encoding.UTF8.GetString(word)).ToArray());
+            if (condition == "absent-profile")
+            {
+                await RouterOsWireCodec.WriteSentenceAsync(tls, ["!done"u8.ToArray()], token);
+                Assert.Equal(0, await tls.ReadAsync(new byte[1], token));
+                return;
+            }
+            ReadOnlyMemory<byte>[] row = ["!re"u8.ToArray(),
+                Encoding.ASCII.GetBytes(condition == "wrong-owner" ? "=owner=other" : "=owner=admin"),
+                "=name=day"u8.ToArray(), "=validity=1d"u8.ToArray()];
+            await RouterOsWireCodec.WriteSentenceAsync(tls, row, token);
+            if (condition == "wrong-owner") return;
+            if (condition == "duplicate-profile")
+            {
+                await RouterOsWireCodec.WriteSentenceAsync(tls,
+                    ["!re"u8.ToArray(), "=owner=other"u8.ToArray(), "=name=day"u8.ToArray()], token);
+                return;
+            }
+            await RouterOsWireCodec.WriteSentenceAsync(tls, ["!done"u8.ToArray()], token);
+            byte[][] linkRequest = await RouterOsWireCodec.ReadSentenceAsync(tls, token);
+            Assert.Equal(new[] { "/tool/user-manager/profile/profile-limitation/print",
+                "=.proplist=profile,limitation,from-time,till-time,weekdays", "?profile=day" },
+                linkRequest.Select(word => Encoding.UTF8.GetString(word)).ToArray());
+            if (condition == "rejected")
+            {
+                await RouterOsWireCodec.WriteSentenceAsync(tls, ["!trap"u8.ToArray()], token);
+                return;
+            }
+            if (condition == "wrong-link")
+            {
+                await RouterOsWireCodec.WriteSentenceAsync(tls,
+                    ["!re"u8.ToArray(), "=profile=other"u8.ToArray(), "=limitation=quota"u8.ToArray()], token);
+                return;
+            }
+            if (condition == "missing-limitation")
+            {
+                await RouterOsWireCodec.WriteSentenceAsync(tls,
+                    ["!re"u8.ToArray(), "=profile=day"u8.ToArray()], token);
+                return;
+            }
+            if (condition == "multiple")
+            {
+                await RouterOsWireCodec.WriteSentenceAsync(tls,
+                    ["!re"u8.ToArray(), "=profile=day"u8.ToArray(), "=limitation=quota"u8.ToArray(),
+                        "=from-time=0s"u8.ToArray(), "=till-time=23h59m59s"u8.ToArray(),
+                        "=weekdays=sunday,monday"u8.ToArray()], token);
+                await RouterOsWireCodec.WriteSentenceAsync(tls,
+                    ["!re"u8.ToArray(), "=profile=day"u8.ToArray(), "=limitation=quota"u8.ToArray(),
+                        "=from-time=12h"u8.ToArray(), "=weekdays=friday"u8.ToArray()], token);
+                await RouterOsWireCodec.WriteSentenceAsync(tls,
+                    ["!re"u8.ToArray(), "=profile=day"u8.ToArray(), "=limitation=speed"u8.ToArray()], token);
+            }
+            await RouterOsWireCodec.WriteSentenceAsync(tls, ["!done"u8.ToArray()], token);
+        });
+        Task<UserManager6ProfileMappingEvidence?> Find() =>
+            RouterOsReadRecovery.ReadUserManager6ProfileMappingAsync("admin", "day",
+                "127.0.0.1", "router.test", "synthetic-user"u8.ToArray(), "synthetic-private-password"u8.ToArray(),
+                server.Port, trustedRootDer: certificates.Root.RawData);
+        try
+        {
+            if (condition is "wrong-owner" or "duplicate-profile" or "wrong-link" or "missing-limitation" or "rejected")
+                await Assert.ThrowsAsync<InvalidDataException>(Find);
+            else if (condition == "absent-profile")
+                Assert.Null(await Find());
+            else
+            {
+                var evidence = await Find();
+                Assert.NotNull(evidence);
+                Assert.Equal("admin", evidence.Profile.Owner);
+                Assert.Equal("day", evidence.Profile.Name);
+                if (condition == "empty") Assert.Empty(evidence.VisibleNameMatches);
+                else Assert.Collection(evidence.VisibleNameMatches,
+                    link =>
+                    {
+                        Assert.Equal("quota", link.Limitation);
+                        Assert.Equal("0s", link.FromTime);
+                        Assert.Equal("23h59m59s", link.TillTime);
+                        Assert.Equal("sunday,monday", link.Weekdays);
+                    },
+                    link =>
+                    {
+                        Assert.Equal("quota", link.Limitation);
+                        Assert.Equal("12h", link.FromTime);
+                        Assert.Null(link.TillTime);
+                        Assert.Equal("friday", link.Weekdays);
+                    },
+                    link =>
+                    {
+                        Assert.Equal("speed", link.Limitation);
+                        Assert.Null(link.Weekdays);
+                    });
+            }
+        }
+        finally { await serve; }
+        Assert.False(server.HasPendingConnection);
+    }
+
+    [Fact]
+    public async Task Um6MappingRetryDoesNotMergeOldPartialLinksWithNewRows()
+    {
+        using var certificates = new Certificates();
+        using var server = new LoopbackServer(certificates.Leaf, certificates.Root, output);
+        Task serve = ServeAsync();
+        async Task ServeAsync()
+        {
+            for (int i = 0; i < 2; i++)
+            {
+                bool first = i == 0;
+                await server.RunAsync(reply: true, handler: async (tls, token) =>
+                {
+                    await PrepareProbePeerAsync(tls, token, "6.49.19");
+                    byte[][] profile = await RouterOsWireCodec.ReadSentenceAsync(tls, token);
+                    Assert.Equal(new[] { "/tool/user-manager/profile/print",
+                        "=.proplist=owner,name,validity,starts-at", "?name=day" },
+                        profile.Select(word => Encoding.UTF8.GetString(word)).ToArray());
+                    await RouterOsWireCodec.WriteSentenceAsync(tls,
+                        ["!re"u8.ToArray(), "=owner=admin"u8.ToArray(), "=name=day"u8.ToArray()], token);
+                    await RouterOsWireCodec.WriteSentenceAsync(tls, ["!done"u8.ToArray()], token);
+                    byte[][] links = await RouterOsWireCodec.ReadSentenceAsync(tls, token);
+                    Assert.Equal(new[] { "/tool/user-manager/profile/profile-limitation/print",
+                        "=.proplist=profile,limitation,from-time,till-time,weekdays", "?profile=day" },
+                        links.Select(word => Encoding.UTF8.GetString(word)).ToArray());
+                    await RouterOsWireCodec.WriteSentenceAsync(tls,
+                        ["!re"u8.ToArray(), "=profile=day"u8.ToArray(),
+                            Encoding.ASCII.GetBytes(first ? "=limitation=old" : "=limitation=new")], token);
+                    if (first) await tls.ShutdownAsync();
+                    else await RouterOsWireCodec.WriteSentenceAsync(tls, ["!done"u8.ToArray()], token);
+                });
+            }
+        }
+        try
+        {
+            var evidence = await RouterOsReadRecovery.ReadUserManager6ProfileMappingAsync("admin", "day",
+                "127.0.0.1", "router.test", "synthetic-user"u8.ToArray(), "synthetic-private-password"u8.ToArray(),
+                server.Port, trustedRootDer: certificates.Root.RawData);
+            Assert.NotNull(evidence);
+            Assert.Equal("new", Assert.Single(evidence.VisibleNameMatches).Limitation);
+        }
+        finally { await serve; }
+        Assert.False(server.HasPendingConnection);
+    }
+
     private static Task<UserManager6Account?> FindUm6AccountAsync(LoopbackServer server, Certificates certificates) =>
         RouterOsReadRecovery.FindUserManager6AccountAsync("admin", "123456", "127.0.0.1", "router.test",
             "synthetic-user"u8.ToArray(), "synthetic-private-password"u8.ToArray(), server.Port,

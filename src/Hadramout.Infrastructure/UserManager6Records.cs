@@ -37,6 +37,14 @@ internal sealed record UserManager6Limitation(string Owner, string Name,
     string? RateLimitRx, string? RateLimitTx);
 internal sealed record UserManager6Profile(string Owner, string Name, string? Validity, string? StartsAt);
 
+// Legacy profile-limitation rows do not expose an owner in the documented field set.
+// A name match is evidence only; it is not an authoritative owner-scoped binding.
+internal sealed record UserManager6ProfileLink(string Profile, string Limitation,
+    string? FromTime, string? TillTime, string? Weekdays);
+
+internal sealed record UserManager6ProfileMappingEvidence(UserManager6Profile Profile,
+    IReadOnlyList<UserManager6ProfileLink> VisibleNameMatches);
+
 internal static class UserManager6Records
 {
     private static readonly UTF8Encoding Utf8 = new(false, true);
@@ -84,6 +92,18 @@ internal static class UserManager6Records
             ReadBytes(words, "download-limit"), ReadBytes(words, "upload-limit"),
             ReadBytes(words, "transfer-limit"), ReadText(words, "uptime-limit", 128),
             ReadText(words, "rate-limit-rx", 128), ReadText(words, "rate-limit-tx", 128));
+
+    internal static UserManager6ProfileLink ParseProfileLink(byte[][] words, string profile)
+    {
+        string actualProfile = RequiredMatch(words, "profile", profile);
+        string? limitation = ReadText(words, "limitation", 128);
+        if (limitation is null)
+            throw new InvalidDataException("User Manager profile link has no limitation identity.");
+        try { ValidateKey(limitation, nameof(limitation)); }
+        catch (ArgumentException) { throw new InvalidDataException("Invalid User Manager limitation identity."); }
+        return new(actualProfile, limitation, ReadText(words, "from-time", 128),
+            ReadText(words, "till-time", 128), ReadText(words, "weekdays", 128));
+    }
 
     private static UserManager6ByteValue ReadBytes(byte[][] words, string field) =>
         UserManager6ByteValue.FromRaw(ReadText(words, field, 64));

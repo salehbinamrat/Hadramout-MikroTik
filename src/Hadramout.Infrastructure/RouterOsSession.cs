@@ -177,6 +177,33 @@ internal sealed class RouterOsSession : IDisposable
         }, timeout, cancellationToken);
     }
 
+    // First verify a unique visible profile name and its owner. Legacy mapping rows
+    // expose profile names but not owners; return explicitly non-authoritative evidence.
+    internal Task<UserManager6ProfileMappingEvidence?> ReadUserManager6ProfileMappingAsync(
+        string owner, string name, TimeSpan? timeout = null, CancellationToken cancellationToken = default)
+    {
+        UserManager6Records.ValidateKey(owner, nameof(owner));
+        UserManager6Records.ValidateKey(name, nameof(name));
+        return WithReadSessionAsync<UserManager6ProfileMappingEvidence?>(async (stream, token) =>
+        {
+            await RequireUserManager6FamilyAsync(stream, token).ConfigureAwait(false);
+            // Do not filter by owner here: that could hide a visible same-name collision.
+            // Only the expected owner's exact row may pass the projector.
+            var profiles = await ReadCommandAsync(stream,
+                ["/tool/user-manager/profile/print"u8.ToArray(),
+                    "=.proplist=owner,name,validity,starts-at"u8.ToArray(),
+                    UserManager6Records.Query("name", name)],
+                words => UserManager6Records.ParseProfile(words, owner, name), 1, token).ConfigureAwait(false);
+            if (profiles.Count == 0) return null;
+            var links = await ReadCommandAsync(stream,
+                ["/tool/user-manager/profile/profile-limitation/print"u8.ToArray(),
+                    "=.proplist=profile,limitation,from-time,till-time,weekdays"u8.ToArray(),
+                    UserManager6Records.Query("profile", name)],
+                words => UserManager6Records.ParseProfileLink(words, name), 32, token).ConfigureAwait(false);
+            return new UserManager6ProfileMappingEvidence(profiles[0], links);
+        }, timeout, cancellationToken);
+    }
+
     private static async Task RequireUserManager6FamilyAsync(Stream stream, CancellationToken token)
     {
         string version = await ReadVersionCoreAsync(stream, token).ConfigureAwait(false);
