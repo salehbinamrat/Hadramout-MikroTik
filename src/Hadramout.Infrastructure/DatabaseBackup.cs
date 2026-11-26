@@ -73,22 +73,27 @@ public static class DatabaseBackup
         try
         {
             create(staged);
-            EnsureStandalone(staged);
-            string hash;
-            long bytes;
-            using (var input = File.OpenRead(staged))
-            {
-                bytes = input.Length;
-                hash = Convert.ToHexString(SHA256.HashData(input)).ToLowerInvariant();
-            }
-            EnsureDestinationAbsent(destination);
-            File.Move(staged, destination, overwrite: false);
-            return new BackupReceipt(hash, bytes);
+            return PublishStandalone(staged, destination);
         }
         finally { Directory.Delete(stageDirectory, recursive: true); }
     }
 
-    private static void ValidatePaths(string source, string destination)
+    internal static BackupReceipt PublishStandalone(string staged, string destination)
+    {
+        EnsureStandalone(staged);
+        string hash;
+        long bytes;
+        using (var input = File.OpenRead(staged))
+        {
+            bytes = input.Length;
+            hash = Convert.ToHexString(SHA256.HashData(input)).ToLowerInvariant();
+        }
+        EnsureDestinationAbsent(destination);
+        File.Move(staged, destination, overwrite: false);
+        return new BackupReceipt(hash, bytes);
+    }
+
+    internal static void ValidatePaths(string source, string destination)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(source);
         ArgumentException.ThrowIfNullOrWhiteSpace(destination);
@@ -136,7 +141,7 @@ public static class DatabaseBackup
             throw new InvalidDataException("Backup schema version is not supported by this release.");
     }
 
-    private static void ValidateSnapshot(string path)
+    internal static void ValidateSnapshot(string path)
     {
         EnsureStandalone(path);
         using var c = OpenRaw(path, SqliteOpenMode.ReadOnly);
@@ -159,7 +164,7 @@ public static class DatabaseBackup
             throw new InvalidDataException("Backup is missing required tables.");
     }
 
-    private static void MakeStandalone(SqliteConnection c)
+    internal static void MakeStandalone(SqliteConnection c)
     {
         using var cmd = c.CreateCommand();
         cmd.CommandText = "PRAGMA wal_checkpoint(TRUNCATE);";
