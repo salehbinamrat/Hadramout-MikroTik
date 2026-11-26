@@ -1,10 +1,15 @@
 using System.Text;
+using Hadramout.Core;
 
 namespace Hadramout.Infrastructure;
 
 internal enum RouterOsFamily { Unsupported, V6, V7 }
 internal enum UserManagerPackageState { Unknown, NotListed, DisabledOrAvailable, InstalledEnabled }
 internal sealed record RouterOsPackage(string Name, string? Version, bool? Disabled, string? Scheduled);
+
+internal enum RouterOsServiceProbeState { NotApplicable, Readable, Rejected, ConnectionTerminated }
+internal sealed record RouterOsServiceProbe(BackendKind Backend, RouterOsFamily Family,
+    RouterOsServiceProbeState State, long? AccountCount = null, int? TrapCategory = null);
 
 // Package evidence is not proof of service availability, license or command permissions.
 internal sealed record RouterOsInventory(string Version, RouterOsFamily Family,

@@ -1,10 +1,11 @@
 using System.Security.Cryptography;
+using System.Globalization;
 
 namespace Hadramout.Infrastructure;
 
 internal enum RouterOsReplyOutcome { Completed, Rejected, Fatal }
 
-internal sealed record RouterOsReadResult<T>(RouterOsReplyOutcome Outcome, IReadOnlyList<T> Rows, int? TrapCategory);
+internal sealed record RouterOsReadResult<T>(RouterOsReplyOutcome Outcome, IReadOnlyList<T> Rows, int? TrapCategory, long? CompletionCount = null);
 
 // Read-only untagged reply sequence. A rejection/fatal result or exception requires the
 // owner to close the connection: a following !done may still be pending. No retry here.
@@ -16,7 +17,7 @@ internal static class RouterOsReplyReader
     // The row projector must return only bounded, explicitly selected values.
     // It must not retain references to the raw words or perform side effects.
     internal static async ValueTask<RouterOsReadResult<T>> ReadAsync<T>(Stream stream,
-        Func<byte[][], T> project, int maxRows, CancellationToken cancellationToken)
+        Func<byte[][], T> project, int maxRows, CancellationToken cancellationToken, bool countOnly = false)
     {
         ArgumentNullException.ThrowIfNull(project);
         if (maxRows is < 1 or > MaxRows) throw new ArgumentOutOfRangeException(nameof(maxRows));
@@ -60,11 +61,21 @@ internal static class RouterOsReplyReader
                 ReadOnlySpan<byte> kind = words[0];
                 if (kind.SequenceEqual("!done"u8))
                 {
-                    // Read-only print completion has no return value; reject unexpected data.
-                    if (words.Length != 1)
+                    long? count = null;
+                    if (countOnly)
+                    {
+                        if (words.Length != 2 || !words[1].AsSpan().StartsWith("=ret="u8))
+                            throw new InvalidDataException("RouterOS count completion requires a numeric return value.");
+                        string value = RouterOsInventory.ReadAscii(words, "ret", 19, required: true)!;
+                        if (!long.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out long parsed) ||
+                            parsed < 0 || (empty && parsed != 0))
+                            throw new InvalidDataException("Invalid RouterOS count result.");
+                        count = parsed;
+                    }
+                    else if (words.Length != 1)
                         throw new InvalidDataException("Unexpected RouterOS completion attributes.");
                     cancellationToken.ThrowIfCancellationRequested();
-                    return new(RouterOsReplyOutcome.Completed, rows.AsReadOnly(), null);
+                    return new(RouterOsReplyOutcome.Completed, rows.AsReadOnly(), null, count);
                 }
                 if (kind.SequenceEqual("!trap"u8))
                 {
@@ -87,7 +98,7 @@ internal static class RouterOsReplyReader
                     empty = true;
                     continue;
                 }
-                if (!kind.SequenceEqual("!re"u8) || empty || rows.Count >= maxRows || words.Length == 1)
+                if (countOnly || !kind.SequenceEqual("!re"u8) || empty || rows.Count >= maxRows || words.Length == 1)
                     throw new InvalidDataException("Unexpected RouterOS data reply or row limit exceeded.");
 
                 rows.Add(project(words));

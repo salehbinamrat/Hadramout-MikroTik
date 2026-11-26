@@ -1,5 +1,6 @@
 using System.Security.Authentication;
 using System.Security.Cryptography;
+using Hadramout.Core;
 
 namespace Hadramout.Infrastructure;
 
@@ -86,6 +87,44 @@ internal sealed class RouterOsSession : IDisposable
                 RouterOsInventory.ParsePackage, 256, token).ConfigureAwait(false);
             return RouterOsInventory.Classify(version, packages, inventoryRead: true);
         }, timeout, cancellationToken);
+
+    // Probe one account menu per call. A rejected or terminated command invalidates this
+    // session; probing a different menu then requires a new authenticated connection.
+    internal Task<RouterOsServiceProbe> ProbeServiceAsync(BackendKind backend, TimeSpan? timeout = null,
+        CancellationToken cancellationToken = default)
+    {
+        if (!Enum.IsDefined(backend)) throw new ArgumentOutOfRangeException(nameof(backend));
+        return WithReadSessionAsync(async (stream, token) =>
+        {
+            string version = await ReadVersionCoreAsync(stream, token).ConfigureAwait(false);
+            var family = RouterOsInventory.ClassifyVersion(version);
+            if (family == RouterOsFamily.Unsupported ||
+                (backend == BackendKind.UserManager6 && family != RouterOsFamily.V6) ||
+                (backend == BackendKind.UserManager7 && family != RouterOsFamily.V7))
+                return new RouterOsServiceProbe(backend, family, RouterOsServiceProbeState.NotApplicable);
+
+            // Fixed allowlist only. PPP secrets filtered to PPPoE; no credentials or rows requested.
+            ReadOnlyMemory<byte>[] command = backend switch
+            {
+                BackendKind.UserManager6 => ["/tool/user-manager/user/print"u8.ToArray(), "=count-only="u8.ToArray()],
+                BackendKind.UserManager7 => ["/user-manager/user/print"u8.ToArray(), "=count-only="u8.ToArray()],
+                BackendKind.Hotspot => ["/ip/hotspot/user/print"u8.ToArray(), "=count-only="u8.ToArray()],
+                BackendKind.Pppoe => ["/ppp/secret/print"u8.ToArray(), "=count-only="u8.ToArray(),
+                    "?service=pppoe"u8.ToArray(), "?service=any"u8.ToArray(), "?#|"u8.ToArray()],
+                _ => throw new ArgumentOutOfRangeException(nameof(backend))
+            };
+            await RouterOsWireCodec.WriteSentenceAsync(stream, command, token).ConfigureAwait(false);
+            var reply = await RouterOsReplyReader.ReadAsync(stream, _ => 0, 1, token, countOnly: true)
+                .ConfigureAwait(false);
+            if (reply.Outcome == RouterOsReplyOutcome.Completed)
+                return new RouterOsServiceProbe(backend, family, RouterOsServiceProbeState.Readable,
+                    reply.CompletionCount ?? throw new InvalidDataException("Missing RouterOS count."));
+            Dispose();
+            return new RouterOsServiceProbe(backend, family,
+                reply.Outcome == RouterOsReplyOutcome.Rejected ? RouterOsServiceProbeState.Rejected :
+                RouterOsServiceProbeState.ConnectionTerminated, TrapCategory: reply.TrapCategory);
+        }, timeout, cancellationToken);
+    }
 
     private async Task<T> WithReadSessionAsync<T>(Func<Stream, CancellationToken, Task<T>> read,
         TimeSpan? timeout, CancellationToken cancellationToken)
