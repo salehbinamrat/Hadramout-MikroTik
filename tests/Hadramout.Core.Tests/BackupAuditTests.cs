@@ -141,7 +141,7 @@ public sealed class BackupAuditTests
     {
         using var f = new Fixture();
         using (var c = DatabaseStore.Open(f.Source))
-            Execute(c, "DROP TABLE um6_create_journal; DROP TABLE audit_events; PRAGMA user_version=3;");
+            DatabaseDurabilityTests.RecreateLegacyFixture(c, 3);
         using var upgraded = DatabaseStore.Open(f.Source);
         Assert.Equal((long)DatabaseStore.CurrentSchemaVersion, Scalar(upgraded, "PRAGMA user_version;"));
         Assert.Equal(1L, Scalar(upgraded, "SELECT count(*) FROM routers;"));
@@ -154,7 +154,7 @@ public sealed class BackupAuditTests
         using var f = new Fixture();
         using (var c = DatabaseStore.Open(f.Source))
         {
-            Execute(c, "DROP TABLE um6_create_journal; PRAGMA user_version=4;");
+            DatabaseDurabilityTests.RecreateLegacyFixture(c, 4);
             DatabaseBackup.MakeStandalone(c);
         }
         byte[] before = SHA256.HashData(File.ReadAllBytes(f.Source));

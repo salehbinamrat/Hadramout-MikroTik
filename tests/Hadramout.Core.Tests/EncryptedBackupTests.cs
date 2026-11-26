@@ -628,11 +628,7 @@ public sealed class EncryptedBackupTests
             path = session.DatabasePath;
         }
         using (var c = DatabaseStore.Open(path))
-        using (var cmd = c.CreateCommand())
-        {
-            cmd.CommandText = "DROP TABLE um6_create_journal; PRAGMA user_version=4;";
-            cmd.ExecuteNonQuery();
-        }
+            DatabaseDurabilityTests.RecreateLegacyFixture(c, 4);
         using var upgraded = ManagedDatabase.OpenApplicationSessionAt(f.Root);
         Assert.Equal(generation, upgraded.Generation);
         using var db = DatabaseStore.OpenExisting(upgraded.DatabasePath);

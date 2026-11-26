@@ -33,7 +33,7 @@ public sealed class DatabaseDurabilityTests
             id = site.Id;
             db.Sites.Add(site);
             db.SaveChanges();
-            RecreateV1Fixture(c);
+            RecreateLegacyFixture(c, 1);
         }
         using var upgraded = DatabaseStore.Open(file.Path);
         using var read = Context(upgraded);
@@ -51,7 +51,7 @@ public sealed class DatabaseDurabilityTests
         using var file = new TestFile();
         using (var c = DatabaseStore.Open(file.Path))
         {
-            RecreateV1Fixture(c);
+            RecreateLegacyFixture(c, 1);
             // Force failure at the second DDL statement without changing the original migration.
             Execute(c, "CREATE INDEX IX_voucher_reservations_BackendId_BatchId ON sites(Name);");
         }
@@ -258,7 +258,7 @@ public sealed class DatabaseDurabilityTests
         using var file = new TestFile();
         Guid id = SeedReservation(file.Path, BackendKind.UserManager6);
         using (var c = DatabaseStore.Open(file.Path))
-            Execute(c, "DROP TABLE um6_create_journal; PRAGMA user_version=4;");
+            RecreateLegacyFixture(c, 4);
         using var upgraded = DatabaseStore.OpenExisting(file.Path);
         Assert.Equal(5L, Scalar(upgraded, "PRAGMA user_version;"));
         Assert.Equal(1L, Scalar(upgraded, "SELECT count(*) FROM voucher_reservations;"));
@@ -295,16 +295,64 @@ public sealed class DatabaseDurabilityTests
     private static NetworkDbContext Context(SqliteConnection c) =>
         new(new DbContextOptionsBuilder<NetworkDbContext>().UseSqlite(c).Options);
 
-    // Synthetic v1 fixture: remove the v3 table and both v2 indexes.
-    private static void RecreateV1Fixture(SqliteConnection c) =>
-        Execute(c, """
-            DROP TABLE um6_create_journal;
-            DROP TABLE audit_events;
-            DROP TABLE router_credentials;
-            DROP INDEX IX_voucher_batches_BackendId_PlanId;
-            DROP INDEX IX_voucher_reservations_BackendId_BatchId;
-            PRAGMA user_version=1;
-            """);
+    // Centralized synthetic legacy fixture construction. Keep the explicit schema
+    // guard in sync with new migrations; never silently leave a newer table behind.
+    internal static void RecreateLegacyFixture(SqliteConnection c, int version)
+    {
+        if (version is < 1 or > 4) throw new ArgumentOutOfRangeException(nameof(version));
+        Assert.Equal(5, DatabaseStore.CurrentSchemaVersion);
+        Assert.Equal(5L, Scalar(c, "PRAGMA user_version;"));
+        using var tx = c.BeginTransaction(deferred: false);
+        using var cmd = c.CreateCommand();
+        cmd.Transaction = tx;
+        cmd.CommandText = "DROP TABLE um6_create_journal;";
+        if (version < 4) cmd.CommandText += " DROP TABLE audit_events;";
+        if (version < 3) cmd.CommandText += " DROP TABLE router_credentials;";
+        if (version < 2) cmd.CommandText +=
+            " DROP INDEX IX_voucher_batches_BackendId_PlanId; DROP INDEX IX_voucher_reservations_BackendId_BatchId;";
+        cmd.CommandText += " PRAGMA user_version=" + version.ToString(System.Globalization.CultureInfo.InvariantCulture) + ";";
+        cmd.ExecuteNonQuery();
+        tx.Commit();
+
+        cmd.Transaction = null;
+        cmd.CommandText = "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%';";
+        Assert.Equal(version >= 4 ? 8L : version == 3 ? 7L : 6L, (long)cmd.ExecuteScalar()!);
+        Assert.Equal((long)version, Scalar(c, "PRAGMA user_version;"));
+    }
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(3)]
+    [InlineData(4)]
+    public void EveryLegacyFixtureHasOnlyItsOwnSchemaAndUpgrades(int version)
+    {
+        using var file = new TestFile();
+        Guid id = SeedReservation(file.Path, BackendKind.UserManager6);
+        using (var c = DatabaseStore.Open(file.Path)) RecreateLegacyFixture(c, version);
+        using var upgraded = DatabaseStore.OpenExisting(file.Path);
+        Assert.Equal((long)DatabaseStore.CurrentSchemaVersion, Scalar(upgraded, "PRAGMA user_version;"));
+        Assert.Equal(1L, Scalar(upgraded, "SELECT count(*) FROM voucher_reservations;"));
+        Assert.Equal(0L, Scalar(upgraded, "SELECT count(*) FROM um6_create_journal;"));
+        Assert.Equal("001", new UserManager6CreateJournal(file.Path).Prepare(id, "admin").Username);
+    }
+
+    [Fact]
+    public void ConflictingVersionFourJournalIsRejectedWithoutChangingExistingData()
+    {
+        using var file = new TestFile();
+        Guid id = SeedReservation(file.Path, BackendKind.UserManager6);
+        var journal = new UserManager6CreateJournal(file.Path);
+        journal.Prepare(id, "admin");
+        Assert.True(journal.TryBeginDispatch(id));
+        using (var c = DatabaseStore.Open(file.Path)) Execute(c, "PRAGMA user_version=4;");
+        Assert.Throws<SqliteException>(() => DatabaseStore.OpenExisting(file.Path));
+        using var raw = file.OpenRaw();
+        Assert.Equal(4L, Scalar(raw, "PRAGMA user_version;"));
+        Assert.Equal(2L, Scalar(raw, "SELECT State FROM um6_create_journal;"));
+        Assert.Equal("001", Scalar(raw, "SELECT Username FROM voucher_reservations;"));
+        Assert.Equal("ok", Scalar(raw, "PRAGMA quick_check;"));
+    }
 
     private static object Scalar(SqliteConnection c, string sql)
     {

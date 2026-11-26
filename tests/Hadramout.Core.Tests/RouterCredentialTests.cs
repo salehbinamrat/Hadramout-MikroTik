@@ -149,11 +149,7 @@ public sealed class RouterCredentialTests
     {
         using var f = new Fixture();
         using (var c = DatabaseStore.Open(f.Path))
-        using (var cmd = c.CreateCommand())
-        {
-            cmd.CommandText = "DROP TABLE audit_events; DROP TABLE router_credentials; PRAGMA user_version=2;";
-            cmd.ExecuteNonQuery();
-        }
+            DatabaseDurabilityTests.RecreateLegacyFixture(c, 2);
         var store = new RouterCredentialStore(f.Path);
         Assert.Null(store.Load(f.First));
         store.Save(f.First, "user"u8, "pass"u8);
