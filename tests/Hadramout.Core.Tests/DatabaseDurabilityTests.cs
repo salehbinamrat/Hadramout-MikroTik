@@ -1,3 +1,5 @@
+using System.Runtime.Versioning;
+using System.Security.Cryptography;
 using Hadramout.Core;
 using Hadramout.Infrastructure;
 using Microsoft.Data.Sqlite;
@@ -542,6 +544,7 @@ public sealed class DatabaseDurabilityTests
     }
 
     [Fact]
+    [SupportedOSPlatform("windows")]
     public void BoundCreationIntentPersistsExactProfileAndOneShotClaim()
     {
         using var file = new TestFile();
@@ -561,6 +564,9 @@ public sealed class DatabaseDurabilityTests
         Assert.Equal(new string('A',64), intent.LeafSha256);
         Assert.Throws<SqliteException>(() => reopened.PrepareBoundIntent(id, "owner", "other"));
         Assert.False(reopened.TryBeginDispatch(id));
+        Assert.False(reopened.TryBeginBoundDispatch(id));
+        Assert.Equal(UserManager6CreateState.Prepared, reopened.Read(id)!.State);
+        new UserManager6VoucherSecretStore(file.Path).Save(id, "synthetic-secret"u8);
         Assert.True(reopened.TryBeginBoundDispatch(id));
         Assert.False(reopened.TryBeginBoundDispatch(id));
         Assert.True(reopened.TryMarkIndeterminate(id));
@@ -572,6 +578,7 @@ public sealed class DatabaseDurabilityTests
     [InlineData("username")]
     [InlineData("plan")]
     [InlineData("backend")]
+    [SupportedOSPlatform("windows")]
     public void BoundCreationClaimRejectsLocalDrift(string condition)
     {
         using var file = new TestFile();
@@ -580,6 +587,7 @@ public sealed class DatabaseDurabilityTests
         var entry = journal.Prepare(id, "admin");
         EnrollIntentTarget(file.Path, entry.RouterId);
         journal.PrepareBoundIntent(id, "admin", "day");
+        new UserManager6VoucherSecretStore(file.Path).Save(id, "synthetic-secret"u8);
         using (var c = DatabaseStore.OpenExisting(file.Path))
             Execute(c, condition switch
             {
@@ -631,6 +639,111 @@ public sealed class DatabaseDurabilityTests
         UserManager6CreateJournal.RequireEquivalentIntentsForRestore(file.Path, identical.Path);
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    [SupportedOSPlatform("windows")]
+    public void VoucherSecretRoundTripDistinguishesMissingAndExplicitEmpty(bool empty)
+    {
+        using var file = new TestFile();
+        Guid id = SeedSecretIntent(file.Path);
+        var store = new UserManager6VoucherSecretStore(file.Path);
+        Assert.Null(store.Load(id));
+        byte[] input = empty ? [] : "synthetic-voucher-password"u8.ToArray();
+        store.Save(id, input);
+        using var lease = store.Load(id);
+        Assert.NotNull(lease);
+        Assert.True(input.AsSpan().SequenceEqual(lease.Password.Span));
+        var borrowed = lease.Password;
+        lease.Dispose();
+        Assert.All(borrowed.ToArray(), value => Assert.Equal((byte)0, value));
+        Assert.Throws<ObjectDisposedException>(() => { _ = lease.Password; });
+        using var c = DatabaseStore.OpenExisting(file.Path);
+        byte[] envelope = (byte[])Scalar(c, "SELECT PasswordEnvelope FROM um6_voucher_secrets;");
+        Assert.NotEmpty(envelope);
+        if (!empty) Assert.False(envelope.AsSpan().IndexOf(input) >= 0);
+        Assert.True(new UserManager6CreateJournal(file.Path).TryBeginBoundDispatch(id));
+    }
+
+    [Fact]
+    [SupportedOSPlatform("windows")]
+    public void VoucherSecretCannotBeReplacedDeletedOrSavedWithoutPreparedIntent()
+    {
+        using var file = new TestFile();
+        Guid id = SeedSecretIntent(file.Path);
+        var store = new UserManager6VoucherSecretStore(file.Path);
+        Assert.Throws<SqliteException>(() => store.Save(Guid.NewGuid(), "synthetic"u8));
+        Assert.Throws<ArgumentException>(() => store.Save(id, new byte[4097]));
+        store.Save(id, "synthetic-original"u8);
+        Assert.Throws<SqliteException>(() => store.Save(id, "synthetic-replacement"u8));
+        using var c = DatabaseStore.OpenExisting(file.Path);
+        Assert.Throws<SqliteException>(() => Execute(c, "UPDATE um6_voucher_secrets SET PasswordEnvelope=X'01';"));
+        Assert.Throws<SqliteException>(() => Execute(c, "DELETE FROM um6_voucher_secrets;"));
+        Assert.Throws<SqliteException>(() => Execute(c, "INSERT OR REPLACE INTO um6_voucher_secrets SELECT * FROM um6_voucher_secrets;"));
+        Assert.True(new UserManager6CreateJournal(file.Path).TryBeginBoundDispatch(id));
+        using var lease = store.Load(id);
+        Assert.NotNull(lease);
+        Assert.True(lease.Password.Span.SequenceEqual("synthetic-original"u8));
+    }
+
+    [Theory]
+    [InlineData("corrupt")]
+    [InlineData("other-reservation")]
+    [InlineData("router-password-purpose")]
+    [SupportedOSPlatform("windows")]
+    public void InvalidVoucherSecretRollsBackClaimWithoutRearming(string condition)
+    {
+        using var file = new TestFile();
+        Guid id = SeedSecretIntent(file.Path);
+        byte[] envelope = condition switch
+        {
+            "other-reservation" => RouterCredentialProtector.Protect(Guid.NewGuid(), "um6-voucher-password/v1", "synthetic"u8),
+            "router-password-purpose" => RouterCredentialProtector.Protect(id, "password", "synthetic"u8),
+            _ => [1]
+        };
+        using (var c = DatabaseStore.OpenExisting(file.Path))
+        using (var cmd = c.CreateCommand())
+        {
+            cmd.CommandText = "INSERT INTO um6_voucher_secrets VALUES($id,$envelope);";
+            cmd.Parameters.AddWithValue("$id", id);
+            cmd.Parameters.Add("$envelope", SqliteType.Blob).Value = envelope;
+            cmd.ExecuteNonQuery();
+        }
+        var journal = new UserManager6CreateJournal(file.Path);
+        Assert.Throws<CryptographicException>(() => journal.TryBeginBoundDispatch(id));
+        Assert.Equal(UserManager6CreateState.Prepared, journal.Read(id)!.State);
+        Assert.False(journal.TryBeginDispatch(id));
+    }
+
+    [Fact]
+    [SupportedOSPlatform("windows")]
+    public void VoucherSecretRestoreCannotLoseOrChangeCiphertext()
+    {
+        using var file = new TestFile();
+        using var candidate = new TestFile();
+        Guid id = SeedSecretIntent(file.Path);
+        DatabaseBackup.Create(file.Path, candidate.Path);
+        new UserManager6VoucherSecretStore(file.Path).Save(id, "synthetic-one"u8);
+        Assert.Throws<InvalidOperationException>(() =>
+            UserManager6VoucherSecretStore.RequireEquivalentForRestore(file.Path, candidate.Path));
+        new UserManager6VoucherSecretStore(candidate.Path).Save(id, "synthetic-two"u8);
+        Assert.Throws<InvalidOperationException>(() =>
+            UserManager6VoucherSecretStore.RequireEquivalentForRestore(file.Path, candidate.Path));
+        using var identical = new TestFile();
+        DatabaseBackup.Create(file.Path, identical.Path);
+        UserManager6VoucherSecretStore.RequireEquivalentForRestore(file.Path, identical.Path);
+    }
+
+    private static Guid SeedSecretIntent(string path)
+    {
+        Guid id = SeedReservation(path, BackendKind.UserManager6);
+        var journal = new UserManager6CreateJournal(path);
+        var entry = journal.Prepare(id, "admin");
+        EnrollIntentTarget(path, entry.RouterId);
+        journal.PrepareBoundIntent(id, "admin", "day");
+        return id;
+    }
+
     private static void EnrollIntentTarget(string path, Guid routerId)
     {
         using var ca = CreateEnrollmentCa();
@@ -660,13 +773,14 @@ public sealed class DatabaseDurabilityTests
     // guard in sync with new migrations; never silently leave a newer table behind.
     internal static void RecreateLegacyFixture(SqliteConnection c, int version)
     {
-        if (version is < 1 or > 6) throw new ArgumentOutOfRangeException(nameof(version));
-        Assert.Equal(7, DatabaseStore.CurrentSchemaVersion);
-        Assert.Equal(7L, Scalar(c, "PRAGMA user_version;"));
+        if (version is < 1 or > 7) throw new ArgumentOutOfRangeException(nameof(version));
+        Assert.Equal(8, DatabaseStore.CurrentSchemaVersion);
+        Assert.Equal(8L, Scalar(c, "PRAGMA user_version;"));
         using var tx = c.BeginTransaction(deferred: false);
         using var cmd = c.CreateCommand();
         cmd.Transaction = tx;
-        cmd.CommandText = "DROP TABLE um6_create_intents;";
+        cmd.CommandText = "DROP TABLE um6_voucher_secrets;";
+        if (version < 7) cmd.CommandText += " DROP TABLE um6_create_intents;";
         if (version < 6) cmd.CommandText += " DROP TABLE router_targets;";
         if (version < 5) cmd.CommandText += " DROP TABLE um6_create_journal;";
         if (version < 4) cmd.CommandText += " DROP TABLE audit_events;";
@@ -679,7 +793,7 @@ public sealed class DatabaseDurabilityTests
 
         cmd.Transaction = null;
         cmd.CommandText = "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%';";
-        Assert.Equal(version == 6 ? 10L : version == 5 ? 9L : version == 4 ? 8L : version == 3 ? 7L : 6L, (long)cmd.ExecuteScalar()!);
+        Assert.Equal(version == 7 ? 11L : version == 6 ? 10L : version == 5 ? 9L : version == 4 ? 8L : version == 3 ? 7L : 6L, (long)cmd.ExecuteScalar()!);
         Assert.Equal((long)version, Scalar(c, "PRAGMA user_version;"));
     }
 
@@ -690,6 +804,7 @@ public sealed class DatabaseDurabilityTests
     [InlineData(4)]
     [InlineData(5)]
     [InlineData(6)]
+    [InlineData(7)]
     public void EveryLegacyFixtureHasOnlyItsOwnSchemaAndUpgrades(int version)
     {
         using var file = new TestFile();
