@@ -22,7 +22,8 @@
 - PR #21 merged 224e6128e05094cdfbb9f260af97590209fbf776; Core 45876165166 / Release 45876165073 passed on 119836cc6b79581121d96815c97941400ae8dcd6; artifact 15145495015. P15 hosted simulation passed; physical qualification remains open.
 - PR #22 merged f450247c71af2845b05fa533be3e6162053634a1; Core 45878108788 / Release 45878108905 passed on 9ef9098086e318beb9826bf4a04d10f5db40feb5; artifact 15145481920. Corrected TLS fixture and P16a passed hosted CI.
 - PR #23 merged 1661a7cc726c99367e617155f5c15b6717a9f270; Core 45879472040 / Release 45879472056 passed on b7dfad40a9634ed6d5587199aa204cda875584ac; artifact 15146122913. P16b usage and limitation reads passed hosted CI.
-- P16b.2 proposed legacy profile-link evidence with 13 new regression cases, CI pending. Owner binding, verified balance semantics and field validation remain open.
+- PR #24 merged 06b952c1c8d5346bfd103b8da9d027d060007190; Core 45881628107 / Release 45881628108 passed on f7212ba1bd7e688280cdd2fb1551dde26a24c350; artifact 15148380501. Profile mapping evidence passed hosted CI.
+- P16b.3 proposed independent legacy account activity/profile observations and exact uptime decoding, 24 new regression cases; CI pending. No verified expiry or balance semantics; live validation remains open.
 - P10 remaining: restore UI and RBAC, managed crash cleanup, real cross-account/device validation, full audit coverage/actor attribution, retention and scheduling. No production restore.
 - P01 deeper per-feature audit; physical Windows, RouterOS, printers; hard-kill, power-loss and disk-full tests pending. main remains unprotected; exact-head manual gate enforced. No production DB or real router changes.
 

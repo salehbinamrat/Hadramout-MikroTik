@@ -939,6 +939,10 @@ public sealed class RouterOsTlsTransportTests(ITestOutputHelper output)
             reply.Add("=download-used=4294967296"u8.ToArray());
             reply.Add("=upload-used=128B"u8.ToArray());
             reply.Add("=uptime-used=1d2h"u8.ToArray());
+            reply.Add("=active=yes"u8.ToArray());
+            reply.Add("=incomplete=no"u8.ToArray());
+            reply.Add("=last-seen=nov/26/2026 18:00:00"u8.ToArray());
+            reply.Add("=active-sessions=*1,*2"u8.ToArray());
             await RouterOsWireCodec.WriteSentenceAsync(tls, reply, token);
             await RouterOsWireCodec.WriteSentenceAsync(tls, ["!done"u8.ToArray()], token);
         });
@@ -954,6 +958,18 @@ public sealed class RouterOsTlsTransportTests(ITestOutputHelper output)
             Assert.Equal(128UL, account.Usage.UploadUsed.Bytes);
             Assert.Equal(4294967424UL, account.Usage.ObservedTransferBytes);
             Assert.Equal("1d2h", account.Usage.UptimeUsed);
+            Assert.Equal(93600UL, account.Usage.ObservedUptimeSeconds);
+            Assert.Equal(profile switch
+            {
+                null => UserManager6ProfileObservation.Unknown,
+                "" => UserManager6ProfileObservation.EmptyNameReported,
+                _ => UserManager6ProfileObservation.NameReported
+            }, account.ProfileObservation);
+            Assert.Equal("yes", account.Activity.Active);
+            Assert.Equal("no", account.Activity.Incomplete);
+            Assert.Equal("nov/26/2026 18:00:00", account.Activity.LastSeen);
+            Assert.Equal("*1,*2", account.Activity.ActiveSessions);
+            Assert.Equal(UserManager6LastSeenObservation.OtherValueReported, account.Activity.LastSeenObservation);
         }
         finally { await serve; }
     }
@@ -1281,7 +1297,7 @@ public sealed class RouterOsTlsTransportTests(ITestOutputHelper output)
     private static async Task AssertUm6AccountRequestAsync(SslStream tls, CancellationToken token)
     {
         byte[][] words = await RouterOsWireCodec.ReadSentenceAsync(tls, token);
-        Assert.Equal(new[] { "/tool/user-manager/user/print", "=.proplist=customer,username,disabled,actual-profile,download-used,upload-used,uptime-used",
+        Assert.Equal(new[] { "/tool/user-manager/user/print", "=.proplist=customer,username,disabled,actual-profile,download-used,upload-used,uptime-used,active,incomplete,last-seen,active-sessions",
             "?customer=admin", "?username=123456" }, words.Select(word => Encoding.UTF8.GetString(word)).ToArray());
     }
 

@@ -502,6 +502,69 @@ public sealed class RouterOsWireCodecTests
                 32, CancellationToken.None));
     }
 
+    [Theory]
+    [InlineData("0s", 0UL)]
+    [InlineData("18m20s", 1100UL)]
+    [InlineData("1d2h", 93600UL)]
+    [InlineData("1w2d3h4m5s", 788645UL)]
+    [InlineData("18446744073709551615s", ulong.MaxValue)]
+    public void Um6UptimeDecodesOnlyExactUnitComponents(string raw, ulong expected) =>
+        Assert.Equal(expected, UserManager6Records.ParseUptimeSeconds(raw));
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("00:00:00")]
+    [InlineData("unlimited")]
+    [InlineData("1.5h")]
+    [InlineData("-1s")]
+    [InlineData("1h2h")]
+    [InlineData("1s1m")]
+    [InlineData("1h 2m")]
+    [InlineData("1")]
+    [InlineData("18446744073709551616s")]
+    [InlineData("18446744073709551615m")]
+    [InlineData("1m18446744073709551615s")]
+    public void Um6UptimeUnknownOrOverflowNeverBecomesZero(string? raw) =>
+        Assert.Null(UserManager6Records.ParseUptimeSeconds(raw));
+
+    [Theory]
+    [InlineData(null, null, null, 0, 0)]
+    [InlineData("no", "", "never", 1, 1)]
+    [InlineData("yes", "day", "never", 2, 1)]
+    [InlineData("no", "day", "nov/26/2026 18:00:00", 2, 2)]
+    [InlineData(null, " ", "", 0, 0)]
+    public void Um6AccountKeepsAdministrativeProfileAndActivityObservationsIndependent(
+        string? disabled, string? profile, string? lastSeen, int profileObservation, int lastSeenObservation)
+    {
+        var words = new List<byte[]> { "!re"u8.ToArray(), "=customer=admin"u8.ToArray(), "=username=123"u8.ToArray() };
+        if (disabled is not null) words.Add(Encoding.UTF8.GetBytes("=disabled=" + disabled));
+        if (profile is not null) words.Add(Encoding.UTF8.GetBytes("=actual-profile=" + profile));
+        if (lastSeen is not null) words.Add(Encoding.UTF8.GetBytes("=last-seen=" + lastSeen));
+        words.Add("=download-used=0"u8.ToArray());
+        words.Add("=upload-used=0"u8.ToArray());
+        words.Add("=active-sessions=0"u8.ToArray());
+        var account = UserManager6Records.ParseAccount(words.ToArray(), "admin", "123");
+        Assert.Equal(disabled == "yes" ? true : disabled == "no" ? false : (bool?)null, account.Disabled);
+        Assert.Equal((UserManager6ProfileObservation)profileObservation, account.ProfileObservation);
+        Assert.Equal((UserManager6LastSeenObservation)lastSeenObservation, account.Activity.LastSeenObservation);
+        Assert.Equal(profile, account.ActualProfile);
+        Assert.Equal(lastSeen, account.Activity.LastSeen);
+        Assert.Equal("0", account.Activity.ActiveSessions);
+        Assert.Null(account.Activity.Active);
+        Assert.Null(account.Activity.Incomplete);
+        Assert.Equal(0UL, account.Usage.ObservedTransferBytes);
+        Assert.Null(account.Usage.ObservedUptimeSeconds);
+    }
+
+    [Fact]
+    public void Um6ActivityEvidenceRejectsOversizedSessionReferenceField()
+    {
+        Assert.Throws<InvalidDataException>(() => UserManager6Records.ParseAccount(
+            ["!re"u8.ToArray(), "=customer=admin"u8.ToArray(), "=username=123"u8.ToArray(),
+                Encoding.ASCII.GetBytes("=active-sessions=" + new string('x', 4097))], "admin", "123"));
+    }
+
     private sealed class FragmentedStream(byte[] bytes) : MemoryStream(bytes)
     {
         public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default) =>

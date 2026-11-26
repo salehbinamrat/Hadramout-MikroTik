@@ -136,7 +136,7 @@ internal sealed class RouterOsSession : IDisposable
             await RequireUserManager6FamilyAsync(stream, token).ConfigureAwait(false);
             var rows = await ReadCommandAsync(stream,
                 ["/tool/user-manager/user/print"u8.ToArray(),
-                    "=.proplist=customer,username,disabled,actual-profile,download-used,upload-used,uptime-used"u8.ToArray(),
+                    "=.proplist=customer,username,disabled,actual-profile,download-used,upload-used,uptime-used,active,incomplete,last-seen,active-sessions"u8.ToArray(),
                     UserManager6Records.Query("customer", customer), UserManager6Records.Query("username", username)],
                 words => UserManager6Records.ParseAccount(words, customer, username), 1, token).ConfigureAwait(false);
             return rows.Count == 0 ? null : rows[0];

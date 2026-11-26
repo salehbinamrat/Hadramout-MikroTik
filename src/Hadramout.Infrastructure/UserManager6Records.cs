@@ -26,10 +26,31 @@ internal sealed record UserManager6Usage(UserManager6ByteValue DownloadUsed,
     internal ulong? ObservedTransferBytes =>
         DownloadUsed.Bytes is ulong download && UploadUsed.Bytes is ulong upload &&
         download <= ulong.MaxValue - upload ? download + upload : null;
+
+    internal ulong? ObservedUptimeSeconds => UserManager6Records.ParseUptimeSeconds(UptimeUsed);
+}
+
+// Independent observations, deliberately not an entitlement/expiry classification.
+internal enum UserManager6ProfileObservation { Unknown, EmptyNameReported, NameReported }
+internal enum UserManager6LastSeenObservation { Unknown, NeverReported, OtherValueReported }
+
+internal sealed record UserManager6ActivityEvidence(string? Active, string? Incomplete,
+    string? LastSeen, string? ActiveSessions)
+{
+    internal UserManager6LastSeenObservation LastSeenObservation =>
+        string.IsNullOrWhiteSpace(LastSeen) ? UserManager6LastSeenObservation.Unknown :
+        LastSeen == "never" ? UserManager6LastSeenObservation.NeverReported :
+        UserManager6LastSeenObservation.OtherValueReported;
 }
 
 internal sealed record UserManager6Account(string Customer, string Username, bool? Disabled,
-    string? ActualProfile, UserManager6Usage Usage);
+    string? ActualProfile, UserManager6Usage Usage, UserManager6ActivityEvidence Activity)
+{
+    internal UserManager6ProfileObservation ProfileObservation =>
+        ActualProfile == "" ? UserManager6ProfileObservation.EmptyNameReported :
+        string.IsNullOrWhiteSpace(ActualProfile) ? UserManager6ProfileObservation.Unknown :
+        UserManager6ProfileObservation.NameReported;
+}
 
 internal sealed record UserManager6Limitation(string Owner, string Name,
     UserManager6ByteValue DownloadLimit, UserManager6ByteValue UploadLimit,
@@ -80,7 +101,10 @@ internal static class UserManager6Records
         };
         return new(actualCustomer, actualUsername, disabled, ReadText(words, "actual-profile", 512),
             new UserManager6Usage(ReadBytes(words, "download-used"), ReadBytes(words, "upload-used"),
-                ReadText(words, "uptime-used", 128)));
+                ReadText(words, "uptime-used", 128)),
+            new UserManager6ActivityEvidence(ReadText(words, "active", 128),
+                ReadText(words, "incomplete", 128), ReadText(words, "last-seen", 128),
+                ReadText(words, "active-sessions", 4096)));
     }
 
     internal static UserManager6Profile ParseProfile(byte[][] words, string owner, string name) =>
@@ -103,6 +127,39 @@ internal static class UserManager6Records
         catch (ArgumentException) { throw new InvalidDataException("Invalid User Manager limitation identity."); }
         return new(actualProfile, limitation, ReadText(words, "from-time", 128),
             ReadText(words, "till-time", 128), ReadText(words, "weekdays", 128));
+    }
+
+    // Decode only exact descending w/d/h/m/s components; unknown formats stay raw.
+    // No calendar conversion, wall-clock expiry, or subtraction from a profile limit.
+    internal static ulong? ParseUptimeSeconds(string? raw)
+    {
+        if (string.IsNullOrEmpty(raw) || raw.Length > 128) return null;
+        ReadOnlySpan<char> remaining = raw.AsSpan();
+        int previousRank = 6;
+        ulong total = 0;
+        while (!remaining.IsEmpty)
+        {
+            int i = 0;
+            while (i < remaining.Length && char.IsAsciiDigit(remaining[i])) i++;
+            if (i == 0 || i == remaining.Length ||
+                !ulong.TryParse(remaining[..i], NumberStyles.None, CultureInfo.InvariantCulture, out ulong amount))
+                return null;
+            (int rank, ulong factor) = remaining[i] switch
+            {
+                'w' => (5, 604800UL),
+                'd' => (4, 86400UL),
+                'h' => (3, 3600UL),
+                'm' => (2, 60UL),
+                's' => (1, 1UL),
+                _ => (0, 0UL)
+            };
+            if (rank == 0 || rank >= previousRank || amount > (ulong.MaxValue - total) / factor)
+                return null;
+            total += amount * factor;
+            previousRank = rank;
+            remaining = remaining[(i + 1)..];
+        }
+        return total;
     }
 
     private static UserManager6ByteValue ReadBytes(byte[][] words, string field) =>
