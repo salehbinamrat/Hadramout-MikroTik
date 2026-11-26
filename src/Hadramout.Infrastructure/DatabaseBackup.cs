@@ -1,4 +1,6 @@
+using System.Security.AccessControl;
 using System.Security.Cryptography;
+using System.Security.Principal;
 using Microsoft.Data.Sqlite;
 
 namespace Hadramout.Infrastructure;
@@ -67,8 +69,7 @@ public static class DatabaseBackup
     private static BackupReceipt Stage(string destination, Action<string> create)
     {
         string parent = Path.GetDirectoryName(destination)!;
-        string stageDirectory = Path.Combine(parent, ".hadramout-stage-" + Guid.NewGuid().ToString("N"));
-        Directory.CreateDirectory(stageDirectory);
+        string stageDirectory = CreatePrivateWorkspace(parent, ".hadramout-stage-");
         string staged = Path.Combine(stageDirectory, "snapshot.db");
         try
         {
@@ -76,6 +77,51 @@ public static class DatabaseBackup
             return PublishStandalone(staged, destination);
         }
         finally { Directory.Delete(stageDirectory, recursive: true); }
+    }
+
+    // A trusted local parent is still required. Do not create plaintext until the
+    // workspace's access policy is verified. No permissive fallback.
+    internal static string CreatePrivateWorkspace(string parent, string prefix = ".hmk-private-")
+    {
+        string path = Path.Combine(parent, prefix + Guid.NewGuid().ToString("N"));
+        if (Directory.Exists(path) || File.Exists(path))
+            throw new IOException("Temporary workspace already exists.");
+
+        if (OperatingSystem.IsWindows())
+        {
+            using var identity = WindowsIdentity.GetCurrent();
+            var user = identity.User ?? throw new UnauthorizedAccessException("Windows user identity unavailable.");
+            var policy = new DirectorySecurity();
+            policy.SetOwner(user);
+            policy.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
+            policy.AddAccessRule(new FileSystemAccessRule(user, FileSystemRights.FullControl,
+                InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit,
+                PropagationFlags.None, AccessControlType.Allow));
+            // Supply the ACL to the creation call rather than hardening after creation.
+            DirectoryInfo directory = policy.CreateDirectory(path);
+            if ((directory.Attributes & FileAttributes.ReparsePoint) != 0)
+                throw new IOException("Temporary workspace is a reparse point.");
+            var actual = directory.GetAccessControl(AccessControlSections.Access | AccessControlSections.Owner);
+            var rules = actual.GetAccessRules(true, true, typeof(SecurityIdentifier))
+                .Cast<FileSystemAccessRule>().ToArray();
+            if (!actual.AreAccessRulesProtected || !user.Equals(actual.GetOwner(typeof(SecurityIdentifier))) ||
+                rules.Length != 1 || !user.Equals(rules[0].IdentityReference) ||
+                rules[0].AccessControlType != AccessControlType.Allow ||
+                (rules[0].FileSystemRights & FileSystemRights.FullControl) != FileSystemRights.FullControl ||
+                (rules[0].InheritanceFlags & (InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit)) !=
+                    (InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit) ||
+                rules[0].PropagationFlags != PropagationFlags.None || rules[0].IsInherited)
+                throw new UnauthorizedAccessException("Private workspace permissions could not be verified.");
+        }
+        else
+        {
+            const UnixFileMode permissions = UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute;
+            DirectoryInfo directory = Directory.CreateDirectory(path, permissions);
+            if ((directory.Attributes & FileAttributes.ReparsePoint) != 0 ||
+                File.GetUnixFileMode(path) != permissions)
+                throw new UnauthorizedAccessException("Private workspace permissions could not be verified.");
+        }
+        return path;
     }
 
     internal static BackupReceipt PublishStandalone(string staged, string destination)

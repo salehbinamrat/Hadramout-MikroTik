@@ -4,5 +4,6 @@
   <ProjectReference Include="../Hadramout.Core/Hadramout.Core.csproj"/>
   <PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite"/>
   <PackageReference Include="System.Security.Cryptography.ProtectedData"/>
+  <InternalsVisibleTo Include="Hadramout.Core.Tests" />
  </ItemGroup>
 </Project>
