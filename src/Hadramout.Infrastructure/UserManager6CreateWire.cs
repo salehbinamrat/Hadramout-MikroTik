@@ -83,7 +83,7 @@ internal sealed class UserManager6CreateWire(Stream stream)
         return new(UserManager6CreateWireOutcome.Acknowledged, Encoding.ASCII.GetString(words[1], 5, words[1].Length - 5));
     }
 
-    private static void ValidatePassword(ReadOnlySpan<byte> value)
+    internal static void ValidatePassword(ReadOnlySpan<byte> value)
     {
         // Explicit empty supported locally. Nonempty values must be valid UTF-8;
         // reject ASCII control bytes instead of transmitting ambiguous values.

@@ -12,7 +12,7 @@ internal sealed record UserManager6CreateIntent(Guid ReservationId, Guid BatchId
     string PlanName, string LeafSha256, string ProfileOwner, string ProfileName);
 
 internal sealed record UserManager6PreflightScope(Guid ReservationId, Guid RouterId,
-    string LeafSha256, string ProfileOwner, string ProfileName, string Username);
+    string LeafSha256, string ProfileOwner, string ProfileName, string Username, string Customer);
 
 internal sealed record UserManager6CreationReviewRow(UserManager6CreateEntry Entry, bool LocalIdentityMatches);
 internal sealed record UserManager6CreationReviewPage(IReadOnlyList<UserManager6CreationReviewRow> Rows,
@@ -205,7 +205,7 @@ internal sealed class UserManager6CreateJournal(string databasePath)
         using var cmd = c.CreateCommand();
         cmd.Transaction = tx;
         cmd.CommandText = """
-            SELECT j.RouterId,i.LeafSha256,i.ProfileOwner,i.ProfileName,j.Username
+            SELECT j.RouterId,i.LeafSha256,i.ProfileOwner,i.ProfileName,j.Username,j.Customer
             FROM um6_create_journal j
             JOIN um6_create_intents i ON i.ReservationId=j.ReservationId
             JOIN voucher_reservations v ON v.Id=j.ReservationId AND v.BackendId=j.BackendId AND v.Username=j.Username
@@ -221,7 +221,7 @@ internal sealed class UserManager6CreateJournal(string databasePath)
         {
             if (!reader.Read()) throw new InvalidOperationException("A matching prepared creation intent is required.");
             scope = new(reservationId, reader.GetGuid(0), reader.GetString(1), reader.GetString(2),
-                reader.GetString(3), reader.GetString(4));
+                reader.GetString(3), reader.GetString(4), reader.GetString(5));
         }
         using var secret = UserManager6VoucherSecretStore.Load(c, tx, reservationId)
             ?? throw new InvalidOperationException("Voucher password has not been configured.");
@@ -237,6 +237,15 @@ internal sealed class UserManager6CreateJournal(string databasePath)
     // Remote checks, protected voucher credentials and authorization are still required.
     [SupportedOSPlatform("windows")]
     internal bool TryBeginBoundDispatch(Guid reservationId)
+    {
+        using var secret = TryClaimBoundSecret(reservationId);
+        return secret is not null;
+    }
+
+    // Transfer the decrypted, immutable secret only AFTER the one-shot claim commits.
+    // No remote operation may be attempted if validation or commit fails.
+    [SupportedOSPlatform("windows")]
+    internal UserManager6VoucherSecretLease? TryClaimBoundSecret(Guid reservationId)
     {
         ValidateId(reservationId);
         using var c = DatabaseStore.OpenExisting(databasePath);
@@ -260,12 +269,17 @@ internal sealed class UserManager6CreateJournal(string databasePath)
                   AND t.LeafSha256=i.LeafSha256);
             """;
         cmd.Parameters.AddWithValue("$id", reservationId);
-        if (cmd.ExecuteNonQuery() != 1) return false;
+        if (cmd.ExecuteNonQuery() != 1) return null;
         // The update is still uncommitted. A missing or invalid secret rolls it back.
-        using var secret = UserManager6VoucherSecretStore.Load(c, tx, reservationId);
-        if (secret is null) return false;
-        tx.Commit();
-        return true;
+        var secret = UserManager6VoucherSecretStore.Load(c, tx, reservationId);
+        if (secret is null) return null;
+        try
+        {
+            UserManager6CreateWire.ValidatePassword(secret.Password.Span);
+            tx.Commit();
+            return secret;
+        }
+        catch { secret.Dispose(); throw; }
     }
 
     internal bool TryMarkIndeterminate(Guid reservationId) =>

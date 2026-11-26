@@ -203,22 +203,30 @@ internal sealed class RouterOsSession : IDisposable
         UserManager6Records.ValidateKey(owner, nameof(owner));
         UserManager6Records.ValidateKey(profile, nameof(profile));
         UserManager6Records.ValidateKey(username, nameof(username));
-        return WithReadSessionAsync(async (stream, token) =>
-        {
-            await RequireUserManager6FamilyAsync(stream, token).ConfigureAwait(false);
-            var profiles = await ReadUniqueVisibleUm6ProfileAsync(stream, owner, profile, token).ConfigureAwait(false);
-            if (profiles.Count == 0)
-                return new UserManager6PreflightEvidence(UserManager6PreflightState.ProfileNotVisible, null, null);
-            // No customer filter: any visible same-name account blocks creation.
-            var customers = await ReadCommandAsync(stream,
-                ["/tool/user-manager/user/print"u8.ToArray(),
-                    "=.proplist=customer,username"u8.ToArray(),
-                    UserManager6Records.Query("username", username)],
-                words => UserManager6Records.ParseVisibleUsernameCustomer(words, username), 1, token).ConfigureAwait(false);
-            return customers.Count == 0
-                ? new UserManager6PreflightEvidence(UserManager6PreflightState.NoVisibleUsernameMatch, profiles[0], null)
-                : new UserManager6PreflightEvidence(UserManager6PreflightState.UsernameAlreadyVisible, profiles[0], customers[0]);
-        }, timeout, cancellationToken);
+        return WithReadSessionAsync((stream, token) => ReadUm6PreflightCoreAsync(stream, owner, profile, username, token),
+            timeout, cancellationToken);
+    }
+
+    // Shared completed-read protocol; caller owns exclusive authenticated stream.
+    internal static async Task<UserManager6PreflightEvidence> ReadUm6PreflightCoreAsync(
+        Stream stream, string owner, string profile, string username, CancellationToken token)
+    {
+        UserManager6Records.ValidateKey(owner, nameof(owner));
+        UserManager6Records.ValidateKey(profile, nameof(profile));
+        UserManager6Records.ValidateKey(username, nameof(username));
+        await RequireUserManager6FamilyAsync(stream, token).ConfigureAwait(false);
+        var profiles = await ReadUniqueVisibleUm6ProfileAsync(stream, owner, profile, token).ConfigureAwait(false);
+        if (profiles.Count == 0)
+            return new UserManager6PreflightEvidence(UserManager6PreflightState.ProfileNotVisible, null, null);
+        // No customer filter: any visible same-name account blocks creation.
+        var customers = await ReadCommandAsync(stream,
+            ["/tool/user-manager/user/print"u8.ToArray(),
+                "=.proplist=customer,username"u8.ToArray(),
+                UserManager6Records.Query("username", username)],
+            words => UserManager6Records.ParseVisibleUsernameCustomer(words, username), 1, token).ConfigureAwait(false);
+        return customers.Count == 0
+            ? new UserManager6PreflightEvidence(UserManager6PreflightState.NoVisibleUsernameMatch, profiles[0], null)
+            : new UserManager6PreflightEvidence(UserManager6PreflightState.UsernameAlreadyVisible, profiles[0], customers[0]);
     }
 
     // First verify a unique visible profile name and its owner. Legacy mapping rows
