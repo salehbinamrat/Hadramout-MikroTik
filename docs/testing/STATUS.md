@@ -24,7 +24,8 @@
 - PR #23 merged 1661a7cc726c99367e617155f5c15b6717a9f270; Core 45879472040 / Release 45879472056 passed on b7dfad40a9634ed6d5587199aa204cda875584ac; artifact 15146122913. P16b usage and limitation reads passed hosted CI.
 - PR #24 merged 06b952c1c8d5346bfd103b8da9d027d060007190; Core 45881628107 / Release 45881628108 passed on f7212ba1bd7e688280cdd2fb1551dde26a24c350; artifact 15148380501. Profile mapping evidence passed hosted CI.
 - PR #25 merged 47d294bb0b40ef3f07f6f09b4a2845f3c9248039; Core 45884337248 / Release 45884337224 passed on 299ff56c0a18c721feea3894ad1f55bc7d82406d; artifact 15148304540. P16b.3 hosted checks passed.
-- P16c.1 schema v5 one-shot local creation journal: initial head failed both gates (336/337 passed); corrected shared legacy fixture and five additional cases, corrected CI pending. No remote dispatch, no new dependencies; cross-generation reconciliation remains open.
+- PR #26 merged 083eab3caf365684a2f1ae2657cfee724468420d; Core 45886262085 / Release 45886262073 passed on b1a58104a46565dc2333f8ad1917b8f6e2e765d4; artifact 15149257711. Corrected legacy fixtures and creation journal passed hosted CI.
+- P16c.2a proposed exact cross-generation journal comparison, 11 new regression cases; CI pending. Divergent histories and remote reconciliation remain open. P41/P42 dashboard design requirements documented; UI implementation remains pending.
 - P10 remaining: restore UI and RBAC, managed crash cleanup, real cross-account/device validation, full audit coverage/actor attribution, retention and scheduling. No production restore.
 - P01 deeper per-feature audit; physical Windows, RouterOS, printers; hard-kill, power-loss and disk-full tests pending. main remains unprotected; exact-head manual gate enforced. No production DB or real router changes.
 

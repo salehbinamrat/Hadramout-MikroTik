@@ -125,14 +125,13 @@ public static class ManagedDatabase
 
         string currentPath = GenerationPath(root, current);
         RequireRegularFile(currentPath);
-        UserManager6CreateJournal.RequireEmptyForRestore(currentPath);
         Guid next = Guid.NewGuid();
         string candidate = GenerationPath(root, next);
 
         // Current history and the precaution are captured under the same exclusive managed gate.
         var receipts = EncryptedDatabaseBackup.PrepareWithPrecaution(currentPath, encryptedPath,
             candidate, precautionPath, backupPassword, precautionPassword);
-        UserManager6CreateJournal.RequireEmptyForRestore(candidate);
+        UserManager6CreateJournal.RequireEquivalentForRestore(currentPath, candidate);
         var statuses = RestoreCredentialInspector.Inspect(candidate);
         if (!allowUnavailableCredentials && statuses.Any(s => s.State == RestoreCredentialState.Unavailable))
             throw new InvalidOperationException("Restored credentials require explicit review before activation.");

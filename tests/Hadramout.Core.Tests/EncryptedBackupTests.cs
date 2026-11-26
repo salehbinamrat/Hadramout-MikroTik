@@ -657,11 +657,42 @@ public sealed class EncryptedBackupTests
         string precaution = Path.Combine(f.Root, "journal-precaution.hmk");
         Assert.Throws<InvalidOperationException>(() => ManagedDatabase.ActivateRestore(root, generation,
             f.Encrypted, precaution, Password, Password, allowUnavailableCredentials: false));
-        Assert.False(File.Exists(precaution));
+        // Candidate is prepared and a verified precaution retained before comparison.
+        Assert.True(File.Exists(precaution));
         using var active = ManagedDatabase.OpenSession(root);
         Assert.Equal(generation, active.Generation);
         Assert.Equal(UserManager6CreateState.DispatchStarted,
             new UserManager6CreateJournal(active.DatabasePath).Read(id)!.State);
+    }
+
+    [Fact]
+    [SupportedOSPlatform("windows")]
+    public void ManagedRestoreWithEquivalentJournalPreservesClaimAndSwitchesGeneration()
+    {
+        using var f = new Fixture();
+        string root = Path.Combine(f.Root, "managed-equivalent-journal");
+        Directory.CreateDirectory(root);
+        Guid generation, id;
+        using (var session = ManagedDatabase.OpenSession(root))
+        {
+            generation = session.Generation;
+            id = DatabaseDurabilityTests.SeedReservation(session.DatabasePath, BackendKind.UserManager6);
+            var journal = new UserManager6CreateJournal(session.DatabasePath);
+            journal.Prepare(id, "admin");
+            Assert.True(journal.TryBeginDispatch(id));
+            Assert.True(journal.TryMarkIndeterminate(id));
+            EncryptedDatabaseBackup.Create(session.DatabasePath, f.Encrypted, Password);
+        }
+        string precaution = Path.Combine(f.Root, "equivalent-precaution.hmk");
+        var result = ManagedDatabase.ActivateRestore(root, generation, f.Encrypted, precaution,
+            Password, Password, allowUnavailableCredentials: false);
+        Assert.NotEqual(generation, result.Generation);
+        Assert.True(File.Exists(precaution));
+        using var active = ManagedDatabase.OpenSession(root);
+        Assert.Equal(result.Generation, active.Generation);
+        var restored = new UserManager6CreateJournal(active.DatabasePath);
+        Assert.Equal(UserManager6CreateState.Indeterminate, restored.Read(id)!.State);
+        Assert.False(restored.TryBeginDispatch(id));
     }
 
     private static void AddPayload(string path, int size)
