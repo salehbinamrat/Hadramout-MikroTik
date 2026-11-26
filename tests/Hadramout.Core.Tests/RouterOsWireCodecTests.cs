@@ -344,6 +344,71 @@ public sealed class RouterOsWireCodecTests
             ["!re"u8.ToArray(), Encoding.ASCII.GetBytes(name), Encoding.ASCII.GetBytes(disabled)]));
     }
 
+    [Theory]
+    [InlineData("0", 0L)]
+    [InlineData("15000", 15000L)]
+    [InlineData("9223372036854775807", long.MaxValue)]
+    public async Task CountOnlyAcceptsExplicitNonnegativeCompletion(string value, long expected)
+    {
+        using var stream = new MemoryStream();
+        await ReplyAsync(stream, "!done", "=ret=" + value);
+        stream.Position = 0;
+        var result = await RouterOsReplyReader.ReadAsync(stream, _ => 0, 1, CancellationToken.None, countOnly: true);
+        Assert.Equal(RouterOsReplyOutcome.Completed, result.Outcome);
+        Assert.Equal(expected, result.CompletionCount);
+        Assert.Empty(result.Rows);
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("-1")]
+    [InlineData("+1")]
+    [InlineData(" 1")]
+    [InlineData("1.0")]
+    [InlineData("9223372036854775808")]
+    public async Task CountOnlyRejectsInvalidReturnValue(string value)
+    {
+        using var stream = new MemoryStream();
+        await ReplyAsync(stream, "!done", "=ret=" + value);
+        stream.Position = 0;
+        await Assert.ThrowsAsync<InvalidDataException>(async () =>
+            await RouterOsReplyReader.ReadAsync(stream, _ => 0, 1, CancellationToken.None, countOnly: true));
+    }
+
+    [Theory]
+    [InlineData("bare-done")]
+    [InlineData("row")]
+    [InlineData("wrong-attribute")]
+    [InlineData("empty-nonzero")]
+    [InlineData("duplicate-ret")]
+    public async Task CountOnlyCannotInferSuccessFromUnrelatedReplies(string condition)
+    {
+        using var stream = new MemoryStream();
+        switch (condition)
+        {
+            case "bare-done": await ReplyAsync(stream, "!done"); break;
+            case "row": await ReplyAsync(stream, "!re", "=name=synthetic"); break;
+            case "wrong-attribute": await ReplyAsync(stream, "!done", "=count=0"); break;
+            case "empty-nonzero": await ReplyAsync(stream, "!empty"); await ReplyAsync(stream, "!done", "=ret=1"); break;
+            case "duplicate-ret": await ReplyAsync(stream, "!done", "=ret=1", "=ret=2"); break;
+        }
+        stream.Position = 0;
+        await Assert.ThrowsAsync<InvalidDataException>(async () =>
+            await RouterOsReplyReader.ReadAsync(stream, _ => 0, 1, CancellationToken.None, countOnly: true));
+    }
+
+    [Fact]
+    public async Task ExplicitEmptyCountRequiresZeroCompletion()
+    {
+        using var stream = new MemoryStream();
+        await ReplyAsync(stream, "!empty");
+        await ReplyAsync(stream, "!done", "=ret=0");
+        stream.Position = 0;
+        var result = await RouterOsReplyReader.ReadAsync(stream, _ => 0, 1, CancellationToken.None, countOnly: true);
+        Assert.Equal(0L, result.CompletionCount);
+        Assert.Equal(RouterOsReplyOutcome.Completed, result.Outcome);
+    }
+
     private sealed class FragmentedStream(byte[] bytes) : MemoryStream(bytes)
     {
         public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default) =>

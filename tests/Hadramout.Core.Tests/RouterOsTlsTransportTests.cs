@@ -6,6 +6,7 @@ using System.Text;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using Hadramout.Infrastructure;
+using Hadramout.Core;
 using Xunit;
 using Xunit.Abstractions;
 
@@ -367,6 +368,115 @@ public sealed class RouterOsTlsTransportTests(ITestOutputHelper output)
             await Assert.ThrowsAsync<ObjectDisposedException>(() => session.ReadVersionAsync());
         }
         finally { await serve; }
+    }
+
+    [Theory]
+    [InlineData("6.49.19", 2, "/tool/user-manager/user/print", 0L)]
+    [InlineData("7.21.1", 3, "/user-manager/user/print", 15000L)]
+    [InlineData("6.49.19", 1, "/ip/hotspot/user/print", 24L)]
+    [InlineData("7.21.1", 4, "/ppp/secret/print", 12L)]
+    public async Task ServiceProbeUsesCorrectReadOnlyMenuAndCount(string version, int kind, string path, long count)
+    {
+        using var certificates = new Certificates();
+        using var server = new LoopbackServer(certificates.Leaf, certificates.Root, output);
+        Task serve = server.RunAsync(reply: true, handler: async (tls, token) =>
+        {
+            await PrepareProbePeerAsync(tls, token, version);
+            byte[][] words = await RouterOsWireCodec.ReadSentenceAsync(tls, token);
+            string[] expected = kind == 4
+                ? [path, "=count-only=", "?service=pppoe", "?service=any", "?#|"]
+                : [path, "=count-only="];
+            Assert.Equal(expected, words.Select(word => Encoding.ASCII.GetString(word)).ToArray());
+            await RouterOsWireCodec.WriteSentenceAsync(tls,
+                ["!done"u8.ToArray(), Encoding.ASCII.GetBytes("=ret=" + count.ToString(System.Globalization.CultureInfo.InvariantCulture))], token);
+        });
+        try
+        {
+            using var session = await ConnectSessionAsync(server, certificates);
+            var result = await session.ProbeServiceAsync((BackendKind)kind);
+            Assert.Equal(RouterOsServiceProbeState.Readable, result.State);
+            Assert.Equal((BackendKind)kind, result.Backend);
+            Assert.Equal(count, result.AccountCount);
+        }
+        finally { await serve; }
+    }
+
+    [Theory]
+    [InlineData("6.49.19", 3)]
+    [InlineData("7.21.1", 2)]
+    [InlineData("8.0", 1)]
+    public async Task IncompatibleServiceNeverSendsMenuCommand(string version, int kind)
+    {
+        using var certificates = new Certificates();
+        using var server = new LoopbackServer(certificates.Leaf, certificates.Root, output);
+        Task serve = server.RunAsync(reply: true, handler: async (tls, token) =>
+        {
+            await PrepareProbePeerAsync(tls, token, version);
+            Assert.Equal(0, await tls.ReadAsync(new byte[1], token));
+        });
+        try
+        {
+            using var session = await ConnectSessionAsync(server, certificates);
+            var result = await session.ProbeServiceAsync((BackendKind)kind);
+            Assert.Equal(RouterOsServiceProbeState.NotApplicable, result.State);
+            Assert.Null(result.AccountCount);
+        }
+        finally { await serve; }
+    }
+
+    [Theory]
+    [InlineData("!trap", 2)]
+    [InlineData("!fatal", 3)]
+    public async Task RejectedOrFatalServiceProbeIsNotAnEmptyAccountList(string kind, int state)
+    {
+        using var certificates = new Certificates();
+        using var server = new LoopbackServer(certificates.Leaf, certificates.Root, output);
+        Task serve = server.RunAsync(reply: true, handler: async (tls, token) =>
+        {
+            await PrepareProbePeerAsync(tls, token, "6.49.19");
+            await RouterOsWireCodec.ReadSentenceAsync(tls, token);
+            await RouterOsWireCodec.WriteSentenceAsync(tls,
+                [Encoding.ASCII.GetBytes(kind), "=message=synthetic-rejection"u8.ToArray()], token);
+        });
+        try
+        {
+            using var session = await ConnectSessionAsync(server, certificates);
+            var result = await session.ProbeServiceAsync(BackendKind.UserManager6);
+            Assert.Equal((RouterOsServiceProbeState)state, result.State);
+            Assert.Null(result.AccountCount);
+            await Assert.ThrowsAsync<ObjectDisposedException>(() => session.ReadVersionAsync());
+        }
+        finally { await serve; }
+    }
+
+    [Fact]
+    public async Task MalformedCountProbeClosesSessionWithoutReturningZero()
+    {
+        using var certificates = new Certificates();
+        using var server = new LoopbackServer(certificates.Leaf, certificates.Root, output);
+        Task serve = server.RunAsync(reply: true, handler: async (tls, token) =>
+        {
+            await PrepareProbePeerAsync(tls, token, "7.21.1");
+            await RouterOsWireCodec.ReadSentenceAsync(tls, token);
+            await RouterOsWireCodec.WriteSentenceAsync(tls, ["!done"u8.ToArray()], token);
+        });
+        try
+        {
+            using var session = await ConnectSessionAsync(server, certificates);
+            await Assert.ThrowsAsync<InvalidDataException>(() => session.ProbeServiceAsync(BackendKind.UserManager7));
+            await Assert.ThrowsAsync<ObjectDisposedException>(() => session.ReadVersionAsync());
+        }
+        finally { await serve; }
+    }
+
+    private static async Task PrepareProbePeerAsync(SslStream tls, CancellationToken token, string version)
+    {
+        await AssertLoginAsync(tls, token);
+        await RouterOsWireCodec.WriteSentenceAsync(tls, ["!done"u8.ToArray()], token);
+        await AssertVersionRequestAsync(tls, token);
+        await RouterOsWireCodec.WriteSentenceAsync(tls,
+            ["!re"u8.ToArray(), Encoding.ASCII.GetBytes("=version=" + version)], token);
+        await RouterOsWireCodec.WriteSentenceAsync(tls, ["!done"u8.ToArray()], token);
     }
 
     private static async Task AssertPackageRequestAsync(SslStream tls, CancellationToken token)
