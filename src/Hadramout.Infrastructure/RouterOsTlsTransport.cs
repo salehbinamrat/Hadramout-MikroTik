@@ -20,7 +20,7 @@ internal sealed class RouterOsTlsTransport : IDisposable
 
     internal static async Task<RouterOsTlsTransport> ConnectAsync(string host, string certificateName,
         int port = 8729, TimeSpan? timeout = null, ReadOnlyMemory<byte> trustedRootDer = default,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default, string? expectedLeafSha256 = null)
     {
         ValidateHost(host, nameof(host));
         ValidateHost(certificateName, nameof(certificateName));
@@ -30,6 +30,7 @@ internal sealed class RouterOsTlsTransport : IDisposable
             throw new ArgumentOutOfRangeException(nameof(timeout));
         if (trustedRootDer.Length > 65536)
             throw new ArgumentException("Trusted CA certificate exceeds the size limit.", nameof(trustedRootDer));
+        byte[]? expectedLeaf = expectedLeafSha256 is null ? null : ParseLeafPin(expectedLeafSha256);
         cancellationToken.ThrowIfCancellationRequested();
 
         // Explicitly configured private CA, never a certificate learned from the peer.
@@ -71,8 +72,14 @@ internal sealed class RouterOsTlsTransport : IDisposable
                 AllowRenegotiation = false,
                 CertificateChainPolicy = policy
             }, deadline.Token).ConfigureAwait(false);
-            if (!tls.IsAuthenticated || !tls.IsEncrypted || !tls.IsSigned || tls.RemoteCertificate is null)
+            var peer = tls.RemoteCertificate;
+            if (!tls.IsAuthenticated || !tls.IsEncrypted || !tls.IsSigned || peer is null)
                 throw new AuthenticationException("RouterOS TLS peer is not authenticated.");
+            // Additional restriction AFTER platform trust/name validation, BEFORE login.
+            // Never learn or replace a configured pin from an unverified peer.
+            if (expectedLeaf is not null &&
+                !CryptographicOperations.FixedTimeEquals(expectedLeaf, SHA256.HashData(peer.GetRawCertData())))
+                throw new AuthenticationException("RouterOS certificate does not match the configured target.");
             deadline.Token.ThrowIfCancellationRequested();
             return new RouterOsTlsTransport(client, tls);
         }
@@ -87,6 +94,13 @@ internal sealed class RouterOsTlsTransport : IDisposable
             }
             throw;
         }
+    }
+
+    internal static byte[] ParseLeafPin(string pin)
+    {
+        if (pin is null || pin.Length != 64 || !pin.All(Uri.IsHexDigit))
+            throw new ArgumentException("A SHA-256 certificate fingerprint of exactly 64 hexadecimal characters is required.", nameof(pin));
+        return Convert.FromHexString(pin);
     }
 
     private static void ValidateHost(string host, string parameter)

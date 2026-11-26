@@ -26,7 +26,8 @@
 - PR #25 merged 47d294bb0b40ef3f07f6f09b4a2845f3c9248039; Core 45884337248 / Release 45884337224 passed on 299ff56c0a18c721feea3894ad1f55bc7d82406d; artifact 15148304540. P16b.3 hosted checks passed.
 - PR #26 merged 083eab3caf365684a2f1ae2657cfee724468420d; Core 45886262085 / Release 45886262073 passed on b1a58104a46565dc2333f8ad1917b8f6e2e765d4; artifact 15149257711. Corrected legacy fixtures and creation journal passed hosted CI.
 - PR #27 merged abbaabf9ae53044d994a8a5b9ad35e996b5fa9ec; Core 45887243888 / Release 45887243988 passed on c1315dc2656d42bd073cdcc70e5dbc1e87273e98; artifact 15149398679. Exact restore comparison passed hosted CI; dashboard requirements documented.
-- P16c.2b proposed read-only router-scoped recovery review and counts with six new cases; CI pending. Divergent history reconciliation, authenticated target binding and remote dispatch/readback remain open.
+- PR #28 merged d68650353e448dbc52d9fc6164d5e3b02cd0fb81; Core 45890069450 / Release 45890069475 passed on 073c8dfec9888e617c884c3d497fb511a3473195; artifact 15150853584. Local recovery review passed hosted CI.
+- P16c.2c proposed explicit SHA-256 leaf certificate pin-required connection before login, 10 new regression cases; CI pending. Persistent target enrollment and remote dispatch/reconciliation remain open.
 - P10 remaining: restore UI and RBAC, managed crash cleanup, real cross-account/device validation, full audit coverage/actor attribution, retention and scheduling. No production restore.
 - P01 deeper per-feature audit; physical Windows, RouterOS, printers; hard-kill, power-loss and disk-full tests pending. main remains unprotected; exact-head manual gate enforced. No production DB or real router changes.
 

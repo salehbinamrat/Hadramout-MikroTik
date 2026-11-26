@@ -13,10 +13,28 @@ internal sealed class RouterOsSession : IDisposable
     private RouterOsSession(RouterOsTlsTransport transport) => this.transport = transport;
 
     // Caller owns the input buffers and must keep them stable until this task completes.
-    internal static async Task<RouterOsSession> ConnectAsync(string host, string certificateName,
+    internal static Task<RouterOsSession> ConnectAsync(string host, string certificateName,
         ReadOnlyMemory<byte> username, ReadOnlyMemory<byte> password, int port = 8729,
         TimeSpan? timeout = null, ReadOnlyMemory<byte> trustedRootDer = default,
+        CancellationToken cancellationToken = default) =>
+        ConnectCoreAsync(host, certificateName, username, password, port, timeout, trustedRootDer,
+            cancellationToken, expectedLeafSha256: null);
+
+    // Explicit pin-required path for future verified target operations. No downgrade
+    // to the ordinary read connection when pin validation fails.
+    internal static Task<RouterOsSession> ConnectPinnedAsync(string host, string certificateName,
+        string expectedLeafSha256, ReadOnlyMemory<byte> username, ReadOnlyMemory<byte> password,
+        int port = 8729, TimeSpan? timeout = null, ReadOnlyMemory<byte> trustedRootDer = default,
         CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(expectedLeafSha256);
+        return ConnectCoreAsync(host, certificateName, username, password, port, timeout, trustedRootDer,
+            cancellationToken, expectedLeafSha256);
+    }
+
+    private static async Task<RouterOsSession> ConnectCoreAsync(string host, string certificateName,
+        ReadOnlyMemory<byte> username, ReadOnlyMemory<byte> password, int port, TimeSpan? timeout,
+        ReadOnlyMemory<byte> trustedRootDer, CancellationToken cancellationToken, string? expectedLeafSha256)
     {
         if (username.Length is < 1 or > 4096 || password.Length > 4096)
             throw new ArgumentException("RouterOS credential length is invalid.");
@@ -28,7 +46,7 @@ internal sealed class RouterOsSession : IDisposable
         try
         {
             connection = await RouterOsTlsTransport.ConnectAsync(host, certificateName, port, limit,
-                trustedRootDer, deadline.Token).ConfigureAwait(false);
+                trustedRootDer, deadline.Token, expectedLeafSha256).ConfigureAwait(false);
             byte[] nameWord = new byte[6 + username.Length];
             byte[] passwordWord = new byte[10 + password.Length];
             try

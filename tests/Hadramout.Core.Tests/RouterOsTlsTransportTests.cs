@@ -170,6 +170,78 @@ public sealed class RouterOsTlsTransportTests(ITestOutputHelper output)
         finally { await serve; }
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task PinnedSessionRequiresExactCertificateAndAuthenticatesBeforeRead(bool lowerCase)
+    {
+        using var certificates = new Certificates();
+        using var server = new LoopbackServer(certificates.Leaf, certificates.Root, output);
+        string pin = Convert.ToHexString(SHA256.HashData(certificates.Leaf.RawData));
+        if (lowerCase) pin = pin.ToLowerInvariant();
+        Task serve = server.RunAsync(reply: true, handler: (tls, token) =>
+            PrepareProbePeerAsync(tls, token, "6.49.19"));
+        try
+        {
+            using var session = await RouterOsSession.ConnectPinnedAsync("127.0.0.1", "router.test", pin,
+                "synthetic-user"u8.ToArray(), "synthetic-private-password"u8.ToArray(), server.Port,
+                trustedRootDer: certificates.Root.RawData);
+            Assert.Equal("6.49.19", await session.ReadVersionAsync());
+        }
+        finally { await serve; }
+        Assert.False(server.HasPendingConnection);
+    }
+
+    [Theory]
+    [InlineData("wrong-pin")]
+    [InlineData("wrong-name")]
+    [InlineData("wrong-ca")]
+    [InlineData("expired")]
+    public async Task PinnedSessionCannotBypassTrustOrSendLoginOnMismatch(string condition)
+    {
+        using var certificates = new Certificates(expired: condition == "expired");
+        using var other = new Certificates();
+        using var server = new LoopbackServer(certificates.Leaf, certificates.Root, output);
+        string pin = Convert.ToHexString(SHA256.HashData(
+            condition == "wrong-pin" ? other.Leaf.RawData : certificates.Leaf.RawData));
+        string name = condition == "wrong-name" ? "other.test" : "router.test";
+        byte[] trust = condition == "wrong-ca" ? other.Root.RawData : certificates.Root.RawData;
+        // For a valid chain with the wrong pin, TLS succeeds but absolutely no
+        // application data may reach the peer. Observe this assertion strictly.
+        Task serve = condition == "wrong-pin"
+            ? server.RunAsync(reply: true, handler: async (tls, token) =>
+                Assert.Equal(0, await tls.ReadAsync(new byte[1], token)))
+            : server.RunAsync(reply: false);
+        try
+        {
+            var error = await Assert.ThrowsAnyAsync<AuthenticationException>(() =>
+                RouterOsSession.ConnectPinnedAsync("127.0.0.1", name, pin,
+                    "synthetic-user"u8.ToArray(), "synthetic-private-password"u8.ToArray(),
+                    server.Port, trustedRootDer: trust));
+            Assert.DoesNotContain("synthetic-private-password", error.Message, StringComparison.Ordinal);
+            if (condition == "wrong-pin")
+                Assert.Equal("RouterOS certificate does not match the configured target.", error.Message);
+        }
+        finally { await serve; }
+        Assert.False(server.HasPendingConnection);
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData(" ")]
+    [InlineData("ab")]
+    [InlineData("gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg")]
+    public async Task InvalidLeafPinCannotOpenSocket(string pin)
+    {
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        int port = ((IPEndPoint)listener.LocalEndpoint).Port;
+        await Assert.ThrowsAnyAsync<ArgumentException>(() =>
+            RouterOsSession.ConnectPinnedAsync("127.0.0.1", "router.test", pin,
+                "synthetic-user"u8.ToArray(), "synthetic-private-password"u8.ToArray(), port));
+        Assert.False(listener.Pending());
+    }
+
     [Fact]
     public async Task InvalidCertificatePreventsLoginCredentialsFromBeingSent()
     {
