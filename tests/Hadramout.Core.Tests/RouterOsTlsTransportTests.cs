@@ -1099,6 +1099,21 @@ public sealed class RouterOsTlsTransportTests(ITestOutputHelper output)
             word => Assert.True(word.AsSpan().SequenceEqual("=.proplist=version"u8)));
     }
 
+    [Fact]
+    public void IndependentCertificateFixturesHaveUniqueIssuersAndBuildServerContexts()
+    {
+        var issuers = new HashSet<string>(StringComparer.Ordinal);
+        for (int i = 0; i < 12; i++)
+        {
+            using var certificates = new Certificates();
+            Assert.True(issuers.Add(certificates.Root.Subject));
+            Assert.Equal(certificates.Root.Subject, certificates.Leaf.Issuer);
+            Assert.NotNull(certificates.Leaf.Extensions["2.5.29.35"]);
+            using var server = new LoopbackServer(certificates.Leaf, certificates.Root, output);
+            Assert.True(server.Port > 0);
+        }
+    }
+
     private sealed class Certificates : IDisposable
     {
         private readonly RSA rootKey = RSA.Create(2048);
@@ -1109,7 +1124,8 @@ public sealed class RouterOsTlsTransportTests(ITestOutputHelper output)
         public Certificates(bool expired = false)
         {
             DateTimeOffset now = DateTimeOffset.UtcNow;
-            var rootRequest = new CertificateRequest("CN=Hadramout isolated test CA", rootKey,
+            // Distinct issuer names prevent ambiguity in Windows chain-building caches.
+            var rootRequest = new CertificateRequest($"CN=Hadramout test CA {Guid.NewGuid():N}", rootKey,
                 HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
             rootRequest.CertificateExtensions.Add(new X509BasicConstraintsExtension(true, false, 0, true));
             rootRequest.CertificateExtensions.Add(new X509KeyUsageExtension(X509KeyUsageFlags.KeyCertSign |
@@ -1127,6 +1143,9 @@ public sealed class RouterOsTlsTransportTests(ITestOutputHelper output)
             var san = new SubjectAlternativeNameBuilder();
             san.AddDnsName("router.test");
             request.CertificateExtensions.Add(san.Build());
+            request.CertificateExtensions.Add(new X509SubjectKeyIdentifierExtension(request.PublicKey, false));
+            request.CertificateExtensions.Add(X509AuthorityKeyIdentifierExtension.CreateFromCertificate(
+                Root, includeKeyIdentifier: true, includeIssuerAndSerial: true));
             using var issued = request.Create(Root, now.AddDays(-10), expired ? now.AddDays(-1) : now.AddDays(10),
                 RandomNumberGenerator.GetBytes(16));
             using var withKey = issued.CopyWithPrivateKey(leafKey);
@@ -1164,9 +1183,24 @@ public sealed class RouterOsTlsTransportTests(ITestOutputHelper output)
         public LoopbackServer(X509Certificate2 certificate, X509Certificate2 root, ITestOutputHelper output)
         {
             this.output = output;
-            context = SslStreamCertificateContext.Create(certificate,
-                new X509Certificate2Collection(root), offline: true);
-            listener.Start();
+            try
+            {
+                // Supply only the public issuer certificate, not the CA private key.
+                using var publicRoot = X509CertificateLoader.LoadCertificate(root.RawData);
+                context = SslStreamCertificateContext.Create(certificate,
+                    new X509Certificate2Collection(publicRoot), offline: true);
+                listener.Start();
+            }
+            catch (Exception ex)
+            {
+                output.WriteLine($"TLS fixture setup failed: HResult=0x{ex.HResult:X8}; " +
+                    $"issuer={certificate.Issuer}; leaf={certificate.Thumbprint}; CA={root.Thumbprint}; " +
+                    $"runtime={System.Runtime.InteropServices.RuntimeInformation.FrameworkDescription}; " +
+                    $"OS={System.Runtime.InteropServices.RuntimeInformation.OSDescription}");
+                deadline.Dispose();
+                listener.Stop();
+                throw;
+            }
         }
 
         public async Task RunAsync(bool reply, Func<SslStream, CancellationToken, Task>? handler = null)
