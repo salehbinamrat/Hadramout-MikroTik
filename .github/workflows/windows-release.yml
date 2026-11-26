@@ -33,3 +33,10 @@ jobs:
           name: release-test-results
           path: '**/TestResults/*.trx'
           if-no-files-found: warn
+      - name: Smoke stage evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-smoke-evidence
+          path: artifacts/smoke-evidence/*.log
+          if-no-files-found: warn
