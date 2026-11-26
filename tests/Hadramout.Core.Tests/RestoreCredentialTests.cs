@@ -131,8 +131,8 @@ public sealed class RestoreCredentialTests
             catch (InvalidOperationException) { results.Add(false); }
         });
         Assert.Equal(2, results.Count);
-        Assert.Single(results.Where(x => x));
-        Assert.Single(results.Where(x => !x));
+        Assert.Single(results, x => x);
+        Assert.Single(results, x => !x);
         Assert.Equal(3, AuditStore.ReadRecent(f.Path).Count);
     }
 

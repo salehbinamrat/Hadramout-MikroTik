@@ -9,3 +9,6 @@
 - P10d proposed read-only credential classification, explicit transactional re-entry, nine new tests and both-architecture published probe. CI pending; actual different-account/device testing pending.
 - P10 remaining: verify re-entry tests, secure workspace and crash cleanup, real cross-account/device validation, pre-activation safety snapshot, live activation, current-history preservation, full audit coverage/actor attribution, retention and scheduling. No live restore.
 - P01 deeper per-feature audit; physical Windows, RouterOS, printers; hard-kill, power-loss and disk-full tests pending. main remains unprotected; exact-head manual gate enforced. No production DB or real router changes.
+
+## PR #8 build failure — 2026-11-26
+Core run 45858437768 (job 140042839043) and Release run 45858437765 (job 140042838343) failed at compilation with xUnit2031, RestoreCredentialTests.cs lines 134–135. The analyzer rejects Assert.Single(collection.Where(predicate)); use Assert.Single(collection, predicate) instead. Both assertions retain exactly-one-success and exactly-one-rejection semantics; no test disabled and TreatWarningsAsErrors unchanged. Reviewed all C# test files for the same direct pattern. Re-run both workflows on the corrected head before merge; actual test execution pending.
