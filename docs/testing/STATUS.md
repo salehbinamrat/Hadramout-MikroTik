@@ -29,7 +29,8 @@
 - PR #28 merged d68650353e448dbc52d9fc6164d5e3b02cd0fb81; Core 45890069450 / Release 45890069475 passed on 073c8dfec9888e617c884c3d497fb511a3473195; artifact 15150853584. Local recovery review passed hosted CI.
 - PR #29 merged e835b60b3c77c83dfee5fa8c19b1aa09409416c2; Core 45891063227 / Release 45891063118 passed on 853e378895f610ac57d6e88183e7aa0fe71fc628; artifact 15151368074. Pinned TLS tests passed.
 - PR #30 merged f35a44e8e0ca65305352f1235c3f804a3f64b8ef; Core 45891965090 / Release 45891965044 passed on d5ec24bc5cccb06c18f8d9c1a63f1de3063ee90e; artifact 15151987156. Target enrollment and v6 migration passed hosted CI.
-- P16c.2e proposed RouterId-bound version and UM6 account read, seven new regression cases; CI pending. Live qualification, rotation and remote creation remain open.
+- PR #31 merged 047244bf790d4b68933eff08c3a9ea7f5a2b0674; Core 45893687775 / Release 45893687849 passed on c43b3e6a853ae8030a786826bed25596c37cc8a7; artifact 15153011623. RouterId-bound reads passed hosted CI.
+- P16c.3a proposed schema v7 bound creation intent, seven additional regression cases including v6 migration; CI pending. Remote profile verification, protected voucher credentials and dispatch remain open.
 - P10 remaining: restore UI and RBAC, managed crash cleanup, real cross-account/device validation, full audit coverage/actor attribution, retention and scheduling. No production restore.
 - P01 deeper per-feature audit; physical Windows, RouterOS, printers; hard-kill, power-loss and disk-full tests pending. main remains unprotected; exact-head manual gate enforced. No production DB or real router changes.
 

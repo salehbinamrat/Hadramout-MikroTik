@@ -541,6 +541,103 @@ public sealed class DatabaseDurabilityTests
         return System.Security.Cryptography.X509Certificates.X509CertificateLoader.LoadCertificate(issued.RawData);
     }
 
+    [Fact]
+    public void BoundCreationIntentPersistsExactProfileAndOneShotClaim()
+    {
+        using var file = new TestFile();
+        Guid id = SeedReservation(file.Path, BackendKind.UserManager6);
+        var journal = new UserManager6CreateJournal(file.Path);
+        var entry = journal.Prepare(id, "admin");
+        Assert.Throws<InvalidOperationException>(() => journal.PrepareBoundIntent(id, "owner", "remote-day"));
+        Assert.False(journal.TryBeginBoundDispatch(id));
+        EnrollIntentTarget(file.Path, entry.RouterId);
+        journal.PrepareBoundIntent(id, "owner", "remote-day");
+        var reopened = new UserManager6CreateJournal(file.Path);
+        var intent = reopened.ReadBoundIntent(id);
+        Assert.NotNull(intent);
+        Assert.Equal("day", intent.PlanName);
+        Assert.Equal("owner", intent.ProfileOwner);
+        Assert.Equal("remote-day", intent.ProfileName);
+        Assert.Equal(new string('A',64), intent.LeafSha256);
+        Assert.Throws<SqliteException>(() => reopened.PrepareBoundIntent(id, "owner", "other"));
+        Assert.False(reopened.TryBeginDispatch(id));
+        Assert.True(reopened.TryBeginBoundDispatch(id));
+        Assert.False(reopened.TryBeginBoundDispatch(id));
+        Assert.True(reopened.TryMarkIndeterminate(id));
+        Assert.False(reopened.TryBeginBoundDispatch(id));
+        Assert.Equal(intent, reopened.ReadBoundIntent(id));
+    }
+
+    [Theory]
+    [InlineData("username")]
+    [InlineData("plan")]
+    [InlineData("backend")]
+    public void BoundCreationClaimRejectsLocalDrift(string condition)
+    {
+        using var file = new TestFile();
+        Guid id = SeedReservation(file.Path, BackendKind.UserManager6);
+        var journal = new UserManager6CreateJournal(file.Path);
+        var entry = journal.Prepare(id, "admin");
+        EnrollIntentTarget(file.Path, entry.RouterId);
+        journal.PrepareBoundIntent(id, "admin", "day");
+        using (var c = DatabaseStore.OpenExisting(file.Path))
+            Execute(c, condition switch
+            {
+                "username" => "UPDATE voucher_reservations SET Username='002';",
+                "plan" => "UPDATE plans SET Name='changed';",
+                "backend" => "UPDATE backends SET Kind=1;",
+                _ => throw new InvalidOperationException()
+            });
+        Assert.False(journal.TryBeginBoundDispatch(id));
+        Assert.False(journal.TryBeginDispatch(id));
+        Assert.Equal(UserManager6CreateState.Prepared, journal.Read(id)!.State);
+    }
+
+    [Fact]
+    public void BoundCreationIntentCannotBeReplacedOrDeleted()
+    {
+        using var file = new TestFile();
+        Guid id = SeedReservation(file.Path, BackendKind.UserManager6);
+        var journal = new UserManager6CreateJournal(file.Path);
+        var entry = journal.Prepare(id, "admin");
+        EnrollIntentTarget(file.Path, entry.RouterId);
+        journal.PrepareBoundIntent(id, "admin", "day");
+        using var c = DatabaseStore.OpenExisting(file.Path);
+        Assert.Throws<SqliteException>(() => Execute(c, "UPDATE um6_create_intents SET ProfileName='other';"));
+        Assert.Throws<SqliteException>(() => Execute(c, "DELETE FROM um6_create_intents;"));
+        Assert.Throws<SqliteException>(() => Execute(c, "INSERT OR REPLACE INTO um6_create_intents SELECT * FROM um6_create_intents;"));
+        Assert.Equal("day", journal.ReadBoundIntent(id)!.ProfileName);
+    }
+
+    [Fact]
+    public void RestoreRejectsMissingOrDifferentBoundIntentEvenWhenJournalMatches()
+    {
+        using var file = new TestFile();
+        using var candidate = new TestFile();
+        Guid id = SeedReservation(file.Path, BackendKind.UserManager6);
+        var journal = new UserManager6CreateJournal(file.Path);
+        var entry = journal.Prepare(id, "admin");
+        EnrollIntentTarget(file.Path, entry.RouterId);
+        DatabaseBackup.Create(file.Path, candidate.Path);
+        journal.PrepareBoundIntent(id, "admin", "day");
+        UserManager6CreateJournal.RequireEquivalentForRestore(file.Path, candidate.Path);
+        Assert.Throws<InvalidOperationException>(() =>
+            UserManager6CreateJournal.RequireEquivalentIntentsForRestore(file.Path, candidate.Path));
+        new UserManager6CreateJournal(candidate.Path).PrepareBoundIntent(id, "admin", "other");
+        Assert.Throws<InvalidOperationException>(() =>
+            UserManager6CreateJournal.RequireEquivalentIntentsForRestore(file.Path, candidate.Path));
+        using var identical = new TestFile();
+        DatabaseBackup.Create(file.Path, identical.Path);
+        UserManager6CreateJournal.RequireEquivalentIntentsForRestore(file.Path, identical.Path);
+    }
+
+    private static void EnrollIntentTarget(string path, Guid routerId)
+    {
+        using var ca = CreateEnrollmentCa();
+        new RouterTargetStore(path).Enroll(routerId, "router.test", 8729, "router.test",
+            new string('A',64), ca.RawData);
+    }
+
     internal static Guid SeedReservation(string path, BackendKind kind)
     {
         using var c = DatabaseStore.Open(path);
@@ -563,13 +660,14 @@ public sealed class DatabaseDurabilityTests
     // guard in sync with new migrations; never silently leave a newer table behind.
     internal static void RecreateLegacyFixture(SqliteConnection c, int version)
     {
-        if (version is < 1 or > 5) throw new ArgumentOutOfRangeException(nameof(version));
-        Assert.Equal(6, DatabaseStore.CurrentSchemaVersion);
-        Assert.Equal(6L, Scalar(c, "PRAGMA user_version;"));
+        if (version is < 1 or > 6) throw new ArgumentOutOfRangeException(nameof(version));
+        Assert.Equal(7, DatabaseStore.CurrentSchemaVersion);
+        Assert.Equal(7L, Scalar(c, "PRAGMA user_version;"));
         using var tx = c.BeginTransaction(deferred: false);
         using var cmd = c.CreateCommand();
         cmd.Transaction = tx;
-        cmd.CommandText = "DROP TABLE router_targets;";
+        cmd.CommandText = "DROP TABLE um6_create_intents;";
+        if (version < 6) cmd.CommandText += " DROP TABLE router_targets;";
         if (version < 5) cmd.CommandText += " DROP TABLE um6_create_journal;";
         if (version < 4) cmd.CommandText += " DROP TABLE audit_events;";
         if (version < 3) cmd.CommandText += " DROP TABLE router_credentials;";
@@ -581,7 +679,7 @@ public sealed class DatabaseDurabilityTests
 
         cmd.Transaction = null;
         cmd.CommandText = "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%';";
-        Assert.Equal(version == 5 ? 9L : version == 4 ? 8L : version == 3 ? 7L : 6L, (long)cmd.ExecuteScalar()!);
+        Assert.Equal(version == 6 ? 10L : version == 5 ? 9L : version == 4 ? 8L : version == 3 ? 7L : 6L, (long)cmd.ExecuteScalar()!);
         Assert.Equal((long)version, Scalar(c, "PRAGMA user_version;"));
     }
 
@@ -591,6 +689,7 @@ public sealed class DatabaseDurabilityTests
     [InlineData(3)]
     [InlineData(4)]
     [InlineData(5)]
+    [InlineData(6)]
     public void EveryLegacyFixtureHasOnlyItsOwnSchemaAndUpgrades(int version)
     {
         using var file = new TestFile();
