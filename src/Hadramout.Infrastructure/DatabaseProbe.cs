@@ -1,23 +1,35 @@
 using Hadramout.Core;
-using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 
 namespace Hadramout.Infrastructure;
 
-// Only a disposable, in-memory compatibility check. Never opens user data.
+// Disposable on-disk test of actual migrations, native provider and reopen.
+// Never opens user data.
 public static class DatabaseProbe
 {
     public static bool Verify()
     {
-        using var connection = new SqliteConnection("Data Source=:memory:;Foreign Keys=True;Pooling=False");
-        connection.Open();
-        var options = new DbContextOptionsBuilder<NetworkDbContext>().UseSqlite(connection).Options;
-        using var db = new NetworkDbContext(options);
-        db.Database.EnsureCreated();
-        var site = new Site { Name = "compatibility-probe" };
-        db.Sites.Add(site);
-        db.SaveChanges();
-        db.ChangeTracker.Clear();
-        return db.Sites.Single().Id == site.Id;
+        var directory = Directory.CreateTempSubdirectory("hadramout-probe-");
+        var path = Path.Combine(directory.FullName, "probe.db");
+        try
+        {
+            var site = new Site { Name = "compatibility-probe" };
+            using (var connection = DatabaseStore.Open(path))
+            using (var db = new NetworkDbContext(new DbContextOptionsBuilder<NetworkDbContext>()
+                .UseSqlite(connection).Options))
+            {
+                db.Sites.Add(site);
+                db.SaveChanges();
+            }
+
+            using var reopened = DatabaseStore.Open(path);
+            using var readDb = new NetworkDbContext(new DbContextOptionsBuilder<NetworkDbContext>()
+                .UseSqlite(reopened).Options);
+            return readDb.Sites.Single().Id == site.Id;
+        }
+        finally
+        {
+            directory.Delete(recursive: true);
+        }
     }
 }
