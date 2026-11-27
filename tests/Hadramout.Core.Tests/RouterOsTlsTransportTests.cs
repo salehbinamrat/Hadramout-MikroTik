@@ -1624,6 +1624,130 @@ public sealed class RouterOsTlsTransportTests(ITestOutputHelper output)
         finally { directory.Delete(recursive: true); }
     }
 
+    [Theory]
+    [InlineData("started")]
+    [InlineData("indeterminate")]
+    [InlineData("legacy-ack")]
+    [InlineData("ack")]
+    [InlineData("bare-observed")]
+    [InlineData("absent")]
+    [InlineData("mismatch")]
+    [InlineData("wrong-marker")]
+    [InlineData("enabled")]
+    [InlineData("local-change")]
+    [SupportedOSPlatform("windows")]
+    public async Task BoundCreationRecoveryReadsExactDisabledIdentityWithoutChangingJournal(string condition)
+    {
+        using var certificates = new Certificates();
+        using var server = new LoopbackServer(certificates.Leaf, certificates.Root, output);
+        var directory = Directory.CreateTempSubdirectory("hadramout-recovery-");
+        try
+        {
+            string path = Path.Combine(directory.FullName, "test.db");
+            Guid id = PreparePreflightFixture(path, server.Port, certificates, true);
+            var journal = new UserManager6CreateJournal(path);
+            Assert.True(journal.TryBeginBoundDispatch(id));
+            if (condition == "indeterminate") Assert.True(journal.TryMarkIndeterminate(id));
+            else if (condition == "legacy-ack") Assert.True(journal.TryMarkAcknowledged(id));
+            else if (condition != "started")
+            {
+                Assert.True(journal.TryRecordAcknowledgement(id, new(UserManager6CreateWireOutcome.Acknowledged,
+                    condition == "bare-observed" ? null : "*1")));
+                if (condition == "bare-observed") journal.RecordDisabledObservation(id, new("*1", false));
+            }
+            var prior = journal.ReadBoundRecoveryScope(id);
+            Task serve = server.RunAsync(reply: true, handler: async (tls, token) =>
+            {
+                await PrepareProbePeerAsync(tls, token, "6.49.19");
+                byte[][] request = await RouterOsWireCodec.ReadSentenceAsync(tls, token);
+                Assert.Equal(new[] { "/tool/user-manager/user/print",
+                    "=.proplist=.id,customer,username,disabled,comment", "?username=001" },
+                    request.Select(word => Encoding.UTF8.GetString(word)).ToArray());
+                if (condition != "absent")
+                {
+                    ReadOnlyMemory<byte>[] row = ["!re"u8.ToArray(),
+                        condition == "mismatch" ? "=.id=*2"u8.ToArray() : "=.id=*1"u8.ToArray(),
+                        "=customer=admin"u8.ToArray(), "=username=001"u8.ToArray(),
+                        condition == "enabled" ? "=disabled=no"u8.ToArray() : "=disabled=yes"u8.ToArray(),
+                        Encoding.UTF8.GetBytes("=comment=" + (condition == "wrong-marker" ? "different" : "hmk-create:" + id.ToString("N")))];
+                    await RouterOsWireCodec.WriteSentenceAsync(tls, row, token);
+                    if (condition is "mismatch" or "wrong-marker" or "enabled") return;
+                }
+                if (condition == "local-change") journal.RecordDisabledObservation(id, new("*1", true));
+                await RouterOsWireCodec.WriteSentenceAsync(tls, ["!done"u8.ToArray()], token);
+                Assert.Equal(0, await tls.ReadAsync(new byte[1], token));
+            });
+            try
+            {
+                if (condition is "mismatch" or "wrong-marker" or "enabled")
+                    await Assert.ThrowsAsync<InvalidDataException>(() => RouterOsReadRecovery.ReadBoundUm6RecoveryAsync(path, id));
+                else if (condition == "local-change")
+                    await Assert.ThrowsAsync<InvalidOperationException>(() => RouterOsReadRecovery.ReadBoundUm6RecoveryAsync(path, id));
+                else
+                {
+                    var result = await RouterOsReadRecovery.ReadBoundUm6RecoveryAsync(path, id);
+                    Assert.Equal(prior, result.Scope);
+                    if (condition == "absent") Assert.Null(result.VisibleDisabledAccount);
+                    else
+                    {
+                        Assert.NotNull(result.VisibleDisabledAccount);
+                        Assert.Equal("*1", result.VisibleDisabledAccount.RemoteId);
+                        Assert.Equal(prior.ExpectedRemoteId is not null, result.VisibleDisabledAccount.ReturnedIdMatched);
+                    }
+                }
+                if (condition != "local-change") Assert.Equal(prior, journal.ReadBoundRecoveryScope(id));
+                Assert.Equal(prior.State, journal.Read(id)!.State);
+                Assert.False(journal.TryBeginBoundDispatch(id));
+            }
+            finally { await serve; }
+            Assert.False(server.HasPendingConnection);
+        }
+        finally { directory.Delete(recursive: true); }
+    }
+
+    [Theory]
+    [InlineData("prepared")]
+    [InlineData("changed-plan")]
+    [InlineData("unbound")]
+    [SupportedOSPlatform("windows")]
+    public async Task BoundCreationRecoveryRejectsIneligibleLocalScopeBeforeConnecting(string condition)
+    {
+        using var certificates = new Certificates();
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        int port = ((IPEndPoint)listener.LocalEndpoint).Port;
+        var directory = Directory.CreateTempSubdirectory("hadramout-recovery-local-");
+        try
+        {
+            string path = Path.Combine(directory.FullName, "test.db");
+            var journal = new UserManager6CreateJournal(path);
+            Guid id;
+            if (condition == "unbound")
+            {
+                id = DatabaseDurabilityTests.SeedReservation(path, BackendKind.UserManager6);
+                journal.Prepare(id, "admin");
+                Assert.True(journal.TryBeginDispatch(id));
+            }
+            else
+            {
+                id = PreparePreflightFixture(path, port, certificates, true);
+                if (condition == "changed-plan")
+                {
+                    Assert.True(journal.TryBeginBoundDispatch(id));
+                    using var db = DatabaseStore.OpenExisting(path);
+                    using var cmd = db.CreateCommand();
+                    cmd.CommandText = "UPDATE plans SET Name='changed';";
+                    cmd.ExecuteNonQuery();
+                }
+            }
+            var prior = journal.Read(id);
+            await Assert.ThrowsAsync<InvalidOperationException>(() => RouterOsReadRecovery.ReadBoundUm6RecoveryAsync(path, id));
+            Assert.False(listener.Pending());
+            Assert.Equal(prior, journal.Read(id));
+        }
+        finally { directory.Delete(recursive: true); }
+    }
+
     [SupportedOSPlatform("windows")]
     private static Guid PreparePreflightFixture(string path, int port, Certificates certificates, bool saveSecret)
     {

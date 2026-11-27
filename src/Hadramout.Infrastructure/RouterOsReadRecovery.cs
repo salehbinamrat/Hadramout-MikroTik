@@ -118,6 +118,25 @@ internal static class RouterOsReadRecovery
             cancellationToken, requiredPin: scope.LeafSha256);
     }
 
+    // Read-only recovery; no mutation, no inferred acknowledgement and no replay.
+    // Caller must hold the managed generation and quiesce creation/configuration changes.
+    [SupportedOSPlatform("windows")]
+    internal static async Task<UserManager6RecoveryObservation> ReadBoundUm6RecoveryAsync(
+        string databasePath, Guid reservationId, TimeSpan? timeout = null,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var journal = new UserManager6CreateJournal(databasePath);
+        var scope = journal.ReadBoundRecoveryScope(reservationId);
+        var observed = await ReadBoundAsync(databasePath, scope.RouterId, timeout,
+            (session, token) => session.ReadUm6RecoveryObservationAsync(scope, timeout, token),
+            cancellationToken, requiredPin: scope.LeafSha256).ConfigureAwait(false);
+        cancellationToken.ThrowIfCancellationRequested();
+        if (journal.ReadBoundRecoveryScope(reservationId) != scope)
+            throw new InvalidOperationException("Local creation evidence changed during review.");
+        return new(scope, observed);
+    }
+
     [SupportedOSPlatform("windows")]
     private static async Task<T> ReadBoundAsync<T>(string databasePath, Guid routerId, TimeSpan? timeout,
         Func<RouterOsSession, CancellationToken, Task<T>> operation, CancellationToken cancellationToken,
