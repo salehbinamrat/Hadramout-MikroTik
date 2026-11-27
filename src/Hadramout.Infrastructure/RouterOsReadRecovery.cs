@@ -164,6 +164,19 @@ internal static class RouterOsReadRecovery
     }
 
     [SupportedOSPlatform("windows")]
+    internal static Task<UserManager7CreatePreflightEvidence> ReadBoundUserManager7CreationPreflightAsync(
+        string databasePath, Guid routerId, string username, string profileName, string groupName,
+        TimeSpan? timeout = null, CancellationToken cancellationToken = default)
+    {
+        UserManager6Records.ValidateKey(username, nameof(username));
+        UserManager6Records.ValidateKey(profileName, nameof(profileName));
+        UserManager6Records.ValidateKey(groupName, nameof(groupName));
+        return ReadBoundAsync(databasePath, routerId, timeout,
+            (session, token) => session.ReadUserManager7CreationPreflightAsync(
+                username, profileName, groupName, timeout, token), cancellationToken);
+    }
+
+    [SupportedOSPlatform("windows")]
     internal static Task<UserManager7ProfileMappingEvidence?> ReadBoundUserManager7ProfileMappingAsync(
         string databasePath, Guid routerId, string name, TimeSpan? timeout = null,
         CancellationToken cancellationToken = default)
