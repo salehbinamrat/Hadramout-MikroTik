@@ -26,8 +26,62 @@ internal sealed record UserManager7AssignmentEvidence(UserManager7Account Accoun
         VisibleAssignments.Count(row => row.State == UserManager7AssignmentState.ActiveReported) > 1;
 }
 
+internal sealed record UserManager7Profile(string RemoteId, string Name, string? ValidityRaw,
+    string? StartsWhenRaw, string? OverrideSharedUsersRaw);
+internal sealed record UserManager7ProfileLink(string RemoteId, string ProfileName, string LimitationName,
+    string? FromTimeRaw, string? TillTimeRaw, string? WeekdaysRaw);
+internal sealed record UserManager7ProfileMappingEvidence(UserManager7Profile Profile,
+    IReadOnlyList<UserManager7ProfileLink> VisibleLinks);
+internal sealed record UserManager7Limitation(string RemoteId, string Name,
+    string? DownloadLimitRaw, string? UploadLimitRaw, string? TransferLimitRaw,
+    string? UptimeLimitRaw, string? RateLimitRxRaw, string? RateLimitTxRaw,
+    string? ResetIntervalRaw, string? ResetStartRaw);
+
 internal static class UserManager7Records
 {
+    private static string ExactKey(byte[][] words, string field, string? expected = null)
+    {
+        string? value = UserManager6Records.ReadText(words, field, 128);
+        if (value is null || (expected is not null && value != expected))
+            throw new InvalidDataException("User Manager v7 definition identity does not match.");
+        try { UserManager6Records.ValidateKey(value, field); }
+        catch (ArgumentException) { throw new InvalidDataException("Invalid User Manager v7 definition identity."); }
+        return value;
+    }
+
+    private static string RemoteId(byte[][] words)
+    {
+        string? id = UserManager6Records.ReadText(words, ".id", 33);
+        if (!UserManager6Records.IsOpaqueRemoteId(id))
+            throw new InvalidDataException("Invalid User Manager v7 definition remote identity.");
+        return id!;
+    }
+
+    internal static UserManager7Profile ParseProfile(byte[][] words, string name) =>
+        new(RemoteId(words), ExactKey(words, "name", name),
+            UserManager6Records.ReadText(words, "validity", 128),
+            UserManager6Records.ReadText(words, "starts-when", 64),
+            UserManager6Records.ReadText(words, "override-shared-users", 64));
+
+    internal static UserManager7ProfileLink ParseProfileLink(byte[][] words, string name) =>
+        new(RemoteId(words), ExactKey(words, "profile", name), ExactKey(words, "limitation"),
+            UserManager6Records.ReadText(words, "from-time", 128),
+            UserManager6Records.ReadText(words, "till-time", 128),
+            UserManager6Records.ReadText(words, "weekdays", 128));
+
+    // Keep zero, missing, unlimited and unrecognized formats distinct. Never
+    // calculate effective allowances or reverse RX/TX based on guesses.
+    internal static UserManager7Limitation ParseLimitation(byte[][] words, string name) =>
+        new(RemoteId(words), ExactKey(words, "name", name),
+            UserManager6Records.ReadText(words, "download-limit", 64),
+            UserManager6Records.ReadText(words, "upload-limit", 64),
+            UserManager6Records.ReadText(words, "transfer-limit", 64),
+            UserManager6Records.ReadText(words, "uptime-limit", 128),
+            UserManager6Records.ReadText(words, "rate-limit-rx", 128),
+            UserManager6Records.ReadText(words, "rate-limit-tx", 128),
+            UserManager6Records.ReadText(words, "reset-counters-interval", 64),
+            UserManager6Records.ReadText(words, "reset-counters-start-time", 128));
+
     internal static UserManager7Assignment ParseAssignment(byte[][] words, string username)
     {
         string? user = UserManager6Records.ReadText(words, "user", 128);

@@ -1330,6 +1330,142 @@ public sealed class RouterOsTlsTransportTests(ITestOutputHelper output)
         Assert.False(server.HasPendingConnection);
     }
 
+    [Theory]
+    [InlineData("multiple")]
+    [InlineData("empty")]
+    [InlineData("absent")]
+    [InlineData("wrong-profile")]
+    [InlineData("duplicate-id")]
+    [InlineData("drift")]
+    [InlineData("limit")]
+    [InlineData("v6")]
+    public async Task UserManager7ProfileMappingRejectsUnsafeScopeAndPreservesSchedules(string condition)
+    {
+        using var certificates = new Certificates();
+        using var server = new LoopbackServer(certificates.Leaf, certificates.Root, output);
+        Task serve = server.RunAsync(reply: true, handler: async (tls, token) =>
+        {
+            await PrepareProbePeerAsync(tls, token, condition == "v6" ? "6.49.19" : "7.21.1");
+            if (condition == "v6") { Assert.Equal(0, await tls.ReadAsync(new byte[1], token)); return; }
+            async Task Profile(bool second)
+            {
+                var request = await RouterOsWireCodec.ReadSentenceAsync(tls, token);
+                Assert.Equal(new[] { "/user-manager/profile/print",
+                    "=.proplist=.id,name,validity,starts-when,override-shared-users", "?name=day" },
+                    request.Select(word => Encoding.UTF8.GetString(word)).ToArray());
+                if (condition != "absent")
+                    await RouterOsWireCodec.WriteSentenceAsync(tls, ["!re"u8.ToArray(), "=.id=*1"u8.ToArray(),
+                        "=name=day"u8.ToArray(), second && condition == "drift" ? "=validity=2d"u8.ToArray() : "=validity=unlimited"u8.ToArray(),
+                        "=starts-when=first-auth"u8.ToArray()], token);
+                await RouterOsWireCodec.WriteSentenceAsync(tls, ["!done"u8.ToArray()], token);
+            }
+            await Profile(false);
+            if (condition == "absent") { Assert.Equal(0, await tls.ReadAsync(new byte[1], token)); return; }
+            var request = await RouterOsWireCodec.ReadSentenceAsync(tls, token);
+            Assert.Equal(new[] { "/user-manager/profile-limitation/print",
+                "=.proplist=.id,profile,limitation,from-time,till-time,weekdays", "?profile=day" },
+                request.Select(word => Encoding.UTF8.GetString(word)).ToArray());
+            int count = condition switch { "empty" => 0, "multiple" or "duplicate-id" => 2, "limit" => 33, _ => 1 };
+            for (int i = 0; i < count; i++)
+                await RouterOsWireCodec.WriteSentenceAsync(tls, ["!re"u8.ToArray(),
+                    Encoding.ASCII.GetBytes("=.id=" + (condition == "duplicate-id" ? "*A" : "*" + (i+10).ToString("X", System.Globalization.CultureInfo.InvariantCulture))),
+                    condition == "wrong-profile" ? "=profile=other"u8.ToArray() : "=profile=day"u8.ToArray(),
+                    "=limitation=quota"u8.ToArray(), "=from-time=00:00:00"u8.ToArray(),
+                    "=till-time=23:59:59"u8.ToArray(), "=weekdays=monday"u8.ToArray()], token);
+            if (condition is "wrong-profile" or "duplicate-id" or "limit") return;
+            await RouterOsWireCodec.WriteSentenceAsync(tls, ["!done"u8.ToArray()], token);
+            await Profile(true);
+            Assert.Equal(0, await tls.ReadAsync(new byte[1], token));
+        });
+        async Task<UserManager7ProfileMappingEvidence?> Read()
+        {
+            using var session = await RouterOsSession.ConnectAsync("127.0.0.1", "router.test",
+                "synthetic-user"u8.ToArray(), "synthetic-private-password"u8.ToArray(), server.Port,
+                trustedRootDer: certificates.Root.RawData);
+            return await session.ReadUserManager7ProfileMappingAsync("day");
+        }
+        try
+        {
+            if (condition == "v6") await Assert.ThrowsAsync<NotSupportedException>(Read);
+            else if (condition == "absent") Assert.Null(await Read());
+            else if (condition is "empty" or "multiple")
+            {
+                var evidence = await Read();
+                Assert.NotNull(evidence);
+                Assert.Equal("unlimited", evidence.Profile.ValidityRaw);
+                Assert.Equal("first-auth", evidence.Profile.StartsWhenRaw);
+                Assert.Null(evidence.Profile.OverrideSharedUsersRaw);
+                Assert.Equal(condition == "empty" ? 0 : 2, evidence.VisibleLinks.Count);
+                Assert.All(evidence.VisibleLinks, row =>
+                {
+                    Assert.Equal("quota", row.LimitationName);
+                    Assert.Equal("monday", row.WeekdaysRaw);
+                });
+            }
+            else await Assert.ThrowsAsync<InvalidDataException>(Read);
+        }
+        finally { await serve; }
+    }
+
+    [Theory]
+    [InlineData("present")]
+    [InlineData("absent")]
+    [InlineData("wrong-name")]
+    [InlineData("duplicate")]
+    [InlineData("v6")]
+    public async Task UserManager7LimitationPreservesRawLimitsAndRejectsWrongIdentity(string condition)
+    {
+        using var certificates = new Certificates();
+        using var server = new LoopbackServer(certificates.Leaf, certificates.Root, output);
+        Task serve = server.RunAsync(reply: true, handler: async (tls, token) =>
+        {
+            await PrepareProbePeerAsync(tls, token, condition == "v6" ? "6.49.19" : "7.21.1");
+            if (condition == "v6") { Assert.Equal(0, await tls.ReadAsync(new byte[1], token)); return; }
+            var request = await RouterOsWireCodec.ReadSentenceAsync(tls, token);
+            Assert.Equal(new[] { "/user-manager/limitation/print",
+                "=.proplist=.id,name,download-limit,upload-limit,transfer-limit,uptime-limit,rate-limit-rx,rate-limit-tx,reset-counters-interval,reset-counters-start-time",
+                "?name=quota" }, request.Select(word => Encoding.UTF8.GetString(word)).ToArray());
+            if (condition != "absent")
+            {
+                ReadOnlyMemory<byte>[] row = ["!re"u8.ToArray(), "=.id=*1"u8.ToArray(),
+                    condition == "wrong-name" ? "=name=other"u8.ToArray() : "=name=quota"u8.ToArray(),
+                    "=download-limit=0"u8.ToArray(), "=transfer-limit=4294967296"u8.ToArray(),
+                    "=uptime-limit=1d"u8.ToArray(), "=rate-limit-rx=256k"u8.ToArray(),
+                    "=rate-limit-tx=3M"u8.ToArray(), "=reset-counters-interval=daily"u8.ToArray()];
+                await RouterOsWireCodec.WriteSentenceAsync(tls, row, token);
+                if (condition == "duplicate") await RouterOsWireCodec.WriteSentenceAsync(tls, row, token);
+                if (condition is "duplicate" or "wrong-name") return;
+            }
+            await RouterOsWireCodec.WriteSentenceAsync(tls, ["!done"u8.ToArray()], token);
+            Assert.Equal(0, await tls.ReadAsync(new byte[1], token));
+        });
+        async Task<UserManager7Limitation?> Read()
+        {
+            using var session = await RouterOsSession.ConnectAsync("127.0.0.1", "router.test",
+                "synthetic-user"u8.ToArray(), "synthetic-private-password"u8.ToArray(), server.Port,
+                trustedRootDer: certificates.Root.RawData);
+            return await session.FindUserManager7LimitationAsync("quota");
+        }
+        try
+        {
+            if (condition == "v6") await Assert.ThrowsAsync<NotSupportedException>(Read);
+            else if (condition == "absent") Assert.Null(await Read());
+            else if (condition == "present")
+            {
+                var result = await Read();
+                Assert.NotNull(result);
+                Assert.Equal("0", result.DownloadLimitRaw);
+                Assert.Null(result.UploadLimitRaw);
+                Assert.Equal("4294967296", result.TransferLimitRaw);
+                Assert.Equal("256k", result.RateLimitRxRaw);
+                Assert.Equal("3M", result.RateLimitTxRaw);
+                Assert.Equal("daily", result.ResetIntervalRaw);
+            }
+            else await Assert.ThrowsAsync<InvalidDataException>(Read);
+        }
+        finally { await serve; }
+    }
+
     [Fact]
     public async Task UserManager6LookupNeverSendsLegacyMenuToV7()
     {

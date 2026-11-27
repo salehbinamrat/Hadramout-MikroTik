@@ -187,6 +187,63 @@ internal sealed class RouterOsSession : IDisposable
         }, timeout, cancellationToken);
     }
 
+    internal Task<UserManager7ProfileMappingEvidence?> ReadUserManager7ProfileMappingAsync(string name,
+        TimeSpan? timeout = null, CancellationToken cancellationToken = default)
+    {
+        UserManager6Records.ValidateKey(name, nameof(name));
+        return WithReadSessionAsync<UserManager7ProfileMappingEvidence?>(async (stream, token) =>
+        {
+            await RequireUserManager7FamilyAsync(stream, token).ConfigureAwait(false);
+            var profile = await ReadUm7ProfileCoreAsync(stream, name, token).ConfigureAwait(false);
+            if (profile is null) return null;
+            var ids = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var links = await ReadCommandAsync(stream,
+                ["/user-manager/profile-limitation/print"u8.ToArray(),
+                    "=.proplist=.id,profile,limitation,from-time,till-time,weekdays"u8.ToArray(),
+                    UserManager6Records.Query("profile", name)],
+                words =>
+                {
+                    var row = UserManager7Records.ParseProfileLink(words, name);
+                    if (!ids.Add(row.RemoteId))
+                        throw new InvalidDataException("Duplicate User Manager v7 profile limitation identity.");
+                    return row;
+                }, 32, token).ConfigureAwait(false);
+            if (await ReadUm7ProfileCoreAsync(stream, name, token).ConfigureAwait(false) != profile)
+                throw new InvalidDataException("User Manager v7 profile changed during mapping read.");
+            token.ThrowIfCancellationRequested();
+            return new(profile, links);
+        }, timeout, cancellationToken);
+    }
+
+    private static async Task<UserManager7Profile?> ReadUm7ProfileCoreAsync(Stream stream,
+        string name, CancellationToken token)
+    {
+        var rows = await ReadCommandAsync(stream,
+            ["/user-manager/profile/print"u8.ToArray(),
+                "=.proplist=.id,name,validity,starts-when,override-shared-users"u8.ToArray(),
+                UserManager6Records.Query("name", name)],
+            words => UserManager7Records.ParseProfile(words, name), 1, token).ConfigureAwait(false);
+        token.ThrowIfCancellationRequested();
+        return rows.Count == 0 ? null : rows[0];
+    }
+
+    internal Task<UserManager7Limitation?> FindUserManager7LimitationAsync(string name,
+        TimeSpan? timeout = null, CancellationToken cancellationToken = default)
+    {
+        UserManager6Records.ValidateKey(name, nameof(name));
+        return WithReadSessionAsync<UserManager7Limitation?>(async (stream, token) =>
+        {
+            await RequireUserManager7FamilyAsync(stream, token).ConfigureAwait(false);
+            var rows = await ReadCommandAsync(stream,
+                ["/user-manager/limitation/print"u8.ToArray(),
+                    "=.proplist=.id,name,download-limit,upload-limit,transfer-limit,uptime-limit,rate-limit-rx,rate-limit-tx,reset-counters-interval,reset-counters-start-time"u8.ToArray(),
+                    UserManager6Records.Query("name", name)],
+                words => UserManager7Records.ParseLimitation(words, name), 1, token).ConfigureAwait(false);
+            token.ThrowIfCancellationRequested();
+            return rows.Count == 0 ? null : rows[0];
+        }, timeout, cancellationToken);
+    }
+
     private static async Task RequireUserManager7FamilyAsync(Stream stream, CancellationToken token)
     {
         string version = await ReadVersionCoreAsync(stream, token).ConfigureAwait(false);
