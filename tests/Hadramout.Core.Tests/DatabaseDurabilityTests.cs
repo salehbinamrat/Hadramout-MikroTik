@@ -1,5 +1,6 @@
 using System.Runtime.Versioning;
 using System.Security.Cryptography;
+using System.Text;
 using Hadramout.Core;
 using Hadramout.Infrastructure;
 using Microsoft.Data.Sqlite;
@@ -732,6 +733,120 @@ public sealed class DatabaseDurabilityTests
         using var identical = new TestFile();
         DatabaseBackup.Create(file.Path, identical.Path);
         UserManager6VoucherSecretStore.RequireEquivalentForRestore(file.Path, identical.Path);
+    }
+
+    [Theory]
+    [InlineData("ack", 3, 4, 3, 4)]
+    [InlineData("trap", 3, 3, 4, 4)]
+    [InlineData("eof", 3, 3, 4, 4)]
+    [InlineData("missing-profile", 1, 1, 0, 2)]
+    [InlineData("existing", 2, 1, 1, 3)]
+    [InlineData("lost-claim", 3, 2, 2, 3)]
+    [SupportedOSPlatform("windows")]
+    public async Task QualifiedCreationCoordinatesPreflightClaimAndResult(string condition, int completedReads,
+        int stateValue, int outcomeValue, int commands)
+    {
+        var expectedState = (UserManager6CreateState)stateValue;
+        var expectedOutcome = (UserManager6CoordinationOutcome)outcomeValue;
+        using var file = new TestFile();
+        Guid id = SeedSecretIntent(file.Path);
+        new UserManager6VoucherSecretStore(file.Path).Save(id, "synthetic-voucher"u8);
+        var journal = new UserManager6CreateJournal(file.Path);
+        using var replies = new MemoryStream();
+        await WriteReplyAsync(replies, "!re", "=version=6.49.19");
+        await WriteReplyAsync(replies, "!done");
+        if (completedReads >= 2 || condition != "missing-profile")
+            await WriteReplyAsync(replies, "!re", "=owner=admin", "=name=day");
+        await WriteReplyAsync(replies, "!done");
+        if (condition != "missing-profile")
+        {
+            if (condition == "existing") await WriteReplyAsync(replies, "!re", "=customer=other", "=username=001");
+            await WriteReplyAsync(replies, "!done");
+        }
+        if (condition == "ack") await WriteReplyAsync(replies, "!done", "=ret=*1");
+        if (condition == "trap") await WriteReplyAsync(replies, "!trap", "=message=synthetic");
+
+        // Observe the durable state at the actual start of add-command transmission.
+        // Inject a competing claim just as the username lookup is sent.
+        using var stream = new QualificationExchange(replies.ToArray(), word =>
+        {
+            if (word == "/tool/user-manager/user/print" && condition == "lost-claim")
+                Assert.True(journal.TryBeginBoundDispatch(id));
+            if (word == "/tool/user-manager/user/add")
+                Assert.Equal(UserManager6CreateState.DispatchStarted, journal.Read(id)!.State);
+        });
+        var outcome = await UserManager6CreateCoordinator.ExecuteForQualificationAsync(file.Path, id, stream);
+        Assert.Equal(expectedOutcome, outcome);
+        Assert.Equal(expectedState, journal.Read(id)!.State);
+        using var sent = new MemoryStream(stream.ToArray());
+        var recorded = new List<string[]>();
+        while (sent.Position != sent.Length)
+            recorded.Add((await RouterOsWireCodec.ReadSentenceAsync(sent, CancellationToken.None))
+                .Select(word => Encoding.UTF8.GetString(word)).ToArray());
+        Assert.Equal(commands, recorded.Count);
+        Assert.Equal("/system/resource/print", recorded[0][0]);
+        Assert.Equal("/tool/user-manager/profile/print", recorded[1][0]);
+        if (commands >= 3) Assert.Equal("/tool/user-manager/user/print", recorded[2][0]);
+        if (commands == 4)
+        {
+            Assert.Equal(new[] { "/tool/user-manager/user/add", "=customer=admin", "=username=001",
+                "=password=synthetic-voucher", "=disabled=yes", "=comment=hmk-create:" + id.ToString("N") }, recorded[3]);
+        }
+        if (expectedState != UserManager6CreateState.Prepared)
+        {
+            long length = stream.Length;
+            await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                UserManager6CreateCoordinator.ExecuteForQualificationAsync(file.Path, id, stream));
+            Assert.Equal(length, stream.Length);
+        }
+    }
+
+    [Theory]
+    [InlineData("malformed")]
+    [InlineData("control")]
+    [SupportedOSPlatform("windows")]
+    public void ClaimRejectsNonTransmittablePasswordWithoutConsumingReservation(string condition)
+    {
+        using var file = new TestFile();
+        Guid id = SeedSecretIntent(file.Path);
+        new UserManager6VoucherSecretStore(file.Path).Save(id, condition == "malformed" ? new byte[] { 255 } : new byte[] { 0 });
+        var journal = new UserManager6CreateJournal(file.Path);
+        Assert.Throws<ArgumentException>(() => journal.TryBeginBoundDispatch(id));
+        Assert.Equal(UserManager6CreateState.Prepared, journal.Read(id)!.State);
+    }
+
+    [Fact]
+    [SupportedOSPlatform("windows")]
+    public async Task QualifiedCreationInterruptedBeforePreflightCompletionNeverClaims()
+    {
+        using var file = new TestFile();
+        Guid id = SeedSecretIntent(file.Path);
+        new UserManager6VoucherSecretStore(file.Path).Save(id, "synthetic"u8);
+        using var stream = new QualificationExchange([], _ => { });
+        await Assert.ThrowsAsync<EndOfStreamException>(() =>
+            UserManager6CreateCoordinator.ExecuteForQualificationAsync(file.Path, id, stream));
+        Assert.Equal(UserManager6CreateState.Prepared, new UserManager6CreateJournal(file.Path).Read(id)!.State);
+    }
+
+    private static ValueTask WriteReplyAsync(Stream stream, params string[] words) =>
+        RouterOsWireCodec.WriteSentenceAsync(stream,
+            words.Select(word => (ReadOnlyMemory<byte>)Encoding.UTF8.GetBytes(word)).ToArray(), CancellationToken.None);
+
+    private sealed class QualificationExchange(byte[] replies, Action<string> onWord) : MemoryStream
+    {
+        private readonly MemoryStream input = new(replies);
+        public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default) =>
+            input.ReadAsync(buffer, cancellationToken);
+        public override ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            if (buffer.Span.StartsWith("/"u8)) onWord(Encoding.UTF8.GetString(buffer.Span));
+            return base.WriteAsync(buffer, cancellationToken);
+        }
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing) input.Dispose();
+            base.Dispose(disposing);
+        }
     }
 
     private static Guid SeedSecretIntent(string path)
