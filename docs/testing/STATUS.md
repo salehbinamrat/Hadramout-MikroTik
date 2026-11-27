@@ -35,7 +35,8 @@
 - PR #34 merged 7556ce873b59d587fa27f1370bb4ce0e80947d20; Core 45896808502 / Release 45896808420 passed on 41226f9a8d7d2f4446caa1b129ee1cc4ca6f738a; artifact 15153404985. Prepared preflight passed hosted CI.
 - PR #35 merged 5aef23576f884e9ed98752a9ec84627860918ef6; Core 45898079145 / Release 45898079103 passed on 5e0fd263b490a555fe1b91860587afe95495852f; artifact 15154393494. Isolated creation exchange passed hosted CI.
 - PR #36 merged a64c993782144e9336db49074ea47fb9a90163ed; Core 45899919249 / Release 45899919233 passed on c49adc8e785a1abd94414835117c4ea22623cee6; package artifact 15155766312, smoke evidence 15156080884. Qualification-only coordination and corrected smoke stages passed hosted CI; no live connector or activation.
-- P16c.3c.2b proposed isolated disabled-account readback observation and 16 synthetic regression cases; hosted CI pending. No durable confirmation or production operation.
+- PR #37 merged 3593c528f29aa8b8d5ffc5871929bbfff05deb8b; Core 45946143109 / Release 45946143154 passed on 12e384fdac64cc435e87b2f565f3c3cea82d38f7; package artifact 15175360138, smoke evidence 15174872979. Exact isolated disabled-account readback passed hosted CI.
+- P16c.3c.2c proposed schema v9 durable acknowledgement and optional same-stream disabled observation, exact restore comparison and 8 new regression cases (including legacy migration v8); hosted CI pending. No production connector, profile activation or print eligibility.
 - P10 remaining: restore UI and RBAC, managed crash cleanup, real cross-account/device validation, full audit coverage/actor attribution, retention and scheduling. No production restore.
 - P01 deeper per-feature audit; physical Windows, RouterOS, printers; hard-kill, power-loss and disk-full tests pending. main remains unprotected; exact-head manual gate enforced. No production DB or real router changes.
 

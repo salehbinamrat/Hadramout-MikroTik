@@ -14,6 +14,9 @@ internal sealed record UserManager6CreateIntent(Guid ReservationId, Guid BatchId
 internal sealed record UserManager6PreflightScope(Guid ReservationId, Guid RouterId,
     string LeafSha256, string ProfileOwner, string ProfileName, string Username, string Customer);
 
+// Null record means no durable acknowledgement; null ID is a bare acknowledgement.
+internal sealed record UserManager6StoredCreationEvidence(string? ReturnedId, string? ObservedId);
+
 internal sealed record UserManager6CreationReviewRow(UserManager6CreateEntry Entry, bool LocalIdentityMatches);
 internal sealed record UserManager6CreationReviewPage(IReadOnlyList<UserManager6CreationReviewRow> Rows,
     Guid? NextAfterReservationId);
@@ -287,6 +290,110 @@ internal sealed class UserManager6CreateJournal(string databasePath)
 
     internal bool TryMarkAcknowledged(Guid reservationId) =>
         Transition(reservationId, UserManager6CreateState.DispatchStarted, UserManager6CreateState.Acknowledged);
+
+    // Acknowledgement and its optional returned ID are committed together. Existing
+    // legacy state=4 rows are deliberately not backfilled with fabricated receipts.
+    internal bool TryRecordAcknowledgement(Guid reservationId, UserManager6CreateWireReceipt receipt)
+    {
+        ValidateId(reservationId);
+        ArgumentNullException.ThrowIfNull(receipt);
+        if (receipt.Outcome != UserManager6CreateWireOutcome.Acknowledged ||
+            (receipt.ReturnedId is not null && !UserManager6Records.IsOpaqueRemoteId(receipt.ReturnedId)))
+            throw new ArgumentException("Valid acknowledgement evidence required.", nameof(receipt));
+
+        using var c = DatabaseStore.OpenExisting(databasePath);
+        using var tx = c.BeginTransaction(deferred: false);
+        using var cmd = c.CreateCommand();
+        cmd.Transaction = tx;
+        cmd.CommandText = "UPDATE um6_create_journal SET State=4 WHERE ReservationId=$id AND State=2;";
+        cmd.Parameters.AddWithValue("$id", reservationId);
+        if (cmd.ExecuteNonQuery() != 1) return false;
+        // Trigger validates the current bound relationships and the retained secret.
+        // Failure rolls back BOTH the acknowledgement and the evidence insert.
+        InsertEvidence(c, tx, reservationId, 1, receipt.ReturnedId);
+        tx.Commit();
+        return true;
+    }
+
+    // Only a caller that completed the exact qualification read may submit this
+    // observation. The immutable acknowledgement and current local scope must agree.
+    internal void RecordDisabledObservation(Guid reservationId, UserManager6DisabledCreationObservation observation)
+    {
+        ValidateId(reservationId);
+        ArgumentNullException.ThrowIfNull(observation);
+        if (!UserManager6Records.IsOpaqueRemoteId(observation.RemoteId))
+            throw new ArgumentException("Valid observed identity required.", nameof(observation));
+        using var c = DatabaseStore.OpenExisting(databasePath);
+        using var tx = c.BeginTransaction(deferred: false);
+        using var cmd = c.CreateCommand();
+        cmd.Transaction = tx;
+        cmd.CommandText = "SELECT RemoteId FROM um6_create_evidence WHERE ReservationId=$id AND Kind=1;";
+        cmd.Parameters.AddWithValue("$id", reservationId);
+        object? returned = cmd.ExecuteScalar();
+        if (returned is null || (returned is string known &&
+                !string.Equals(known, observation.RemoteId, StringComparison.Ordinal)) ||
+            observation.ReturnedIdMatched != (returned is string))
+            throw new InvalidOperationException("Observation does not match retained acknowledgement.");
+        InsertEvidence(c, tx, reservationId, 2, observation.RemoteId);
+        tx.Commit();
+    }
+
+    internal UserManager6StoredCreationEvidence? ReadCreationEvidence(Guid reservationId)
+    {
+        ValidateId(reservationId);
+        using var c = OpenReadOnly();
+        using var cmd = c.CreateCommand();
+        cmd.CommandText = """
+            SELECT ack.RemoteId, observed.RemoteId
+            FROM um6_create_evidence ack LEFT JOIN um6_create_evidence observed
+              ON observed.ReservationId=ack.ReservationId AND observed.Kind=2
+            WHERE ack.ReservationId=$id AND ack.Kind=1;
+            """;
+        cmd.Parameters.AddWithValue("$id", reservationId);
+        using var r = cmd.ExecuteReader();
+        return r.Read() ? new(r.IsDBNull(0) ? null : r.GetString(0),
+            r.IsDBNull(1) ? null : r.GetString(1)) : null;
+    }
+
+    private static void InsertEvidence(SqliteConnection c, SqliteTransaction tx, Guid reservationId,
+        int kind, string? remoteId)
+    {
+        using var cmd = c.CreateCommand();
+        cmd.Transaction = tx;
+        cmd.CommandText = "INSERT INTO um6_create_evidence(ReservationId,Kind,RemoteId) VALUES($id,$kind,$remote);";
+        cmd.Parameters.AddWithValue("$id", reservationId);
+        cmd.Parameters.AddWithValue("$kind", kind);
+        cmd.Parameters.AddWithValue("$remote", (object?)remoteId ?? DBNull.Value);
+        cmd.ExecuteNonQuery();
+    }
+
+    // Restore must preserve all evidence exactly, including bare acknowledgement
+    // versus no receipt. No merge, inference or replay.
+    internal static void RequireEquivalentEvidenceForRestore(string currentPath, string candidatePath)
+    {
+        using var current = DatabaseBackup.OpenRaw(currentPath, SqliteOpenMode.ReadOnly);
+        using var candidate = DatabaseBackup.OpenRaw(candidatePath, SqliteOpenMode.ReadOnly);
+        DatabaseBackup.RequireIdentity(current);
+        DatabaseBackup.RequireIdentity(candidate);
+        using var a = current.CreateCommand();
+        using var b = candidate.CreateCommand();
+        const string query = """
+            SELECT ReservationId,Kind,RemoteId FROM um6_create_evidence
+            ORDER BY ReservationId COLLATE BINARY,Kind;
+            """;
+        a.CommandText = query;
+        b.CommandText = query;
+        using var left = a.ExecuteReader();
+        using var right = b.ExecuteReader();
+        while (true)
+        {
+            bool hasLeft = left.Read(), hasRight = right.Read();
+            if (hasLeft != hasRight) throw RestoreConflict();
+            if (!hasLeft) return;
+            for (int i = 0; i < 3; i++)
+                if (!Equals(left.GetValue(i), right.GetValue(i))) throw RestoreConflict();
+        }
+    }
 
     private bool Transition(Guid reservationId, UserManager6CreateState expected, UserManager6CreateState next)
     {

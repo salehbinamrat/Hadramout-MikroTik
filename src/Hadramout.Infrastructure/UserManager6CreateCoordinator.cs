@@ -16,7 +16,7 @@ internal static class UserManager6CreateCoordinator
 {
     internal static async Task<UserManager6CoordinationOutcome> ExecuteForQualificationAsync(
         string databasePath, Guid reservationId, Stream stream, TimeSpan? timeout = null,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default, bool observeAfterAcknowledgement = false)
     {
         ArgumentNullException.ThrowIfNull(stream);
         TimeSpan limit = timeout ?? TimeSpan.FromSeconds(15);
@@ -46,12 +46,21 @@ internal static class UserManager6CreateCoordinator
         // Never invoke the read recovery/reconnect wrapper around this exchange.
         var receipt = await new UserManager6CreateWire(stream).CreateDisabledOnceAsync(
             reservationId, scope.Customer, scope.Username, secret.Password, deadline.Token).ConfigureAwait(false);
+        secret.Dispose(); // Do not retain the decrypted voucher during readback.
         bool acknowledged = receipt.Outcome == UserManager6CreateWireOutcome.Acknowledged;
         // No cancellation token for local result persistence. If persistence fails,
         // the previously committed DispatchStarted state is still non-rearmable.
-        bool recorded = acknowledged ? journal.TryMarkAcknowledged(reservationId) :
+        bool recorded = acknowledged ? journal.TryRecordAcknowledgement(reservationId, receipt) :
             journal.TryMarkIndeterminate(reservationId);
         if (!recorded) throw new InvalidOperationException("Creation result could not be recorded; review required.");
+        if (acknowledged && observeAfterAcknowledgement)
+        {
+            // A failure or absent row does not undo the durable acknowledgement.
+            // No readback attempt is made for a trap, EOF or uncertain creation.
+            var observed = await RouterOsSession.ReadUm6DisabledCreationObservationAsync(stream,
+                reservationId, scope.Customer, scope.Username, receipt, deadline.Token).ConfigureAwait(false);
+            if (observed is not null) journal.RecordDisabledObservation(reservationId, observed);
+        }
         return acknowledged ? UserManager6CoordinationOutcome.Acknowledged : UserManager6CoordinationOutcome.Indeterminate;
     }
 }

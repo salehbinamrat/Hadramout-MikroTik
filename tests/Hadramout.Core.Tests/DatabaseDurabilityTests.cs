@@ -946,6 +946,127 @@ public sealed class DatabaseDurabilityTests
         }
     }
 
+    [Theory]
+    [InlineData("match")]
+    [InlineData("bare")]
+    [InlineData("absent")]
+    [InlineData("mismatch")]
+    [InlineData("uncertain")]
+    [SupportedOSPlatform("windows")]
+    public async Task QualifiedCreationPersistsAcknowledgementBeforeOptionalReadback(string condition)
+    {
+        using var file = new TestFile();
+        Guid id = SeedSecretIntent(file.Path);
+        new UserManager6VoucherSecretStore(file.Path).Save(id, "synthetic"u8);
+        var journal = new UserManager6CreateJournal(file.Path);
+        using var replies = new MemoryStream();
+        await WriteReplyAsync(replies, "!re", "=version=6.49.19");
+        await WriteReplyAsync(replies, "!done");
+        await WriteReplyAsync(replies, "!re", "=owner=admin", "=name=day");
+        await WriteReplyAsync(replies, "!done");
+        await WriteReplyAsync(replies, "!done");
+        if (condition == "uncertain") await WriteReplyAsync(replies, "!trap", "=message=synthetic");
+        else
+        {
+            if (condition == "bare") await WriteReplyAsync(replies, "!done");
+            else await WriteReplyAsync(replies, "!done", "=ret=*1");
+            await WriteReplyAsync(replies, "!re", "=version=6.49.19");
+            await WriteReplyAsync(replies, "!done");
+            if (condition != "absent")
+                await WriteReplyAsync(replies, "!re", condition == "mismatch" ? "=.id=*2" : "=.id=*1",
+                    "=customer=admin", "=username=001", "=disabled=yes", "=comment=hmk-create:" + id.ToString("N"));
+            await WriteReplyAsync(replies, "!done");
+        }
+        int versionReads = 0, adds = 0;
+        using var stream = new QualificationExchange(replies.ToArray(), word =>
+        {
+            if (word == "/tool/user-manager/user/add") adds++;
+            if (word == "/system/resource/print" && ++versionReads == 2)
+            {
+                Assert.Equal(UserManager6CreateState.Acknowledged, journal.Read(id)!.State);
+                Assert.NotNull(journal.ReadCreationEvidence(id));
+                Assert.Null(journal.ReadCreationEvidence(id)!.ObservedId);
+            }
+        });
+        if (condition == "mismatch")
+            await Assert.ThrowsAsync<InvalidDataException>(() => UserManager6CreateCoordinator.ExecuteForQualificationAsync(
+                file.Path, id, stream, observeAfterAcknowledgement: true));
+        else
+        {
+            var result = await UserManager6CreateCoordinator.ExecuteForQualificationAsync(
+                file.Path, id, stream, observeAfterAcknowledgement: true);
+            Assert.Equal(condition == "uncertain" ? UserManager6CoordinationOutcome.Indeterminate :
+                UserManager6CoordinationOutcome.Acknowledged, result);
+        }
+        Assert.Equal(1, adds);
+        Assert.Equal(condition == "uncertain" ? 1 : 2, versionReads);
+        var stored = new UserManager6CreateJournal(file.Path).ReadCreationEvidence(id);
+        if (condition == "uncertain") Assert.Null(stored);
+        else
+        {
+            Assert.NotNull(stored);
+            Assert.Equal(condition == "bare" ? null : "*1", stored.ReturnedId);
+            Assert.Equal(condition is "match" or "bare" ? "*1" : null, stored.ObservedId);
+            Assert.Equal(UserManager6CreateState.Acknowledged, journal.Read(id)!.State);
+        }
+        Assert.False(journal.TryBeginBoundDispatch(id));
+    }
+
+    [Fact]
+    [SupportedOSPlatform("windows")]
+    public void CreationEvidenceIsImmutableAndRestoreCannotLoseIt()
+    {
+        using var file = new TestFile();
+        using var before = new TestFile();
+        using var after = new TestFile();
+        Guid id = SeedSecretIntent(file.Path);
+        new UserManager6VoucherSecretStore(file.Path).Save(id, "synthetic"u8);
+        var journal = new UserManager6CreateJournal(file.Path);
+        Assert.True(journal.TryBeginBoundDispatch(id));
+        Assert.True(journal.TryRecordAcknowledgement(id, new(UserManager6CreateWireOutcome.Acknowledged, "*1")));
+        Assert.False(journal.TryRecordAcknowledgement(id, new(UserManager6CreateWireOutcome.Acknowledged, "*2")));
+        Assert.Throws<InvalidOperationException>(() => journal.RecordDisabledObservation(id, new("*2", true)));
+        Assert.Throws<InvalidOperationException>(() => journal.RecordDisabledObservation(id, new("*1", false)));
+        // Create consistent snapshots using SQLite's backup API rather than copying WAL files.
+        using (var c = DatabaseStore.Open(file.Path))
+        using (var destination = before.OpenRaw()) c.BackupDatabase(destination);
+        journal.RecordDisabledObservation(id, new("*1", true));
+        Assert.Throws<SqliteException>(() => journal.RecordDisabledObservation(id, new("*1", true)));
+        using (var c = DatabaseStore.Open(file.Path))
+        {
+            Assert.Throws<SqliteException>(() => Execute(c, "UPDATE um6_create_evidence SET RemoteId='*2';"));
+            Assert.Throws<SqliteException>(() => Execute(c, "DELETE FROM um6_create_evidence;"));
+            Assert.Throws<SqliteException>(() => Execute(c, "INSERT OR REPLACE INTO um6_create_evidence SELECT * FROM um6_create_evidence;"));
+            using var destination = after.OpenRaw();
+            c.BackupDatabase(destination);
+        }
+        Assert.Throws<InvalidOperationException>(() => UserManager6CreateJournal.RequireEquivalentEvidenceForRestore(file.Path, before.Path));
+        Assert.Throws<InvalidOperationException>(() => UserManager6CreateJournal.RequireEquivalentEvidenceForRestore(before.Path, file.Path));
+        UserManager6CreateJournal.RequireEquivalentEvidenceForRestore(file.Path, after.Path);
+    }
+
+    [Fact]
+    [SupportedOSPlatform("windows")]
+    public void FailedEvidenceInsertRollsBackAcknowledgementAndLegacyAckIsNotBackfilled()
+    {
+        using var file = new TestFile();
+        Guid id = SeedSecretIntent(file.Path);
+        new UserManager6VoucherSecretStore(file.Path).Save(id, "synthetic"u8);
+        var journal = new UserManager6CreateJournal(file.Path);
+        Assert.True(journal.TryBeginBoundDispatch(id));
+        using (var c = DatabaseStore.Open(file.Path))
+            Execute(c, "CREATE TRIGGER synthetic_evidence_failure BEFORE INSERT ON um6_create_evidence BEGIN SELECT RAISE(ABORT,'synthetic'); END;");
+        Assert.Throws<SqliteException>(() => journal.TryRecordAcknowledgement(id,
+            new(UserManager6CreateWireOutcome.Acknowledged, "*1")));
+        Assert.Equal(UserManager6CreateState.DispatchStarted, journal.Read(id)!.State);
+        Assert.Null(journal.ReadCreationEvidence(id));
+        // The previous state-only API is retained for existing synthetic legacy tests.
+        Assert.True(journal.TryMarkAcknowledged(id));
+        Assert.Null(journal.ReadCreationEvidence(id));
+        Assert.Throws<InvalidOperationException>(() => journal.RecordDisabledObservation(id, new("*1", false)));
+        Assert.False(journal.TryBeginBoundDispatch(id));
+    }
+
     private static Guid SeedSecretIntent(string path)
     {
         Guid id = SeedReservation(path, BackendKind.UserManager6);
@@ -985,13 +1106,14 @@ public sealed class DatabaseDurabilityTests
     // guard in sync with new migrations; never silently leave a newer table behind.
     internal static void RecreateLegacyFixture(SqliteConnection c, int version)
     {
-        if (version is < 1 or > 7) throw new ArgumentOutOfRangeException(nameof(version));
-        Assert.Equal(8, DatabaseStore.CurrentSchemaVersion);
-        Assert.Equal(8L, Scalar(c, "PRAGMA user_version;"));
+        if (version is < 1 or > 8) throw new ArgumentOutOfRangeException(nameof(version));
+        Assert.Equal(9, DatabaseStore.CurrentSchemaVersion);
+        Assert.Equal(9L, Scalar(c, "PRAGMA user_version;"));
         using var tx = c.BeginTransaction(deferred: false);
         using var cmd = c.CreateCommand();
         cmd.Transaction = tx;
-        cmd.CommandText = "DROP TABLE um6_voucher_secrets;";
+        cmd.CommandText = "DROP TABLE um6_create_evidence;";
+        if (version < 8) cmd.CommandText += " DROP TABLE um6_voucher_secrets;";
         if (version < 7) cmd.CommandText += " DROP TABLE um6_create_intents;";
         if (version < 6) cmd.CommandText += " DROP TABLE router_targets;";
         if (version < 5) cmd.CommandText += " DROP TABLE um6_create_journal;";
@@ -1005,7 +1127,7 @@ public sealed class DatabaseDurabilityTests
 
         cmd.Transaction = null;
         cmd.CommandText = "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%';";
-        Assert.Equal(version == 7 ? 11L : version == 6 ? 10L : version == 5 ? 9L : version == 4 ? 8L : version == 3 ? 7L : 6L, (long)cmd.ExecuteScalar()!);
+        Assert.Equal(version == 8 ? 12L : version == 7 ? 11L : version == 6 ? 10L : version == 5 ? 9L : version == 4 ? 8L : version == 3 ? 7L : 6L, (long)cmd.ExecuteScalar()!);
         Assert.Equal((long)version, Scalar(c, "PRAGMA user_version;"));
     }
 
@@ -1017,6 +1139,7 @@ public sealed class DatabaseDurabilityTests
     [InlineData(5)]
     [InlineData(6)]
     [InlineData(7)]
+    [InlineData(8)]
     public void EveryLegacyFixtureHasOnlyItsOwnSchemaAndUpgrades(int version)
     {
         using var file = new TestFile();
