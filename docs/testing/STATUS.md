@@ -66,3 +66,7 @@ Head 948f4c0ae47573fdc3e5d7be3d3747c36c14cae9: Core 45899402322 passed; Release 
 
 
 PR #36 corrected exact head passed both gates; the stage checks and packaging artifact are present. Original aggregate timeout's internal cause remains unproven; no per-stage time limit increase or skipped tests.
+
+
+## PR #42 correction — 2026-11-27
+Exact failing head 3944c4ebae457154b631780a03f3e3295ce87d55. Core 45952530047 (job 140351439127) and Release 45952530070 (job 140351439326) failed compilation with CS0051 at DatabaseDurabilityTests.cs:1159: public theory signature exposed internal UserManager6ProfileLinkState. Root cause is test API accessibility, not SQLite execution or packaging. Keep domain enum internal; use bool InlineData and map both values to the original enum inside the public theory. Preserve both original test cases and assertions. Inspect public parameterized test signatures in the changed test class before commit. Added concurrent profile-link claim regression (eight competing calls, exactly one winner, no creation-state change), extending existing concurrency pattern. Nine new cases total for this stage, including v10 migration. Future public theory signatures must use public types (primitive inputs preferred for internal domain states); check accessibility and InlineData compatibility before upload, and keep native compiler gate mandatory in both Windows workflows. No production changes in correction, no suppressed errors, skipped tests or altered packaging. Fresh exact-head CI required before merge.

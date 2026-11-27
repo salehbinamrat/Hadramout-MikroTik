@@ -1153,11 +1153,13 @@ public sealed class DatabaseDurabilityTests
             new(scope.ProfileOwner, scope.ProfileName, null, null));
 
     [Theory]
-    [InlineData(UserManager6ProfileLinkState.Acknowledged)]
-    [InlineData(UserManager6ProfileLinkState.Indeterminate)]
+    [InlineData(true)]
+    [InlineData(false)]
     [SupportedOSPlatform("windows")]
-    public void ProfileLinkClaimIsDurableOneShotAndRestoreCannotRearm(UserManager6ProfileLinkState outcome)
+    public void ProfileLinkClaimIsDurableOneShotAndRestoreCannotRearm(bool acknowledged)
     {
+        var outcome = acknowledged ? UserManager6ProfileLinkState.Acknowledged :
+            UserManager6ProfileLinkState.Indeterminate;
         using var file = new TestFile();
         using var before = new TestFile();
         using var after = new TestFile();
@@ -1225,6 +1227,30 @@ public sealed class DatabaseDurabilityTests
         }
         Assert.Throws<InvalidOperationException>(() => journal.TryClaimProfileLink(scope, evidence));
         Assert.Null(journal.ReadProfileLinkEntry(id));
+    }
+
+    [Fact]
+    [SupportedOSPlatform("windows")]
+    public void ConcurrentProfileLinkClaimsHaveExactlyOneWinner()
+    {
+        using var file = new TestFile();
+        Guid id = SeedSecretIntent(file.Path);
+        new UserManager6VoucherSecretStore(file.Path).Save(id, "synthetic"u8);
+        var journal = new UserManager6CreateJournal(file.Path);
+        Assert.True(journal.TryBeginBoundDispatch(id));
+        Assert.True(journal.TryMarkIndeterminate(id));
+        Assert.True(journal.TryRecordRecoveryObservation(new(journal.ReadBoundRecoveryScope(id), new("*1", false))));
+        var scope = journal.ReadProfileLinkScope(id);
+        var evidence = MatchingProfileEvidence(scope);
+        int winners = 0;
+        Parallel.For(0, 8, _ =>
+        {
+            if (new UserManager6CreateJournal(file.Path).TryClaimProfileLink(scope, evidence))
+                Interlocked.Increment(ref winners);
+        });
+        Assert.Equal(1, winners);
+        Assert.Equal(UserManager6ProfileLinkState.DispatchStarted, journal.ReadProfileLinkEntry(id)!.State);
+        Assert.Equal(UserManager6CreateState.Indeterminate, journal.Read(id)!.State);
     }
 
     private static Guid SeedSecretIntent(string path)
