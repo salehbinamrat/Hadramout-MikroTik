@@ -296,14 +296,7 @@ internal sealed class RouterOsSession : IDisposable
             throw new InvalidOperationException("Prior exact disabled-account evidence required.");
         return WithReadSessionAsync<UserManager6ProfileLinkReadEvidence>(async (stream, token) =>
         {
-            await RequireUserManager6FamilyAsync(stream, token).ConfigureAwait(false);
-            var accounts = await ReadCommandAsync(stream,
-                ["/tool/user-manager/user/print"u8.ToArray(),
-                    "=.proplist=.id,customer,username,disabled,comment,actual-profile"u8.ToArray(),
-                    UserManager6Records.Query("username", creation.Username)],
-                words => UserManager6Records.ParseProfileLinkAccount(words, creation.ReservationId,
-                    creation.Customer, creation.Username, creation.ExpectedRemoteId!), 1, token).ConfigureAwait(false);
-            token.ThrowIfCancellationRequested();
+            var accounts = await ReadProfileLinkAccountsAsync(stream, creation, token).ConfigureAwait(false);
             if (accounts.Count == 0)
                 return new(UserManager6ProfileLinkReadState.AccountNotVisible, null, null);
             var (account, actualProfile) = accounts[0];
@@ -320,6 +313,58 @@ internal sealed class RouterOsSession : IDisposable
                 ? new(UserManager6ProfileLinkReadState.ProfileNotVisible, account, null, actualProfile)
                 : new(UserManager6ProfileLinkReadState.BothVisible, account, profiles[0], actualProfile);
         }, timeout, cancellationToken);
+    }
+
+    // Review only: a named actual-profile and visible owner are not authoritative
+    // assignment, activation, entitlement or print eligibility.
+    internal Task<UserManager6ProfileLinkReviewEvidence> ReadUm6ProfileLinkReviewAsync(
+        UserManager6ProfileLinkReviewScope scope, TimeSpan? timeout = null, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(scope);
+        var intent = scope.Intent;
+        var creation = intent.Creation;
+        UserManager6Records.ValidateKey(intent.ProfileOwner, nameof(intent.ProfileOwner));
+        UserManager6Records.ValidateKey(intent.ProfileName, nameof(intent.ProfileName));
+        if (scope.Entry.ReservationId != creation.ReservationId ||
+            !Enum.IsDefined(scope.Entry.State) ||
+            creation.State is not (UserManager6CreateState.Indeterminate or UserManager6CreateState.Acknowledged) ||
+            (creation.Recovery is null && creation.Evidence?.ObservedId is null) ||
+            !UserManager6Records.IsOpaqueRemoteId(creation.ExpectedRemoteId) ||
+            scope.Entry.RemoteId != creation.ExpectedRemoteId)
+            throw new InvalidOperationException("Matching retained profile link claim required.");
+        return WithReadSessionAsync<UserManager6ProfileLinkReviewEvidence>(async (stream, token) =>
+        {
+            var accounts = await ReadProfileLinkAccountsAsync(stream, creation, token).ConfigureAwait(false);
+            if (accounts.Count == 0)
+                return new(scope, UserManager6ProfileLinkReviewState.AccountNotVisible, null, null, null);
+            var (account, actualProfile) = accounts[0];
+            if (actualProfile == string.Empty)
+                return new(scope, UserManager6ProfileLinkReviewState.EmptyProfileReported, account, actualProfile, null);
+            if (string.IsNullOrWhiteSpace(actualProfile))
+                return new(scope, UserManager6ProfileLinkReviewState.ActualProfileUnknown, account, actualProfile, null);
+            if (actualProfile != intent.ProfileName)
+                return new(scope, UserManager6ProfileLinkReviewState.OtherProfileReported, account, actualProfile, null);
+            var profiles = await ReadUniqueVisibleUm6ProfileAsync(stream,
+                intent.ProfileOwner, intent.ProfileName, token).ConfigureAwait(false);
+            token.ThrowIfCancellationRequested();
+            return profiles.Count == 0
+                ? new(scope, UserManager6ProfileLinkReviewState.IntendedNameProfileNotVisible, account, actualProfile, null)
+                : new(scope, UserManager6ProfileLinkReviewState.IntendedNameAndOwnerVisible, account, actualProfile, profiles[0]);
+        }, timeout, cancellationToken);
+    }
+
+    private static async Task<IReadOnlyList<(UserManager6DisabledCreationObservation Account, string? ActualProfile)>>
+        ReadProfileLinkAccountsAsync(Stream stream, UserManager6RecoveryScope creation, CancellationToken token)
+    {
+        await RequireUserManager6FamilyAsync(stream, token).ConfigureAwait(false);
+        var accounts = await ReadCommandAsync(stream,
+            ["/tool/user-manager/user/print"u8.ToArray(),
+                "=.proplist=.id,customer,username,disabled,comment,actual-profile"u8.ToArray(),
+                UserManager6Records.Query("username", creation.Username)],
+            words => UserManager6Records.ParseProfileLinkAccount(words, creation.ReservationId,
+                creation.Customer, creation.Username, creation.ExpectedRemoteId!), 1, token).ConfigureAwait(false);
+        token.ThrowIfCancellationRequested();
+        return accounts;
     }
 
     private static async Task<UserManager6DisabledCreationObservation?> ReadUm6DisabledIdentityCoreAsync(

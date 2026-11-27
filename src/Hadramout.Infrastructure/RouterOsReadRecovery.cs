@@ -168,6 +168,25 @@ internal static class RouterOsReadRecovery
         return evidence;
     }
 
+    // Review a retained link claim, never recreate it or alter its state.
+    // Caller holds managed generation and quiesces creation/configuration changes.
+    [SupportedOSPlatform("windows")]
+    internal static async Task<UserManager6ProfileLinkReviewEvidence> ReadBoundUm6ProfileLinkReviewAsync(
+        string databasePath, Guid reservationId, TimeSpan? timeout = null,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var journal = new UserManager6CreateJournal(databasePath);
+        var scope = journal.ReadProfileLinkReviewScope(reservationId);
+        var evidence = await ReadBoundAsync(databasePath, scope.Intent.Creation.RouterId, timeout,
+            (session, token) => session.ReadUm6ProfileLinkReviewAsync(scope, timeout, token),
+            cancellationToken, requiredPin: scope.Intent.Creation.LeafSha256).ConfigureAwait(false);
+        cancellationToken.ThrowIfCancellationRequested();
+        if (journal.ReadProfileLinkReviewScope(reservationId) != scope)
+            throw new InvalidOperationException("Local profile link scope changed during review.");
+        return evidence;
+    }
+
     [SupportedOSPlatform("windows")]
     private static async Task<T> ReadBoundAsync<T>(string databasePath, Guid routerId, TimeSpan? timeout,
         Func<RouterOsSession, CancellationToken, Task<T>> operation, CancellationToken cancellationToken,
