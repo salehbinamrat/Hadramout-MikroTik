@@ -282,6 +282,33 @@ internal sealed class RouterOsSession : IDisposable
             timeout, cancellationToken);
     }
 
+    // Read only, on one exclusive authenticated session. This is not evidence of
+    // an assigned profile or permission to perform an add/activate/enable command.
+    internal Task<UserManager6ProfileLinkReadEvidence> ReadUm6ProfileLinkPreflightAsync(
+        UserManager6ProfileLinkScope scope, TimeSpan? timeout = null, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(scope);
+        var creation = scope.Creation;
+        UserManager6Records.ValidateKey(scope.ProfileOwner, nameof(scope.ProfileOwner));
+        UserManager6Records.ValidateKey(scope.ProfileName, nameof(scope.ProfileName));
+        if ((creation.Recovery is null && creation.Evidence?.ObservedId is null) ||
+            !UserManager6Records.IsOpaqueRemoteId(creation.ExpectedRemoteId))
+            throw new InvalidOperationException("Prior exact disabled-account evidence required.");
+        return WithReadSessionAsync<UserManager6ProfileLinkReadEvidence>(async (stream, token) =>
+        {
+            var account = await ReadUm6DisabledIdentityCoreAsync(stream, creation.ReservationId,
+                creation.Customer, creation.Username, creation.ExpectedRemoteId, token).ConfigureAwait(false);
+            if (account is null)
+                return new(UserManager6ProfileLinkReadState.AccountNotVisible, null, null);
+            var profiles = await ReadUniqueVisibleUm6ProfileAsync(stream,
+                scope.ProfileOwner, scope.ProfileName, token).ConfigureAwait(false);
+            token.ThrowIfCancellationRequested();
+            return profiles.Count == 0
+                ? new(UserManager6ProfileLinkReadState.ProfileNotVisible, account, null)
+                : new(UserManager6ProfileLinkReadState.BothVisible, account, profiles[0]);
+        }, timeout, cancellationToken);
+    }
+
     private static async Task<UserManager6DisabledCreationObservation?> ReadUm6DisabledIdentityCoreAsync(
         Stream stream, Guid reservationId, string customer, string username, string? expectedId,
         CancellationToken token)
