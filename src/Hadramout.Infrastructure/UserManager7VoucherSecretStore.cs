@@ -35,7 +35,15 @@ internal sealed class UserManager7VoucherSecretStore(string databasePath)
             throw new ArgumentException("Absolute database path required.", nameof(databasePath));
         using var c = DatabaseBackup.OpenRaw(databasePath, SqliteOpenMode.ReadOnly);
         DatabaseBackup.RequireIdentity(c);
+        return Load(c, null, reservationId);
+    }
+
+    [SupportedOSPlatform("windows")]
+    internal static UserManager6VoucherSecretLease? Load(SqliteConnection c, SqliteTransaction? tx, Guid reservationId)
+    {
+        ValidateId(reservationId);
         using var cmd = c.CreateCommand();
+        cmd.Transaction = tx;
         cmd.CommandText = """
             SELECT CASE WHEN typeof(s.PasswordEnvelope)='blob' AND length(s.PasswordEnvelope) BETWEEN 1 AND $max
                        THEN s.PasswordEnvelope END,

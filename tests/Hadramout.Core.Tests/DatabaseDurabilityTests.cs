@@ -1635,6 +1635,98 @@ public sealed class DatabaseDurabilityTests
         Assert.Throws<InvalidOperationException>(() => store.Load(id));
     }
 
+    [Fact]
+    [SupportedOSPlatform("windows")]
+    public void Um7ClaimIsDurableAndCannotBeRearmedByRestoreOrSql()
+    {
+        using var file = new TestFile();
+        using var before = new TestFile();
+        using var claimed = new TestFile();
+        using var identical = new TestFile();
+        Guid id = SeedUm7SecretIntent(file.Path);
+        new UserManager7VoucherSecretStore(file.Path).Save(id, "synthetic"u8);
+        var journal = new UserManager7CreateClaimStore(file.Path);
+        Assert.Null(journal.Read(id));
+        using (var c = DatabaseStore.Open(file.Path))
+        using (var copy = before.OpenRaw()) c.BackupDatabase(copy);
+        using (var lease = journal.TryClaimForQualification(id))
+        {
+            Assert.NotNull(lease);
+            Assert.True("synthetic"u8.SequenceEqual(lease.Password.Span));
+            Assert.Equal(UserManager7CreateClaimState.DispatchStarted, new UserManager7CreateClaimStore(file.Path).Read(id));
+        }
+        Assert.Null(new UserManager7CreateClaimStore(file.Path).TryClaimForQualification(id));
+        using (var c = DatabaseStore.OpenExisting(file.Path))
+        using (var copy = claimed.OpenRaw()) c.BackupDatabase(copy);
+        Assert.True(journal.TryMarkIndeterminate(id));
+        Assert.False(journal.TryMarkIndeterminate(id));
+        Assert.Equal(UserManager7CreateClaimState.Indeterminate, journal.Read(id));
+        Assert.Null(journal.TryClaimForQualification(id));
+        using (var c = DatabaseStore.OpenExisting(file.Path))
+        {
+            Assert.Throws<SqliteException>(() => Execute(c, "UPDATE um7_create_claims SET State=2;"));
+            Assert.Throws<SqliteException>(() => Execute(c, "UPDATE um7_create_claims SET State=4;"));
+            Assert.Throws<SqliteException>(() => Execute(c, "DELETE FROM um7_create_claims;"));
+            Assert.Throws<SqliteException>(() => Execute(c, "INSERT OR REPLACE INTO um7_create_claims SELECT ReservationId,2 FROM um7_create_claims;"));
+            using var copy = identical.OpenRaw();
+            c.BackupDatabase(copy);
+        }
+        UserManager7CreateClaimStore.RequireEquivalentForRestore(file.Path, identical.Path);
+        Assert.Throws<InvalidOperationException>(() => UserManager7CreateClaimStore.RequireEquivalentForRestore(file.Path, before.Path));
+        Assert.Throws<InvalidOperationException>(() => UserManager7CreateClaimStore.RequireEquivalentForRestore(before.Path, file.Path));
+        Assert.Throws<InvalidOperationException>(() => UserManager7CreateClaimStore.RequireEquivalentForRestore(file.Path, claimed.Path));
+    }
+
+    [Fact]
+    [SupportedOSPlatform("windows")]
+    public void Um7ConcurrentClaimsHaveExactlyOneWinner()
+    {
+        using var file = new TestFile();
+        Guid id = SeedUm7SecretIntent(file.Path);
+        new UserManager7VoucherSecretStore(file.Path).Save(id, "synthetic"u8);
+        int winners = 0;
+        Parallel.For(0, 8, _ =>
+        {
+            using var lease = new UserManager7CreateClaimStore(file.Path).TryClaimForQualification(id);
+            if (lease is not null) Interlocked.Increment(ref winners);
+        });
+        Assert.Equal(1, winners);
+        Assert.Equal(UserManager7CreateClaimState.DispatchStarted, new UserManager7CreateClaimStore(file.Path).Read(id));
+    }
+
+    [Theory]
+    [InlineData("missing")]
+    [InlineData("malformed")]
+    [InlineData("drift")]
+    [SupportedOSPlatform("windows")]
+    public void Um7ClaimDoesNotCommitWithoutUsableBoundSecret(string condition)
+    {
+        using var file = new TestFile();
+        Guid id = SeedUm7SecretIntent(file.Path);
+        var journal = new UserManager7CreateClaimStore(file.Path);
+        if (condition == "missing")
+        {
+            Assert.Null(journal.TryClaimForQualification(id));
+            using var c = DatabaseStore.OpenExisting(file.Path);
+            Assert.Throws<SqliteException>(() => Execute(c, "INSERT INTO um7_create_claims SELECT ReservationId,2 FROM um7_create_intents;"));
+        }
+        else if (condition == "malformed")
+        {
+            using (var c = DatabaseStore.OpenExisting(file.Path))
+                Execute(c, "INSERT INTO um7_voucher_secrets SELECT ReservationId,X'01' FROM um7_create_intents;");
+            Assert.Throws<CryptographicException>(() => journal.TryClaimForQualification(id));
+        }
+        else
+        {
+            new UserManager7VoucherSecretStore(file.Path).Save(id, "synthetic"u8);
+            using (var c = DatabaseStore.OpenExisting(file.Path))
+                Execute(c, "UPDATE voucher_reservations SET Username='changed';");
+            Assert.Throws<InvalidOperationException>(() => journal.TryClaimForQualification(id));
+        }
+        Assert.Null(journal.Read(id));
+        Assert.False(journal.TryMarkIndeterminate(id));
+    }
+
     private static Guid SeedUm7SecretIntent(string path)
     {
         Guid id = SeedReservation(path, BackendKind.UserManager7);
@@ -1685,13 +1777,14 @@ public sealed class DatabaseDurabilityTests
     // guard in sync with new migrations; never silently leave a newer table behind.
     internal static void RecreateLegacyFixture(SqliteConnection c, int version)
     {
-        if (version is < 1 or > 12) throw new ArgumentOutOfRangeException(nameof(version));
-        Assert.Equal(13, DatabaseStore.CurrentSchemaVersion);
-        Assert.Equal(13L, Scalar(c, "PRAGMA user_version;"));
+        if (version is < 1 or > 13) throw new ArgumentOutOfRangeException(nameof(version));
+        Assert.Equal(14, DatabaseStore.CurrentSchemaVersion);
+        Assert.Equal(14L, Scalar(c, "PRAGMA user_version;"));
         using var tx = c.BeginTransaction(deferred: false);
         using var cmd = c.CreateCommand();
         cmd.Transaction = tx;
-        cmd.CommandText = "DROP TABLE um7_voucher_secrets;";
+        cmd.CommandText = "DROP TABLE um7_create_claims;";
+        if (version < 13) cmd.CommandText += " DROP TABLE um7_voucher_secrets;";
         if (version < 12) cmd.CommandText += " DROP TRIGGER um7_intent_exclude_um6; DROP TABLE um7_create_intents;";
         if (version < 11) cmd.CommandText += " DROP TABLE um6_profile_link_journal;";
         if (version < 10) cmd.CommandText += " DROP TRIGGER um6_recovery_consistency_guard; DROP TABLE um6_recovery_evidence;";
@@ -1710,7 +1803,7 @@ public sealed class DatabaseDurabilityTests
 
         cmd.Transaction = null;
         cmd.CommandText = "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%';";
-        Assert.Equal(version == 12 ? 16L : version == 11 ? 15L : version == 10 ? 14L : version == 9 ? 13L : version == 8 ? 12L : version == 7 ? 11L : version == 6 ? 10L : version == 5 ? 9L : version == 4 ? 8L : version == 3 ? 7L : 6L, (long)cmd.ExecuteScalar()!);
+        Assert.Equal(version == 13 ? 17L : version == 12 ? 16L : version == 11 ? 15L : version == 10 ? 14L : version == 9 ? 13L : version == 8 ? 12L : version == 7 ? 11L : version == 6 ? 10L : version == 5 ? 9L : version == 4 ? 8L : version == 3 ? 7L : 6L, (long)cmd.ExecuteScalar()!);
         Assert.Equal((long)version, Scalar(c, "PRAGMA user_version;"));
     }
 
@@ -1727,6 +1820,7 @@ public sealed class DatabaseDurabilityTests
     [InlineData(10)]
     [InlineData(11)]
     [InlineData(12)]
+    [InlineData(13)]
     public void EveryLegacyFixtureHasOnlyItsOwnSchemaAndUpgrades(int version)
     {
         using var file = new TestFile();
