@@ -39,7 +39,8 @@
 - PR #38 merged 064841463b419f1b9adc1e914b8463dc8fff25b2; Core 45946940379 / Release 45946940332 passed on df0c3accbe3a581335de8e01c4c4d1c9b345a548; package artifact 15174978820, smoke evidence 15174978828. Schema v9 durable creation evidence passed hosted CI.
 - PR #39 merged 0ada32a1aacac5389e814f3a2c0a1eb554be8877; Core 45947795017 / Release 45947794952 passed on 78fcfbfd39b0b46f57f79801d91bd9991e21e20b; package artifact 15175697170, smoke evidence 15175313199. Bound read-only recovery passed hosted CI.
 - PR #40 merged 560084273d719aa081dc853ff77c3cd52a897d66; Core 45950918583 / Release 45950918557 passed on 36a1ae77dfd2270dffc9f9510cd5880897a07368; package artifact 15177530641, smoke evidence 15176837198. Schema v10 recovery evidence passed hosted CI.
-- P16c.4a proposed exact bound account and intended profile read-only preflight; 9 synthetic TLS/local regression cases. Hosted CI pending. No assignment, activation, printing or schema change.
+- PR #41 merged c143d2aabbe22e3bb4feddfe67c93986a6b3b51b; Core 45951709257 / Release 45951709362 passed on 4562c00d55ac225b403620abb4aed5f0ac7ec778; package artifact 15177277753, smoke evidence 15177417396. Bound profile preflight passed hosted CI.
+- P16c.4b.1 proposed schema v11 separate one-shot profile-link journal, atomic local scope claim, immutable identity and restore guard; 8 new regression cases including v10 migration. Hosted CI pending. No network mutation, assignment confirmation, activation or printing.
 - P10 remaining: restore UI and RBAC, managed crash cleanup, real cross-account/device validation, full audit coverage/actor attribution, retention and scheduling. No production restore.
 - P01 deeper per-feature audit; physical Windows, RouterOS, printers; hard-kill, power-loss and disk-full tests pending. main remains unprotected; exact-head manual gate enforced. No production DB or real router changes.
 
@@ -65,3 +66,7 @@ Head 948f4c0ae47573fdc3e5d7be3d3747c36c14cae9: Core 45899402322 passed; Release 
 
 
 PR #36 corrected exact head passed both gates; the stage checks and packaging artifact are present. Original aggregate timeout's internal cause remains unproven; no per-stage time limit increase or skipped tests.
+
+
+## PR #42 correction — 2026-11-27
+Exact failing head 3944c4ebae457154b631780a03f3e3295ce87d55. Core 45952530047 (job 140351439127) and Release 45952530070 (job 140351439326) failed compilation with CS0051 at DatabaseDurabilityTests.cs:1159: public theory signature exposed internal UserManager6ProfileLinkState. Root cause is test API accessibility, not SQLite execution or packaging. Keep domain enum internal; use bool InlineData and map both values to the original enum inside the public theory. Preserve both original test cases and assertions. Inspect public parameterized test signatures in the changed test class before commit. Added concurrent profile-link claim regression (eight competing calls, exactly one winner, no creation-state change), extending existing concurrency pattern. Nine new cases total for this stage, including v10 migration. Future public theory signatures must use public types (primitive inputs preferred for internal domain states); check accessibility and InlineData compatibility before upload, and keep native compiler gate mandatory in both Windows workflows. No production changes in correction, no suppressed errors, skipped tests or altered packaging. Fresh exact-head CI required before merge.

@@ -38,6 +38,9 @@ internal enum UserManager6ProfileLinkReadState { AccountNotVisible, ProfileNotVi
 internal sealed record UserManager6ProfileLinkReadEvidence(UserManager6ProfileLinkReadState State,
     UserManager6DisabledCreationObservation? Account, UserManager6Profile? Profile);
 
+internal enum UserManager6ProfileLinkState { DispatchStarted = 2, Indeterminate = 3, Acknowledged = 4 }
+internal sealed record UserManager6ProfileLinkEntry(Guid ReservationId, string RemoteId, UserManager6ProfileLinkState State);
+
 internal sealed record UserManager6CreationReviewRow(UserManager6CreateEntry Entry, bool LocalIdentityMatches);
 internal sealed record UserManager6CreationReviewPage(IReadOnlyList<UserManager6CreationReviewRow> Rows,
     Guid? NextAfterReservationId);
@@ -326,6 +329,14 @@ internal sealed class UserManager6CreateJournal(string databasePath)
         ValidateId(reservationId);
         using var c = OpenReadOnly();
         using var tx = c.BeginTransaction(deferred: true);
+        var scope = ReadProfileLinkScope(c, tx, reservationId);
+        tx.Commit();
+        return scope;
+    }
+
+    private static UserManager6ProfileLinkScope ReadProfileLinkScope(SqliteConnection c,
+        SqliteTransaction tx, Guid reservationId)
+    {
         var creation = ReadBoundRecoveryScope(c, tx, reservationId);
         if (creation.Recovery is null && creation.Evidence?.ObservedId is null)
             throw new InvalidOperationException("Prior exact disabled-account evidence required.");
@@ -342,8 +353,101 @@ internal sealed class UserManager6CreateJournal(string databasePath)
             UserManager6Records.ValidateKey(name, nameof(name));
             scope = new(creation, owner, name);
         }
-        tx.Commit();
         return scope;
+    }
+
+    // Local qualification claim only. A future dispatcher must obtain fresh
+    // same-session preflight and hold the managed generation and exclusive session.
+    // No remote command is implemented here. Do not claim a still-in-flight creation.
+    internal bool TryClaimProfileLink(UserManager6ProfileLinkScope scope, UserManager6ProfileLinkReadEvidence evidence)
+    {
+        ArgumentNullException.ThrowIfNull(scope);
+        ArgumentNullException.ThrowIfNull(evidence);
+        Guid id = scope.Creation.ReservationId;
+        ValidateId(id);
+        string? remoteId = scope.Creation.ExpectedRemoteId;
+        if (scope.Creation.State is not (UserManager6CreateState.Indeterminate or UserManager6CreateState.Acknowledged) ||
+            !UserManager6Records.IsOpaqueRemoteId(remoteId) ||
+            evidence.State != UserManager6ProfileLinkReadState.BothVisible ||
+            evidence.Account is null || !evidence.Account.ReturnedIdMatched || evidence.Account.RemoteId != remoteId ||
+            evidence.Profile is null || evidence.Profile.Owner != scope.ProfileOwner || evidence.Profile.Name != scope.ProfileName)
+            throw new InvalidOperationException("Exact account and intended profile evidence required.");
+
+        using var c = DatabaseStore.OpenExisting(databasePath);
+        using var tx = c.BeginTransaction(deferred: false);
+        if (ReadProfileLinkScope(c, tx, id) != scope)
+            throw new InvalidOperationException("Profile link scope changed before claim.");
+        using var cmd = c.CreateCommand();
+        cmd.Transaction = tx;
+        cmd.CommandText = """
+            INSERT INTO um6_profile_link_journal(ReservationId,RemoteId,State)
+            VALUES($id,$remote,2) ON CONFLICT(ReservationId) DO NOTHING;
+            """;
+        cmd.Parameters.AddWithValue("$id", id);
+        cmd.Parameters.AddWithValue("$remote", remoteId!);
+        bool claimed = cmd.ExecuteNonQuery() == 1;
+        tx.Commit();
+        return claimed;
+    }
+
+    internal UserManager6ProfileLinkEntry? ReadProfileLinkEntry(Guid reservationId)
+    {
+        ValidateId(reservationId);
+        using var c = OpenReadOnly();
+        using var cmd = c.CreateCommand();
+        cmd.CommandText = "SELECT RemoteId,State FROM um6_profile_link_journal WHERE ReservationId=$id;";
+        cmd.Parameters.AddWithValue("$id", reservationId);
+        using var r = cmd.ExecuteReader();
+        if (!r.Read()) return null;
+        string remoteId = r.GetString(0);
+        var state = (UserManager6ProfileLinkState)r.GetInt32(1);
+        if (!UserManager6Records.IsOpaqueRemoteId(remoteId) || !Enum.IsDefined(state))
+            throw new InvalidDataException("Invalid retained profile link entry.");
+        return new(reservationId, remoteId, state);
+    }
+
+    // Acknowledgement is not confirmed assignment. Neither terminal state can be replayed.
+    internal bool TryRecordProfileLinkResult(Guid reservationId, UserManager6ProfileLinkState outcome)
+    {
+        ValidateId(reservationId);
+        if (outcome is not (UserManager6ProfileLinkState.Acknowledged or UserManager6ProfileLinkState.Indeterminate))
+            throw new ArgumentOutOfRangeException(nameof(outcome));
+        using var c = DatabaseStore.OpenExisting(databasePath);
+        using var tx = c.BeginTransaction(deferred: false);
+        using var cmd = c.CreateCommand();
+        cmd.Transaction = tx;
+        cmd.CommandText = "UPDATE um6_profile_link_journal SET State=$state WHERE ReservationId=$id AND State=2;";
+        cmd.Parameters.AddWithValue("$id", reservationId);
+        cmd.Parameters.AddWithValue("$state", (int)outcome);
+        bool recorded = cmd.ExecuteNonQuery() == 1;
+        tx.Commit();
+        return recorded;
+    }
+
+    internal static void RequireEquivalentProfileLinksForRestore(string currentPath, string candidatePath)
+    {
+        using var current = DatabaseBackup.OpenRaw(currentPath, SqliteOpenMode.ReadOnly);
+        using var candidate = DatabaseBackup.OpenRaw(candidatePath, SqliteOpenMode.ReadOnly);
+        DatabaseBackup.RequireIdentity(current);
+        DatabaseBackup.RequireIdentity(candidate);
+        using var a = current.CreateCommand();
+        using var b = candidate.CreateCommand();
+        const string query = """
+            SELECT ReservationId,RemoteId,State FROM um6_profile_link_journal
+            ORDER BY ReservationId COLLATE BINARY;
+            """;
+        a.CommandText = query;
+        b.CommandText = query;
+        using var left = a.ExecuteReader();
+        using var right = b.ExecuteReader();
+        while (true)
+        {
+            bool hasLeft = left.Read(), hasRight = right.Read();
+            if (hasLeft != hasRight) throw RestoreConflict();
+            if (!hasLeft) return;
+            for (int i = 0; i < 3; i++)
+                if (!Equals(left.GetValue(i), right.GetValue(i))) throw RestoreConflict();
+        }
     }
 
     // Persist only positive readback evidence. Revalidate the whole scope inside
