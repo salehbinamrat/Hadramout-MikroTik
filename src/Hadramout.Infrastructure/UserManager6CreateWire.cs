@@ -14,14 +14,35 @@ internal sealed record UserManager6CreateWireReceipt(UserManager6CreateWireOutco
 // Caller owns and must close the stream on any uncertain outcome/exception.
 internal sealed class UserManager6CreateWire(Stream stream)
 {
-    private static readonly UTF8Encoding Utf8 = new(false, true);
-    private int started;
+    private readonly UserManagerCreateExchange exchange = new(stream);
 
     internal async Task<UserManager6CreateWireReceipt> CreateDisabledOnceAsync(Guid reservationId,
         string customer, string username, ReadOnlyMemory<byte> password, CancellationToken cancellationToken)
     {
-        if (reservationId == Guid.Empty) throw new ArgumentException("Reservation identity required.", nameof(reservationId));
         UserManager6Records.ValidateKey(customer, nameof(customer));
+        var receipt = await exchange.ExecuteOnceAsync(false, reservationId, customer, username, password,
+            cancellationToken).ConfigureAwait(false);
+        return new(receipt.Acknowledged ? UserManager6CreateWireOutcome.Acknowledged :
+            UserManager6CreateWireOutcome.Indeterminate, receipt.ReturnedId);
+    }
+
+    internal static void ValidatePassword(ReadOnlySpan<byte> value) => UserManagerCreateExchange.ValidatePassword(value);
+}
+
+internal sealed record UserManagerCreateCompletion(bool Acknowledged, string? ReturnedId);
+
+// Shared bounded one-shot exchange; only the two fixed creation projections
+// below are supported. The caller is responsible for exclusive stream ownership.
+internal sealed class UserManagerCreateExchange(Stream stream)
+{
+    private static readonly UTF8Encoding Utf8 = new(false, true);
+    private int started;
+
+    internal async Task<UserManagerCreateCompletion> ExecuteOnceAsync(bool um7, Guid reservationId,
+        string scope, string username, ReadOnlyMemory<byte> password, CancellationToken cancellationToken)
+    {
+        if (reservationId == Guid.Empty) throw new ArgumentException("Reservation identity required.", nameof(reservationId));
+        UserManager6Records.ValidateKey(scope, nameof(scope));
         UserManager6Records.ValidateKey(username, nameof(username));
         ValidatePassword(password.Span);
         cancellationToken.ThrowIfCancellationRequested();
@@ -36,11 +57,11 @@ internal sealed class UserManager6CreateWire(Stream stream)
             "=password="u8.CopyTo(passwordWord);
             password.Span.CopyTo(passwordWord.AsSpan(10));
             await RouterOsWireCodec.WriteSentenceAsync(stream,
-                ["/tool/user-manager/user/add"u8.ToArray(),
-                    Utf8.GetBytes("=customer=" + customer),
-                    Utf8.GetBytes("=username=" + username),
+                [um7 ? "/user-manager/user/add"u8.ToArray() : "/tool/user-manager/user/add"u8.ToArray(),
+                    Utf8.GetBytes((um7 ? "=group=" : "=customer=") + scope),
+                    Utf8.GetBytes((um7 ? "=name=" : "=username=") + username),
                     passwordWord, "=disabled=yes"u8.ToArray(),
-                    Utf8.GetBytes("=comment=hmk-create:" + reservationId.ToString("N"))],
+                    Utf8.GetBytes((um7 ? "=comment=hmk-um7-create:" : "=comment=hmk-create:") + reservationId.ToString("N"))],
                 cancellationToken).ConfigureAwait(false);
         }
         catch (Exception error) when (IsUncertainTransportFailure(error))
@@ -68,19 +89,19 @@ internal sealed class UserManager6CreateWire(Stream stream)
         }
     }
 
-    private static UserManager6CreateWireReceipt ParseCompletion(byte[][] words)
+    private static UserManagerCreateCompletion ParseCompletion(byte[][] words)
     {
         // Accept only a bare completion or a single bounded opaque RouterOS ID.
         // Never interpret trap text, a data row, or a following completion as success.
         if (words.Length == 0 || !words[0].AsSpan().SequenceEqual("!done"u8)) return Uncertain();
-        if (words.Length == 1) return new(UserManager6CreateWireOutcome.Acknowledged, null);
+        if (words.Length == 1) return new(true, null);
         if (words.Length != 2 || !words[1].AsSpan().StartsWith("=ret=*"u8) ||
             words[1].Length is < 7 or > 38) return Uncertain();
         foreach (byte value in words[1].AsSpan(6))
             if (value is not (>= (byte)'0' and <= (byte)'9') and
                 not (>= (byte)'A' and <= (byte)'F') and not (>= (byte)'a' and <= (byte)'f'))
                 return Uncertain();
-        return new(UserManager6CreateWireOutcome.Acknowledged, Encoding.ASCII.GetString(words[1], 5, words[1].Length - 5));
+        return new(true, Encoding.ASCII.GetString(words[1], 5, words[1].Length - 5));
     }
 
     internal static void ValidatePassword(ReadOnlySpan<byte> value)
@@ -98,6 +119,5 @@ internal sealed class UserManager6CreateWire(Stream stream)
         error is IOException or InvalidDataException or SocketException or AuthenticationException
             or OperationCanceledException or ObjectDisposedException;
 
-    private static UserManager6CreateWireReceipt Uncertain() =>
-        new(UserManager6CreateWireOutcome.Indeterminate, null);
+    private static UserManagerCreateCompletion Uncertain() => new(false, null);
 }
