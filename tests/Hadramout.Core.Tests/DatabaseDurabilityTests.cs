@@ -1067,6 +1067,87 @@ public sealed class DatabaseDurabilityTests
         Assert.False(journal.TryBeginBoundDispatch(id));
     }
 
+    [Theory]
+    [InlineData("started")]
+    [InlineData("indeterminate")]
+    [InlineData("legacy-ack")]
+    [InlineData("ack")]
+    [SupportedOSPlatform("windows")]
+    public void RecoveryEvidenceRetainsOriginalStateAndNeverFabricatesReceipt(string state)
+    {
+        using var file = new TestFile();
+        Guid id = SeedSecretIntent(file.Path);
+        new UserManager6VoucherSecretStore(file.Path).Save(id, "synthetic"u8);
+        var journal = new UserManager6CreateJournal(file.Path);
+        Assert.True(journal.TryBeginBoundDispatch(id));
+        if (state == "indeterminate") Assert.True(journal.TryMarkIndeterminate(id));
+        if (state == "legacy-ack") Assert.True(journal.TryMarkAcknowledged(id));
+        if (state == "ack") Assert.True(journal.TryRecordAcknowledgement(id, new(UserManager6CreateWireOutcome.Acknowledged, "*1")));
+        var prior = journal.ReadBoundRecoveryScope(id);
+        Assert.False(journal.TryRecordRecoveryObservation(new(prior, null)));
+        Assert.True(journal.TryRecordRecoveryObservation(new(prior, new("*1", prior.ExpectedRemoteId is not null))));
+        var stored = journal.ReadBoundRecoveryScope(id);
+        Assert.NotNull(stored.Recovery);
+        Assert.Equal(prior.State, stored.Recovery.StateAtObservation);
+        Assert.Equal("*1", stored.ExpectedRemoteId);
+        Assert.Equal(prior.Evidence, stored.Evidence);
+        Assert.Equal(prior.State, journal.Read(id)!.State);
+        Assert.False(journal.TryRecordRecoveryObservation(new(stored, null)));
+        Assert.False(journal.TryRecordRecoveryObservation(new(stored, new("*1", true))));
+        Assert.Throws<InvalidOperationException>(() => journal.TryRecordRecoveryObservation(new(stored, new("*2", true))));
+        Assert.Throws<InvalidOperationException>(() => journal.TryRecordRecoveryObservation(new(prior, new("*1", prior.ExpectedRemoteId is not null))));
+        Assert.False(journal.TryBeginBoundDispatch(id));
+    }
+
+    [Fact]
+    [SupportedOSPlatform("windows")]
+    public void RecoveryEvidenceRejectsLateConflictingAcknowledgementAndCannotBeRolledBack()
+    {
+        using var file = new TestFile();
+        using var earlier = new TestFile();
+        using var identical = new TestFile();
+        Guid id = SeedSecretIntent(file.Path);
+        new UserManager6VoucherSecretStore(file.Path).Save(id, "synthetic"u8);
+        var journal = new UserManager6CreateJournal(file.Path);
+        Assert.True(journal.TryBeginBoundDispatch(id));
+        using (var c = DatabaseStore.Open(file.Path))
+        using (var destination = earlier.OpenRaw()) c.BackupDatabase(destination);
+        var scope = journal.ReadBoundRecoveryScope(id);
+        Assert.True(journal.TryRecordRecoveryObservation(new(scope, new("*1", false))));
+        Assert.Throws<SqliteException>(() => journal.TryRecordAcknowledgement(id,
+            new(UserManager6CreateWireOutcome.Acknowledged, "*2")));
+        Assert.Equal(UserManager6CreateState.DispatchStarted, journal.Read(id)!.State);
+        Assert.Null(journal.ReadCreationEvidence(id));
+        using (var c = DatabaseStore.Open(file.Path))
+        {
+            Assert.Throws<SqliteException>(() => Execute(c, "UPDATE um6_recovery_evidence SET RemoteId='*2';"));
+            Assert.Throws<SqliteException>(() => Execute(c, "DELETE FROM um6_recovery_evidence;"));
+            Assert.Throws<SqliteException>(() => Execute(c, "INSERT OR REPLACE INTO um6_recovery_evidence SELECT * FROM um6_recovery_evidence;"));
+            using var destination = identical.OpenRaw();
+            c.BackupDatabase(destination);
+        }
+        Assert.Throws<InvalidOperationException>(() => UserManager6CreateJournal.RequireEquivalentRecoveryForRestore(file.Path, earlier.Path));
+        Assert.Throws<InvalidOperationException>(() => UserManager6CreateJournal.RequireEquivalentRecoveryForRestore(earlier.Path, file.Path));
+        UserManager6CreateJournal.RequireEquivalentRecoveryForRestore(file.Path, identical.Path);
+        Assert.True(journal.TryRecordAcknowledgement(id, new(UserManager6CreateWireOutcome.Acknowledged, "*1")));
+        Assert.Equal(UserManager6CreateState.DispatchStarted, journal.ReadBoundRecoveryScope(id).Recovery!.StateAtObservation);
+    }
+
+    [Fact]
+    [SupportedOSPlatform("windows")]
+    public void RecoveryEvidenceRejectsScopeDriftBeforePersistence()
+    {
+        using var file = new TestFile();
+        Guid id = SeedSecretIntent(file.Path);
+        new UserManager6VoucherSecretStore(file.Path).Save(id, "synthetic"u8);
+        var journal = new UserManager6CreateJournal(file.Path);
+        Assert.True(journal.TryBeginBoundDispatch(id));
+        var scope = journal.ReadBoundRecoveryScope(id);
+        Assert.True(journal.TryMarkIndeterminate(id));
+        Assert.Throws<InvalidOperationException>(() => journal.TryRecordRecoveryObservation(new(scope, new("*1", false))));
+        Assert.Null(journal.ReadBoundRecoveryScope(id).Recovery);
+    }
+
     private static Guid SeedSecretIntent(string path)
     {
         Guid id = SeedReservation(path, BackendKind.UserManager6);
@@ -1106,13 +1187,14 @@ public sealed class DatabaseDurabilityTests
     // guard in sync with new migrations; never silently leave a newer table behind.
     internal static void RecreateLegacyFixture(SqliteConnection c, int version)
     {
-        if (version is < 1 or > 8) throw new ArgumentOutOfRangeException(nameof(version));
-        Assert.Equal(9, DatabaseStore.CurrentSchemaVersion);
-        Assert.Equal(9L, Scalar(c, "PRAGMA user_version;"));
+        if (version is < 1 or > 9) throw new ArgumentOutOfRangeException(nameof(version));
+        Assert.Equal(10, DatabaseStore.CurrentSchemaVersion);
+        Assert.Equal(10L, Scalar(c, "PRAGMA user_version;"));
         using var tx = c.BeginTransaction(deferred: false);
         using var cmd = c.CreateCommand();
         cmd.Transaction = tx;
-        cmd.CommandText = "DROP TABLE um6_create_evidence;";
+        cmd.CommandText = "DROP TRIGGER um6_recovery_consistency_guard; DROP TABLE um6_recovery_evidence;";
+        if (version < 9) cmd.CommandText += " DROP TABLE um6_create_evidence;";
         if (version < 8) cmd.CommandText += " DROP TABLE um6_voucher_secrets;";
         if (version < 7) cmd.CommandText += " DROP TABLE um6_create_intents;";
         if (version < 6) cmd.CommandText += " DROP TABLE router_targets;";
@@ -1127,7 +1209,7 @@ public sealed class DatabaseDurabilityTests
 
         cmd.Transaction = null;
         cmd.CommandText = "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%';";
-        Assert.Equal(version == 8 ? 12L : version == 7 ? 11L : version == 6 ? 10L : version == 5 ? 9L : version == 4 ? 8L : version == 3 ? 7L : 6L, (long)cmd.ExecuteScalar()!);
+        Assert.Equal(version == 9 ? 13L : version == 8 ? 12L : version == 7 ? 11L : version == 6 ? 10L : version == 5 ? 9L : version == 4 ? 8L : version == 3 ? 7L : 6L, (long)cmd.ExecuteScalar()!);
         Assert.Equal((long)version, Scalar(c, "PRAGMA user_version;"));
     }
 
@@ -1140,6 +1222,7 @@ public sealed class DatabaseDurabilityTests
     [InlineData(6)]
     [InlineData(7)]
     [InlineData(8)]
+    [InlineData(9)]
     public void EveryLegacyFixtureHasOnlyItsOwnSchemaAndUpgrades(int version)
     {
         using var file = new TestFile();

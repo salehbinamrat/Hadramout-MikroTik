@@ -37,7 +37,8 @@
 - PR #36 merged a64c993782144e9336db49074ea47fb9a90163ed; Core 45899919249 / Release 45899919233 passed on c49adc8e785a1abd94414835117c4ea22623cee6; package artifact 15155766312, smoke evidence 15156080884. Qualification-only coordination and corrected smoke stages passed hosted CI; no live connector or activation.
 - PR #37 merged 3593c528f29aa8b8d5ffc5871929bbfff05deb8b; Core 45946143109 / Release 45946143154 passed on 12e384fdac64cc435e87b2f565f3c3cea82d38f7; package artifact 15175360138, smoke evidence 15174872979. Exact isolated disabled-account readback passed hosted CI.
 - PR #38 merged 064841463b419f1b9adc1e914b8463dc8fff25b2; Core 45946940379 / Release 45946940332 passed on df0c3accbe3a581335de8e01c4c4d1c9b345a548; package artifact 15174978820, smoke evidence 15174978828. Schema v9 durable creation evidence passed hosted CI.
-- P16c.3c.3a proposed bound read-only recovery review and 13 synthetic TLS/local regression cases; hosted CI pending. No durable recovery transition, production writes, profile activation or printing.
+- PR #39 merged 0ada32a1aacac5389e814f3a2c0a1eb554be8877; Core 45947795017 / Release 45947794952 passed on 78fcfbfd39b0b46f57f79801d91bd9991e21e20b; package artifact 15175697170, smoke evidence 15175313199. Bound read-only recovery passed hosted CI.
+- P16c.3c.3b proposed schema v10 immutable positive recovery evidence, atomic scope revalidation, cross-evidence consistency and exact restore guard; 9 new regression cases including v9 migration. Hosted CI pending. No production writes, activation or printing.
 - P10 remaining: restore UI and RBAC, managed crash cleanup, real cross-account/device validation, full audit coverage/actor attribution, retention and scheduling. No production restore.
 - P01 deeper per-feature audit; physical Windows, RouterOS, printers; hard-kill, power-loss and disk-full tests pending. main remains unprotected; exact-head manual gate enforced. No production DB or real router changes.
 
