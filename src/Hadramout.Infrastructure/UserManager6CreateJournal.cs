@@ -17,6 +17,17 @@ internal sealed record UserManager6PreflightScope(Guid ReservationId, Guid Route
 // Null record means no durable acknowledgement; null ID is a bare acknowledgement.
 internal sealed record UserManager6StoredCreationEvidence(string? ReturnedId, string? ObservedId);
 
+// Snapshot of the immutable intent and current retained evidence. No secret lease.
+internal sealed record UserManager6RecoveryScope(Guid ReservationId, Guid RouterId,
+    string LeafSha256, string Customer, string Username, UserManager6CreateState State,
+    UserManager6StoredCreationEvidence? Evidence)
+{
+    internal string? ExpectedRemoteId => Evidence?.ObservedId ?? Evidence?.ReturnedId;
+}
+
+internal sealed record UserManager6RecoveryObservation(UserManager6RecoveryScope Scope,
+    UserManager6DisabledCreationObservation? VisibleDisabledAccount);
+
 internal sealed record UserManager6CreationReviewRow(UserManager6CreateEntry Entry, bool LocalIdentityMatches);
 internal sealed record UserManager6CreationReviewPage(IReadOnlyList<UserManager6CreationReviewRow> Rows,
     Guid? NextAfterReservationId);
@@ -228,6 +239,52 @@ internal sealed class UserManager6CreateJournal(string databasePath)
         }
         using var secret = UserManager6VoucherSecretStore.Load(c, tx, reservationId)
             ?? throw new InvalidOperationException("Voucher password has not been configured.");
+        tx.Commit();
+        return scope;
+    }
+
+    // Read a consistent local scope for a non-rearmable bound operation.
+    // Legacy unbound entries and drifted relationships are not eligible for network review.
+    internal UserManager6RecoveryScope ReadBoundRecoveryScope(Guid reservationId)
+    {
+        ValidateId(reservationId);
+        using var c = OpenReadOnly();
+        using var tx = c.BeginTransaction(deferred: true);
+        using var cmd = c.CreateCommand();
+        cmd.Transaction = tx;
+        cmd.CommandText = """
+            SELECT j.RouterId,i.LeafSha256,j.Customer,j.Username,j.State,
+                   ack.Kind,ack.RemoteId,observed.RemoteId
+            FROM um6_create_journal j
+            JOIN um6_create_intents i ON i.ReservationId=j.ReservationId
+            JOIN voucher_reservations v ON v.Id=j.ReservationId AND v.BackendId=j.BackendId AND v.Username=j.Username
+            JOIN backends b ON b.Id=j.BackendId AND b.RouterId=j.RouterId AND b.Kind=2
+            JOIN voucher_batches batch ON batch.Id=v.BatchId AND batch.Id=i.BatchId AND batch.BackendId=j.BackendId
+            JOIN plans p ON p.Id=batch.PlanId AND p.Id=i.PlanId AND p.BackendId=j.BackendId AND p.Name=i.PlanName
+            JOIN router_targets t ON t.RouterId=j.RouterId AND t.LeafSha256=i.LeafSha256
+            JOIN um6_voucher_secrets secret ON secret.ReservationId=j.ReservationId
+            LEFT JOIN um6_create_evidence ack ON ack.ReservationId=j.ReservationId AND ack.Kind=1
+            LEFT JOIN um6_create_evidence observed ON observed.ReservationId=j.ReservationId AND observed.Kind=2
+            WHERE j.ReservationId=$id AND j.State IN (2,3,4);
+            """;
+        cmd.Parameters.AddWithValue("$id", reservationId);
+        UserManager6RecoveryScope scope;
+        using (var r = cmd.ExecuteReader())
+        {
+            if (!r.Read()) throw new InvalidOperationException("Matching bound non-rearmable creation required.");
+            var state = (UserManager6CreateState)r.GetInt32(4);
+            string? returned = r.IsDBNull(6) ? null : r.GetString(6);
+            string? observed = r.IsDBNull(7) ? null : r.GetString(7);
+            bool hasAck = !r.IsDBNull(5);
+            if ((hasAck && state != UserManager6CreateState.Acknowledged) ||
+                (!hasAck && observed is not null) ||
+                (returned is not null && !UserManager6Records.IsOpaqueRemoteId(returned)) ||
+                (observed is not null && (!UserManager6Records.IsOpaqueRemoteId(observed) ||
+                    (returned is not null && returned != observed))))
+                throw new InvalidDataException("Inconsistent retained creation evidence.");
+            scope = new(reservationId, r.GetGuid(0), r.GetString(1), r.GetString(2),
+                r.GetString(3), state, hasAck ? new(returned, observed) : null);
+        }
         tx.Commit();
         return scope;
     }

@@ -268,6 +268,29 @@ internal sealed class RouterOsSession : IDisposable
         if (receipt.Outcome != UserManager6CreateWireOutcome.Acknowledged ||
             (receipt.ReturnedId is not null && !UserManager6Records.IsOpaqueRemoteId(receipt.ReturnedId)))
             throw new InvalidOperationException("A valid acknowledged creation receipt is required.");
+        return await ReadUm6DisabledIdentityCoreAsync(stream, reservationId, customer, username,
+            receipt.ReturnedId, token).ConfigureAwait(false);
+    }
+
+    // Recovery has no fabricated acknowledgement: use only the retained expected ID, if any.
+    internal Task<UserManager6DisabledCreationObservation?> ReadUm6RecoveryObservationAsync(
+        UserManager6RecoveryScope scope, TimeSpan? timeout = null, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(scope);
+        return WithReadSessionAsync((stream, token) => ReadUm6DisabledIdentityCoreAsync(stream,
+            scope.ReservationId, scope.Customer, scope.Username, scope.ExpectedRemoteId, token),
+            timeout, cancellationToken);
+    }
+
+    private static async Task<UserManager6DisabledCreationObservation?> ReadUm6DisabledIdentityCoreAsync(
+        Stream stream, Guid reservationId, string customer, string username, string? expectedId,
+        CancellationToken token)
+    {
+        if (reservationId == Guid.Empty) throw new ArgumentException("Reservation identity required.", nameof(reservationId));
+        UserManager6Records.ValidateKey(customer, nameof(customer));
+        UserManager6Records.ValidateKey(username, nameof(username));
+        if (expectedId is not null && !UserManager6Records.IsOpaqueRemoteId(expectedId))
+            throw new ArgumentException("Invalid expected RouterOS identity.", nameof(expectedId));
         token.ThrowIfCancellationRequested();
         await RequireUserManager6FamilyAsync(stream, token).ConfigureAwait(false);
         // Global visible username match, not a customer-filtered query that could
@@ -277,7 +300,7 @@ internal sealed class RouterOsSession : IDisposable
                 "=.proplist=.id,customer,username,disabled,comment"u8.ToArray(),
                 UserManager6Records.Query("username", username)],
             words => UserManager6Records.ParseDisabledCreationObservation(words,
-                reservationId, customer, username, receipt.ReturnedId), 1, token).ConfigureAwait(false);
+                reservationId, customer, username, expectedId), 1, token).ConfigureAwait(false);
         token.ThrowIfCancellationRequested();
         return rows.Count == 0 ? null : rows[0];
     }
