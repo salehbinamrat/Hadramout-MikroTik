@@ -191,7 +191,7 @@ public static class DatabaseBackup
             throw new InvalidDataException("Backup belongs to another application.");
         cmd.CommandText = "PRAGMA user_version;";
         long version = (long)cmd.ExecuteScalar()!;
-        if (version != DatabaseStore.CurrentSchemaVersion && !(allowLegacyVersion && version is 4 or 5 or 6 or 7 or 8 or 9 or 10 or 11 or 12))
+        if (version != DatabaseStore.CurrentSchemaVersion && !(allowLegacyVersion && version is 4 or 5 or 6 or 7 or 8 or 9 or 10 or 11 or 12 or 13))
             throw new InvalidDataException("Backup schema version is not supported by this release.");
     }
 
@@ -316,6 +316,16 @@ public static class DatabaseBackup
                 """;
             if ((long)cmd.ExecuteScalar()! != 4)
                 throw new InvalidDataException("Backup is missing UM7 voucher secret objects.");
+        }
+        if (version >= 14)
+        {
+            cmd.CommandText = """
+                SELECT count(*) FROM sqlite_schema WHERE
+                    (type='table' AND name='um7_create_claims') OR
+                    (type='trigger' AND name IN ('um7_claim_insert_guard','um7_claim_update_guard','um7_claim_no_delete'));
+                """;
+            if ((long)cmd.ExecuteScalar()! != 4)
+                throw new InvalidDataException("Backup is missing UM7 creation claim objects.");
         }
     }
 
