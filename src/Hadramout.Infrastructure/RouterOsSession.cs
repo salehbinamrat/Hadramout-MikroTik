@@ -296,16 +296,29 @@ internal sealed class RouterOsSession : IDisposable
             throw new InvalidOperationException("Prior exact disabled-account evidence required.");
         return WithReadSessionAsync<UserManager6ProfileLinkReadEvidence>(async (stream, token) =>
         {
-            var account = await ReadUm6DisabledIdentityCoreAsync(stream, creation.ReservationId,
-                creation.Customer, creation.Username, creation.ExpectedRemoteId, token).ConfigureAwait(false);
-            if (account is null)
+            await RequireUserManager6FamilyAsync(stream, token).ConfigureAwait(false);
+            var accounts = await ReadCommandAsync(stream,
+                ["/tool/user-manager/user/print"u8.ToArray(),
+                    "=.proplist=.id,customer,username,disabled,comment,actual-profile"u8.ToArray(),
+                    UserManager6Records.Query("username", creation.Username)],
+                words => UserManager6Records.ParseProfileLinkAccount(words, creation.ReservationId,
+                    creation.Customer, creation.Username, creation.ExpectedRemoteId!), 1, token).ConfigureAwait(false);
+            token.ThrowIfCancellationRequested();
+            if (accounts.Count == 0)
                 return new(UserManager6ProfileLinkReadState.AccountNotVisible, null, null);
+            var (account, actualProfile) = accounts[0];
+            // Missing/whitespace is unknown, never an empty-profile observation.
+            // Any named profile (even the intended one) blocks a new link claim.
+            if (actualProfile != string.Empty)
+                return new(string.IsNullOrWhiteSpace(actualProfile)
+                    ? UserManager6ProfileLinkReadState.AccountProfileUnknown
+                    : UserManager6ProfileLinkReadState.AccountProfileAlreadyVisible, account, null, actualProfile);
             var profiles = await ReadUniqueVisibleUm6ProfileAsync(stream,
                 scope.ProfileOwner, scope.ProfileName, token).ConfigureAwait(false);
             token.ThrowIfCancellationRequested();
             return profiles.Count == 0
-                ? new(UserManager6ProfileLinkReadState.ProfileNotVisible, account, null)
-                : new(UserManager6ProfileLinkReadState.BothVisible, account, profiles[0]);
+                ? new(UserManager6ProfileLinkReadState.ProfileNotVisible, account, null, actualProfile)
+                : new(UserManager6ProfileLinkReadState.BothVisible, account, profiles[0], actualProfile);
         }, timeout, cancellationToken);
     }
 

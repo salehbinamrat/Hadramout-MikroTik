@@ -1150,7 +1150,7 @@ public sealed class DatabaseDurabilityTests
 
     private static UserManager6ProfileLinkReadEvidence MatchingProfileEvidence(UserManager6ProfileLinkScope scope) =>
         new(UserManager6ProfileLinkReadState.BothVisible, new(scope.Creation.ExpectedRemoteId!, true),
-            new(scope.ProfileOwner, scope.ProfileName, null, null));
+            new(scope.ProfileOwner, scope.ProfileName, null, null), string.Empty);
 
     [Theory]
     [InlineData(true)]
@@ -1201,6 +1201,10 @@ public sealed class DatabaseDurabilityTests
     [InlineData("wrong-owner")]
     [InlineData("wrong-id")]
     [InlineData("drift")]
+    [InlineData("unknown-current")]
+    [InlineData("whitespace-current")]
+    [InlineData("same-current")]
+    [InlineData("other-current")]
     [SupportedOSPlatform("windows")]
     public void ProfileLinkClaimRejectsUnsafeOrStaleEvidence(string condition)
     {
@@ -1218,6 +1222,10 @@ public sealed class DatabaseDurabilityTests
             "missing-profile" => evidence with { State = UserManager6ProfileLinkReadState.ProfileNotVisible, Profile = null },
             "wrong-owner" => evidence with { Profile = new("other", scope.ProfileName, null, null) },
             "wrong-id" => evidence with { Account = new("*2", true) },
+            "unknown-current" => evidence with { ActualProfile = null },
+            "whitespace-current" => evidence with { ActualProfile = " " },
+            "same-current" => evidence with { ActualProfile = scope.ProfileName },
+            "other-current" => evidence with { ActualProfile = "other-day" },
             _ => evidence
         };
         if (condition == "drift")

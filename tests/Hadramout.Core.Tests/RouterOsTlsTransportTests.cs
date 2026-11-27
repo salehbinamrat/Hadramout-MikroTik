@@ -1799,6 +1799,11 @@ public sealed class RouterOsTlsTransportTests(ITestOutputHelper output)
     [InlineData("wrong-owner")]
     [InlineData("duplicate-profile")]
     [InlineData("scope-drift")]
+    [InlineData("profile-unknown")]
+    [InlineData("profile-whitespace")]
+    [InlineData("profile-intended")]
+    [InlineData("profile-other")]
+    [InlineData("profile-duplicate")]
     [SupportedOSPlatform("windows")]
     public async Task BoundProfileLinkPreflightUsesRetainedIdentityAndExactProfile(string condition)
     {
@@ -1819,18 +1824,30 @@ public sealed class RouterOsTlsTransportTests(ITestOutputHelper output)
                 await PrepareProbePeerAsync(tls, token, "6.49.19");
                 byte[][] request = await RouterOsWireCodec.ReadSentenceAsync(tls, token);
                 Assert.Equal(new[] { "/tool/user-manager/user/print",
-                    "=.proplist=.id,customer,username,disabled,comment", "?username=001" },
+                    "=.proplist=.id,customer,username,disabled,comment,actual-profile", "?username=001" },
                     request.Select(word => Encoding.UTF8.GetString(word)).ToArray());
                 if (condition != "account-absent")
                 {
-                    await RouterOsWireCodec.WriteSentenceAsync(tls, ["!re"u8.ToArray(),
-                        condition == "account-mismatch" ? "=.id=*2"u8.ToArray() : "=.id=*1"u8.ToArray(),
+                    var words = new List<ReadOnlyMemory<byte>>
+                    {
+                        "!re"u8.ToArray(), condition == "account-mismatch" ? "=.id=*2"u8.ToArray() : "=.id=*1"u8.ToArray(),
                         "=customer=admin"u8.ToArray(), "=username=001"u8.ToArray(), "=disabled=yes"u8.ToArray(),
-                        Encoding.UTF8.GetBytes("=comment=hmk-create:" + id.ToString("N"))], token);
-                    if (condition == "account-mismatch") return;
+                        Encoding.UTF8.GetBytes("=comment=hmk-create:" + id.ToString("N"))
+                    };
+                    if (condition != "profile-unknown")
+                        words.Add(Encoding.UTF8.GetBytes("=actual-profile=" + (condition switch
+                        {
+                            "profile-whitespace" => " ",
+                            "profile-intended" => "remote-day",
+                            "profile-other" => "other-day",
+                            _ => ""
+                        })));
+                    if (condition == "profile-duplicate") words.Add("=actual-profile=other-day"u8.ToArray());
+                    await RouterOsWireCodec.WriteSentenceAsync(tls, words.ToArray(), token);
+                    if (condition is "account-mismatch" or "profile-duplicate") return;
                 }
                 await RouterOsWireCodec.WriteSentenceAsync(tls, ["!done"u8.ToArray()], token);
-                if (condition != "account-absent")
+                if (condition is not ("account-absent" or "profile-unknown" or "profile-whitespace" or "profile-intended" or "profile-other"))
                 {
                     request = await RouterOsWireCodec.ReadSentenceAsync(tls, token);
                     Assert.Equal(new[] { "/tool/user-manager/profile/print",
@@ -1862,7 +1879,7 @@ public sealed class RouterOsTlsTransportTests(ITestOutputHelper output)
             });
             try
             {
-                if (condition is "account-mismatch" or "wrong-owner" or "duplicate-profile")
+                if (condition is "account-mismatch" or "wrong-owner" or "duplicate-profile" or "profile-duplicate")
                     await Assert.ThrowsAsync<InvalidDataException>(() => RouterOsReadRecovery.ReadBoundUm6ProfileLinkPreflightAsync(path, id));
                 else if (condition == "scope-drift")
                     await Assert.ThrowsAsync<InvalidOperationException>(() => RouterOsReadRecovery.ReadBoundUm6ProfileLinkPreflightAsync(path, id));
@@ -1873,10 +1890,25 @@ public sealed class RouterOsTlsTransportTests(ITestOutputHelper output)
                     {
                         "account-absent" => UserManager6ProfileLinkReadState.AccountNotVisible,
                         "profile-absent" => UserManager6ProfileLinkReadState.ProfileNotVisible,
+                        "profile-unknown" or "profile-whitespace" => UserManager6ProfileLinkReadState.AccountProfileUnknown,
+                        "profile-intended" or "profile-other" => UserManager6ProfileLinkReadState.AccountProfileAlreadyVisible,
                         _ => UserManager6ProfileLinkReadState.BothVisible
                     }, evidence.State);
                     Assert.Equal(condition == "account-absent" ? null : "*1", evidence.Account?.RemoteId);
                     Assert.Equal(condition == "both" ? "remote-day" : null, evidence.Profile?.Name);
+                    Assert.Equal(condition switch
+                    {
+                        "account-absent" or "profile-unknown" => null,
+                        "profile-whitespace" => " ",
+                        "profile-intended" => "remote-day",
+                        "profile-other" => "other-day",
+                        _ => ""
+                    }, evidence.ActualProfile);
+                    if (condition != "both")
+                    {
+                        Assert.Throws<InvalidOperationException>(() => journal.TryClaimProfileLink(prior, evidence));
+                        Assert.Null(journal.ReadProfileLinkEntry(id));
+                    }
                 }
                 if (condition != "scope-drift") Assert.Equal(prior, journal.ReadProfileLinkScope(id));
                 Assert.Equal(UserManager6CreateState.Indeterminate, journal.Read(id)!.State);

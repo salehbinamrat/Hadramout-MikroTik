@@ -33,10 +33,10 @@ internal sealed record UserManager6RecoveryObservation(UserManager6RecoveryScope
 internal sealed record UserManager6ProfileLinkScope(UserManager6RecoveryScope Creation,
     string ProfileOwner, string ProfileName);
 
-internal enum UserManager6ProfileLinkReadState { AccountNotVisible, ProfileNotVisible, BothVisible }
+internal enum UserManager6ProfileLinkReadState { AccountNotVisible, ProfileNotVisible, BothVisible, AccountProfileUnknown, AccountProfileAlreadyVisible }
 
 internal sealed record UserManager6ProfileLinkReadEvidence(UserManager6ProfileLinkReadState State,
-    UserManager6DisabledCreationObservation? Account, UserManager6Profile? Profile);
+    UserManager6DisabledCreationObservation? Account, UserManager6Profile? Profile, string? ActualProfile = null);
 
 internal enum UserManager6ProfileLinkState { DispatchStarted = 2, Indeterminate = 3, Acknowledged = 4 }
 internal sealed record UserManager6ProfileLinkEntry(Guid ReservationId, string RemoteId, UserManager6ProfileLinkState State);
@@ -368,7 +368,7 @@ internal sealed class UserManager6CreateJournal(string databasePath)
         string? remoteId = scope.Creation.ExpectedRemoteId;
         if (scope.Creation.State is not (UserManager6CreateState.Indeterminate or UserManager6CreateState.Acknowledged) ||
             !UserManager6Records.IsOpaqueRemoteId(remoteId) ||
-            evidence.State != UserManager6ProfileLinkReadState.BothVisible ||
+            evidence.State != UserManager6ProfileLinkReadState.BothVisible || evidence.ActualProfile != string.Empty ||
             evidence.Account is null || !evidence.Account.ReturnedIdMatched || evidence.Account.RemoteId != remoteId ||
             evidence.Profile is null || evidence.Profile.Owner != scope.ProfileOwner || evidence.Profile.Name != scope.ProfileName)
             throw new InvalidOperationException("Exact account and intended profile evidence required.");
