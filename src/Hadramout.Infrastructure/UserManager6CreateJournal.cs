@@ -20,10 +20,12 @@ internal sealed record UserManager6StoredCreationEvidence(string? ReturnedId, st
 // Snapshot of the immutable intent and current retained evidence. No secret lease.
 internal sealed record UserManager6RecoveryScope(Guid ReservationId, Guid RouterId,
     string LeafSha256, string Customer, string Username, UserManager6CreateState State,
-    UserManager6StoredCreationEvidence? Evidence)
+    UserManager6StoredCreationEvidence? Evidence, UserManager6StoredRecoveryEvidence? Recovery = null)
 {
-    internal string? ExpectedRemoteId => Evidence?.ObservedId ?? Evidence?.ReturnedId;
+    internal string? ExpectedRemoteId => Recovery?.RemoteId ?? Evidence?.ObservedId ?? Evidence?.ReturnedId;
 }
+
+internal sealed record UserManager6StoredRecoveryEvidence(UserManager6CreateState StateAtObservation, string RemoteId);
 
 internal sealed record UserManager6RecoveryObservation(UserManager6RecoveryScope Scope,
     UserManager6DisabledCreationObservation? VisibleDisabledAccount);
@@ -250,11 +252,19 @@ internal sealed class UserManager6CreateJournal(string databasePath)
         ValidateId(reservationId);
         using var c = OpenReadOnly();
         using var tx = c.BeginTransaction(deferred: true);
+        var scope = ReadBoundRecoveryScope(c, tx, reservationId);
+        tx.Commit();
+        return scope;
+    }
+
+    private static UserManager6RecoveryScope ReadBoundRecoveryScope(SqliteConnection c,
+        SqliteTransaction tx, Guid reservationId)
+    {
         using var cmd = c.CreateCommand();
         cmd.Transaction = tx;
         cmd.CommandText = """
             SELECT j.RouterId,i.LeafSha256,j.Customer,j.Username,j.State,
-                   ack.Kind,ack.RemoteId,observed.RemoteId
+                   ack.Kind,ack.RemoteId,observed.RemoteId,recovery.StateAtObservation,recovery.RemoteId
             FROM um6_create_journal j
             JOIN um6_create_intents i ON i.ReservationId=j.ReservationId
             JOIN voucher_reservations v ON v.Id=j.ReservationId AND v.BackendId=j.BackendId AND v.Username=j.Username
@@ -265,6 +275,7 @@ internal sealed class UserManager6CreateJournal(string databasePath)
             JOIN um6_voucher_secrets secret ON secret.ReservationId=j.ReservationId
             LEFT JOIN um6_create_evidence ack ON ack.ReservationId=j.ReservationId AND ack.Kind=1
             LEFT JOIN um6_create_evidence observed ON observed.ReservationId=j.ReservationId AND observed.Kind=2
+            LEFT JOIN um6_recovery_evidence recovery ON recovery.ReservationId=j.ReservationId
             WHERE j.ReservationId=$id AND j.State IN (2,3,4);
             """;
         cmd.Parameters.AddWithValue("$id", reservationId);
@@ -282,11 +293,82 @@ internal sealed class UserManager6CreateJournal(string databasePath)
                 (observed is not null && (!UserManager6Records.IsOpaqueRemoteId(observed) ||
                     (returned is not null && returned != observed))))
                 throw new InvalidDataException("Inconsistent retained creation evidence.");
+            UserManager6StoredRecoveryEvidence? recovery = null;
+            if (!r.IsDBNull(8))
+            {
+                var at = (UserManager6CreateState)r.GetInt32(8);
+                string remoteId = r.GetString(9);
+                if ((at != state && at != UserManager6CreateState.DispatchStarted) ||
+                    !UserManager6Records.IsOpaqueRemoteId(remoteId) ||
+                    (returned is not null && returned != remoteId) ||
+                    (observed is not null && observed != remoteId))
+                    throw new InvalidDataException("Inconsistent retained recovery evidence.");
+                recovery = new(at, remoteId);
+            }
             scope = new(reservationId, r.GetGuid(0), r.GetString(1), r.GetString(2),
-                r.GetString(3), state, hasAck ? new(returned, observed) : null);
+                r.GetString(3), state, hasAck ? new(returned, observed) : null, recovery);
         }
-        tx.Commit();
         return scope;
+    }
+
+    // Persist only positive readback evidence. Revalidate the whole scope inside
+    // the same immediate transaction as insertion, closing the local TOCTOU gap.
+    // The first positive observation remains immutable; a later absence never clears it.
+    internal bool TryRecordRecoveryObservation(UserManager6RecoveryObservation observation)
+    {
+        ArgumentNullException.ThrowIfNull(observation);
+        var scope = observation.Scope;
+        ValidateId(scope.ReservationId);
+        var visible = observation.VisibleDisabledAccount;
+        if (visible is null) return false;
+        if (!UserManager6Records.IsOpaqueRemoteId(visible.RemoteId) ||
+            (scope.ExpectedRemoteId is not null && scope.ExpectedRemoteId != visible.RemoteId) ||
+            visible.ReturnedIdMatched != (scope.ExpectedRemoteId is not null))
+            throw new InvalidOperationException("Recovery observation does not match retained identity.");
+
+        using var c = DatabaseStore.OpenExisting(databasePath);
+        using var tx = c.BeginTransaction(deferred: false);
+        if (ReadBoundRecoveryScope(c, tx, scope.ReservationId) != scope)
+            throw new InvalidOperationException("Local creation evidence changed before recovery persistence.");
+        if (scope.Recovery is not null) return false;
+        using var cmd = c.CreateCommand();
+        cmd.Transaction = tx;
+        cmd.CommandText = """
+            INSERT INTO um6_recovery_evidence(ReservationId,StateAtObservation,RemoteId)
+            VALUES($id,$state,$remote);
+            """;
+        cmd.Parameters.AddWithValue("$id", scope.ReservationId);
+        cmd.Parameters.AddWithValue("$state", (int)scope.State);
+        cmd.Parameters.AddWithValue("$remote", visible.RemoteId);
+        cmd.ExecuteNonQuery();
+        tx.Commit();
+        return true;
+    }
+
+    internal static void RequireEquivalentRecoveryForRestore(string currentPath, string candidatePath)
+    {
+        using var current = DatabaseBackup.OpenRaw(currentPath, SqliteOpenMode.ReadOnly);
+        using var candidate = DatabaseBackup.OpenRaw(candidatePath, SqliteOpenMode.ReadOnly);
+        DatabaseBackup.RequireIdentity(current);
+        DatabaseBackup.RequireIdentity(candidate);
+        using var a = current.CreateCommand();
+        using var b = candidate.CreateCommand();
+        const string query = """
+            SELECT ReservationId,StateAtObservation,RemoteId FROM um6_recovery_evidence
+            ORDER BY ReservationId COLLATE BINARY;
+            """;
+        a.CommandText = query;
+        b.CommandText = query;
+        using var left = a.ExecuteReader();
+        using var right = b.ExecuteReader();
+        while (true)
+        {
+            bool hasLeft = left.Read(), hasRight = right.Read();
+            if (hasLeft != hasRight) throw RestoreConflict();
+            if (!hasLeft) return;
+            for (int i = 0; i < 3; i++)
+                if (!Equals(left.GetValue(i), right.GetValue(i))) throw RestoreConflict();
+        }
     }
 
     // A local claim only. Never use the legacy unbound claim for remote dispatch.

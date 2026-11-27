@@ -137,6 +137,18 @@ internal static class RouterOsReadRecovery
         return new(scope, observed);
     }
 
+    // Explicit review action; the only router operation remains the pinned read.
+    // Do not promote journal state, synthesize an acknowledgement or authorize activation.
+    [SupportedOSPlatform("windows")]
+    internal static async Task<bool> RecordBoundUm6RecoveryAsync(string databasePath,
+        Guid reservationId, TimeSpan? timeout = null, CancellationToken cancellationToken = default)
+    {
+        var observation = await ReadBoundUm6RecoveryAsync(databasePath, reservationId, timeout,
+            cancellationToken).ConfigureAwait(false);
+        cancellationToken.ThrowIfCancellationRequested();
+        return new UserManager6CreateJournal(databasePath).TryRecordRecoveryObservation(observation);
+    }
+
     [SupportedOSPlatform("windows")]
     private static async Task<T> ReadBoundAsync<T>(string databasePath, Guid routerId, TimeSpan? timeout,
         Func<RouterOsSession, CancellationToken, Task<T>> operation, CancellationToken cancellationToken,

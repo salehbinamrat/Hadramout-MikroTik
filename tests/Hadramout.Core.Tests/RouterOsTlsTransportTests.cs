@@ -1748,6 +1748,49 @@ public sealed class RouterOsTlsTransportTests(ITestOutputHelper output)
         finally { directory.Delete(recursive: true); }
     }
 
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    [SupportedOSPlatform("windows")]
+    public async Task BoundRecoveryPersistsOnlyPositiveExactEvidence(bool visible)
+    {
+        using var certificates = new Certificates();
+        using var server = new LoopbackServer(certificates.Leaf, certificates.Root, output);
+        var directory = Directory.CreateTempSubdirectory("hadramout-recovery-store-");
+        try
+        {
+            string path = Path.Combine(directory.FullName, "test.db");
+            Guid id = PreparePreflightFixture(path, server.Port, certificates, true);
+            var journal = new UserManager6CreateJournal(path);
+            Assert.True(journal.TryBeginBoundDispatch(id));
+            Assert.True(journal.TryMarkIndeterminate(id));
+            Task serve = server.RunAsync(reply: true, handler: async (tls, token) =>
+            {
+                await PrepareProbePeerAsync(tls, token, "6.49.19");
+                byte[][] request = await RouterOsWireCodec.ReadSentenceAsync(tls, token);
+                Assert.Equal(new[] { "/tool/user-manager/user/print",
+                    "=.proplist=.id,customer,username,disabled,comment", "?username=001" },
+                    request.Select(word => Encoding.UTF8.GetString(word)).ToArray());
+                if (visible)
+                    await RouterOsWireCodec.WriteSentenceAsync(tls, ["!re"u8.ToArray(), "=.id=*1"u8.ToArray(),
+                        "=customer=admin"u8.ToArray(), "=username=001"u8.ToArray(), "=disabled=yes"u8.ToArray(),
+                        Encoding.UTF8.GetBytes("=comment=hmk-create:" + id.ToString("N"))], token);
+                await RouterOsWireCodec.WriteSentenceAsync(tls, ["!done"u8.ToArray()], token);
+                Assert.Equal(0, await tls.ReadAsync(new byte[1], token));
+            });
+            try
+            {
+                Assert.Equal(visible, await RouterOsReadRecovery.RecordBoundUm6RecoveryAsync(path, id));
+                Assert.Equal(visible ? "*1" : null, journal.ReadBoundRecoveryScope(id).Recovery?.RemoteId);
+                Assert.Equal(UserManager6CreateState.Indeterminate, journal.Read(id)!.State);
+                Assert.Null(journal.ReadCreationEvidence(id));
+            }
+            finally { await serve; }
+            Assert.False(server.HasPendingConnection);
+        }
+        finally { directory.Delete(recursive: true); }
+    }
+
     [SupportedOSPlatform("windows")]
     private static Guid PreparePreflightFixture(string path, int port, Certificates certificates, bool saveSecret)
     {

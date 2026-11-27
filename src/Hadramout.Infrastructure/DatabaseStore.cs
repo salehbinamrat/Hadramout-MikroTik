@@ -6,7 +6,7 @@ namespace Hadramout.Infrastructure;
 /// <summary>Opens an owned local database with durable settings and atomic schema upgrades.</summary>
 public static class DatabaseStore
 {
-    public const int CurrentSchemaVersion = 9;
+    public const int CurrentSchemaVersion = 10;
     public const int ApplicationId = 0x484D4B54;
 
     public static SqliteConnection Open(string path) => OpenCore(path, SqliteOpenMode.ReadWriteCreate);
@@ -128,6 +128,13 @@ public static class DatabaseStore
             Execute(connection, tx, SchemaV9);
             Execute(connection, tx, "PRAGMA user_version=9;");
             version = 9;
+        }
+
+        if (version == 9)
+        {
+            Execute(connection, tx, SchemaV10);
+            Execute(connection, tx, "PRAGMA user_version=10;");
+            version = 10;
         }
 
         if (version != CurrentSchemaVersion)
@@ -351,5 +358,40 @@ public static class DatabaseStore
         BEGIN SELECT RAISE(ABORT,'Creation evidence is immutable'); END;
         CREATE TRIGGER um6_evidence_no_delete BEFORE DELETE ON um6_create_evidence
         BEGIN SELECT RAISE(ABORT,'Creation evidence is retained'); END;
+        """;
+
+    // Positive recovery observation is independent of a creation acknowledgement.
+    private const string SchemaV10 = """
+        CREATE TABLE um6_recovery_evidence (
+            ReservationId TEXT NOT NULL PRIMARY KEY REFERENCES um6_create_intents(ReservationId) ON DELETE RESTRICT,
+            StateAtObservation INTEGER NOT NULL CHECK(StateAtObservation IN (2,3,4)),
+            RemoteId TEXT COLLATE BINARY NOT NULL CHECK(
+                typeof(RemoteId)='text' AND length(RemoteId) BETWEEN 2 AND 33 AND
+                instr(RemoteId,char(0))=0 AND substr(RemoteId,1,1)='*' AND
+                substr(RemoteId,2) NOT GLOB '*[^0-9a-fA-F]*')
+        );
+        CREATE TRIGGER um6_recovery_insert_guard BEFORE INSERT ON um6_recovery_evidence
+        WHEN NOT EXISTS (
+            SELECT 1 FROM um6_create_journal j
+            JOIN um6_create_intents i ON i.ReservationId=j.ReservationId
+            JOIN voucher_reservations v ON v.Id=j.ReservationId AND v.BackendId=j.BackendId AND v.Username=j.Username
+            JOIN backends b ON b.Id=j.BackendId AND b.RouterId=j.RouterId AND b.Kind=2
+            JOIN voucher_batches batch ON batch.Id=v.BatchId AND batch.Id=i.BatchId AND batch.BackendId=j.BackendId
+            JOIN plans p ON p.Id=batch.PlanId AND p.Id=i.PlanId AND p.BackendId=j.BackendId AND p.Name=i.PlanName
+            JOIN router_targets t ON t.RouterId=j.RouterId AND t.LeafSha256=i.LeafSha256
+            JOIN um6_voucher_secrets secret ON secret.ReservationId=j.ReservationId
+            WHERE j.ReservationId=NEW.ReservationId AND j.State=NEW.StateAtObservation)
+        OR EXISTS (SELECT 1 FROM um6_create_evidence e WHERE e.ReservationId=NEW.ReservationId
+            AND e.RemoteId IS NOT NULL AND e.RemoteId<>NEW.RemoteId)
+        BEGIN SELECT RAISE(ABORT,'Invalid UM6 recovery evidence'); END;
+        CREATE TRIGGER um6_recovery_no_update BEFORE UPDATE ON um6_recovery_evidence
+        BEGIN SELECT RAISE(ABORT,'Recovery evidence is immutable'); END;
+        CREATE TRIGGER um6_recovery_no_delete BEFORE DELETE ON um6_recovery_evidence
+        BEGIN SELECT RAISE(ABORT,'Recovery evidence is retained'); END;
+        CREATE TRIGGER um6_recovery_consistency_guard BEFORE INSERT ON um6_create_evidence
+        WHEN NEW.RemoteId IS NOT NULL AND EXISTS (
+            SELECT 1 FROM um6_recovery_evidence r WHERE r.ReservationId=NEW.ReservationId
+                AND r.RemoteId<>NEW.RemoteId)
+        BEGIN SELECT RAISE(ABORT,'Creation evidence conflicts with recovery evidence'); END;
         """;
 }
