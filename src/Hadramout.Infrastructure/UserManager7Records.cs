@@ -44,8 +44,55 @@ internal sealed record UserManager7ActiveSession(string RemoteId, string Usernam
 internal sealed record UserManager7ActiveSessionEvidence(UserManager7Account Account,
     IReadOnlyList<UserManager7ActiveSession> VisibleActiveSessions);
 
+internal sealed record UserManager7ServiceSettings(bool? Enabled, bool? UseProfiles);
+internal enum UserManager7ProfileObservation
+{
+    ServiceDisabled, PolicyUnknown, ProfilesNotUsed, NoVisibleAssignments,
+    UnknownAssignmentState, ConflictingActiveReports, ActiveReported, ReadyReported, UsedOnlyReported
+}
+
+// Never an authorization, deletion, printing or expiry decision. A profile
+// observation is independent of the account disabled flag and session accounting.
+internal sealed record UserManager7ProfileStatusEvidence(UserManager7Account Account,
+    UserManager7ServiceSettings Settings, IReadOnlyList<UserManager7Assignment>? VisibleAssignments)
+{
+    internal UserManager7ProfileObservation Observation
+    {
+        get
+        {
+            if (Settings.Enabled == false) return UserManager7ProfileObservation.ServiceDisabled;
+            if (Settings.Enabled != true || Settings.UseProfiles is null)
+                return UserManager7ProfileObservation.PolicyUnknown;
+            if (Settings.UseProfiles == false) return UserManager7ProfileObservation.ProfilesNotUsed;
+            if (VisibleAssignments is null) return UserManager7ProfileObservation.PolicyUnknown;
+            if (VisibleAssignments.Count == 0) return UserManager7ProfileObservation.NoVisibleAssignments;
+            if (VisibleAssignments.Count(a => a.State == UserManager7AssignmentState.ActiveReported) > 1)
+                return UserManager7ProfileObservation.ConflictingActiveReports;
+            if (VisibleAssignments.Any(a => a.State == UserManager7AssignmentState.Unknown))
+                return UserManager7ProfileObservation.UnknownAssignmentState;
+            if (VisibleAssignments.Any(a => a.State == UserManager7AssignmentState.ActiveReported))
+                return UserManager7ProfileObservation.ActiveReported;
+            if (VisibleAssignments.Any(a => a.State == UserManager7AssignmentState.ReadyReported))
+                return UserManager7ProfileObservation.ReadyReported;
+            return UserManager7ProfileObservation.UsedOnlyReported;
+        }
+    }
+}
+
 internal static class UserManager7Records
 {
+    private static bool? ReadFlag(byte[][] words, string field) =>
+        UserManager6Records.ReadText(words, field, 8) switch
+        {
+            "yes" or "true" => true,
+            "no" or "false" => false,
+            null or "" => null,
+            _ => throw new InvalidDataException("Invalid User Manager v7 flag.")
+        };
+
+    internal static UserManager7ServiceSettings ParseServiceSettings(byte[][] words) =>
+        new(ReadFlag(words, "enabled"), ReadFlag(words, "use-profiles"));
+
     private static string ExactKey(byte[][] words, string field, string? expected = null)
     {
         string? value = UserManager6Records.ReadText(words, field, 128);
@@ -132,13 +179,7 @@ internal static class UserManager7Records
         string? id = UserManager6Records.ReadText(words, ".id", 33);
         if (!UserManager6Records.IsOpaqueRemoteId(id))
             throw new InvalidDataException("Invalid User Manager v7 remote identity.");
-        bool? disabled = UserManager6Records.ReadText(words, "disabled", 8) switch
-        {
-            "yes" or "true" => true,
-            "no" or "false" => false,
-            null or "" => null,
-            _ => throw new InvalidDataException("Invalid User Manager v7 disabled flag.")
-        };
+        bool? disabled = ReadFlag(words, "disabled");
         return new(id!, name!, disabled, UserManager6Records.ReadText(words, "group", 128),
             UserManager6Records.ReadText(words, "shared-users", 64));
     }

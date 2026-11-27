@@ -165,18 +165,7 @@ internal sealed class RouterOsSession : IDisposable
             await RequireUserManager7FamilyAsync(stream, token).ConfigureAwait(false);
             var account = await FindUm7AccountCoreAsync(stream, username, token).ConfigureAwait(false);
             if (account is null) return null;
-            var ids = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            var assignments = await ReadCommandAsync(stream,
-                ["/user-manager/user-profile/print"u8.ToArray(),
-                    "=.proplist=.id,user,profile,state,end-time"u8.ToArray(),
-                    UserManager6Records.Query("user", username)],
-                words =>
-                {
-                    var row = UserManager7Records.ParseAssignment(words, username);
-                    if (!ids.Add(row.RemoteId))
-                        throw new InvalidDataException("Duplicate User Manager v7 assignment identity.");
-                    return row;
-                }, 128, token).ConfigureAwait(false);
+            var assignments = await ReadUm7AssignmentsCoreAsync(stream, username, token).ConfigureAwait(false);
             // Same session is not an atomic router snapshot. Reject observed drift,
             // including disappearance/recreation of an identically named account.
             var after = await FindUm7AccountCoreAsync(stream, username, token).ConfigureAwait(false);
@@ -185,6 +174,60 @@ internal sealed class RouterOsSession : IDisposable
             token.ThrowIfCancellationRequested();
             return new(account, assignments);
         }, timeout, cancellationToken);
+    }
+
+    // Separate service policy, account state and profile observations. Do not
+    // query/interpret assignments when the policy is disabled or unknown.
+    internal Task<UserManager7ProfileStatusEvidence?> ReadUserManager7ProfileStatusAsync(string username,
+        TimeSpan? timeout = null, CancellationToken cancellationToken = default)
+    {
+        UserManager6Records.ValidateKey(username, nameof(username));
+        return WithReadSessionAsync<UserManager7ProfileStatusEvidence?>(async (stream, token) =>
+        {
+            await RequireUserManager7FamilyAsync(stream, token).ConfigureAwait(false);
+            var account = await FindUm7AccountCoreAsync(stream, username, token).ConfigureAwait(false);
+            if (account is null) return null;
+            var settings = await ReadUm7ServiceSettingsCoreAsync(stream, token).ConfigureAwait(false);
+            IReadOnlyList<UserManager7Assignment>? assignments = null;
+            if (settings.Enabled == true && settings.UseProfiles == true)
+                assignments = await ReadUm7AssignmentsCoreAsync(stream, username, token).ConfigureAwait(false);
+            if (await ReadUm7ServiceSettingsCoreAsync(stream, token).ConfigureAwait(false) != settings ||
+                await FindUm7AccountCoreAsync(stream, username, token).ConfigureAwait(false) != account)
+                throw new InvalidDataException("User Manager v7 service policy or account changed during review.");
+            token.ThrowIfCancellationRequested();
+            return new(account, settings, assignments);
+        }, timeout, cancellationToken);
+    }
+
+    private static async Task<UserManager7ServiceSettings> ReadUm7ServiceSettingsCoreAsync(Stream stream,
+        CancellationToken token)
+    {
+        var rows = await ReadCommandAsync(stream,
+            ["/user-manager/print"u8.ToArray(), "=.proplist=enabled,use-profiles"u8.ToArray()],
+            UserManager7Records.ParseServiceSettings, 1, token).ConfigureAwait(false);
+        token.ThrowIfCancellationRequested();
+        // A singleton setting row is mandatory. No visible row is not a disabled service.
+        if (rows.Count != 1) throw new InvalidDataException("Missing User Manager v7 service settings.");
+        return rows[0];
+    }
+
+    private static async Task<IReadOnlyList<UserManager7Assignment>> ReadUm7AssignmentsCoreAsync(
+        Stream stream, string username, CancellationToken token)
+    {
+        var ids = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var assignments = await ReadCommandAsync(stream,
+            ["/user-manager/user-profile/print"u8.ToArray(),
+                "=.proplist=.id,user,profile,state,end-time"u8.ToArray(),
+                UserManager6Records.Query("user", username)],
+            words =>
+            {
+                var row = UserManager7Records.ParseAssignment(words, username);
+                if (!ids.Add(row.RemoteId))
+                    throw new InvalidDataException("Duplicate User Manager v7 assignment identity.");
+                return row;
+            }, 128, token).ConfigureAwait(false);
+        token.ThrowIfCancellationRequested();
+        return assignments;
     }
 
     internal Task<UserManager7ActiveSessionEvidence?> ReadUserManager7ActiveSessionsAsync(string username,
