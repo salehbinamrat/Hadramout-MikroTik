@@ -294,6 +294,59 @@ internal sealed class RouterOsSession : IDisposable
         return sessions;
     }
 
+    // For a profile-backed voucher with an explicit group, check only visible
+    // conflicts on the same read session. No write path or claim is created.
+    internal Task<UserManager7CreatePreflightEvidence> ReadUserManager7CreationPreflightAsync(
+        string username, string profileName, string groupName, TimeSpan? timeout = null,
+        CancellationToken cancellationToken = default)
+    {
+        UserManager6Records.ValidateKey(username, nameof(username));
+        UserManager6Records.ValidateKey(profileName, nameof(profileName));
+        UserManager6Records.ValidateKey(groupName, nameof(groupName));
+        return WithReadSessionAsync<UserManager7CreatePreflightEvidence>(async (stream, token) =>
+        {
+            await RequireUserManager7FamilyAsync(stream, token).ConfigureAwait(false);
+            var settings = await ReadUm7ServiceSettingsCoreAsync(stream, token).ConfigureAwait(false);
+            if (settings.Enabled == false)
+                return new(UserManager7CreatePreflightState.ServiceDisabled, settings);
+            if (settings.Enabled != true || settings.UseProfiles is null)
+                return new(UserManager7CreatePreflightState.PolicyUnknown, settings);
+            if (settings.UseProfiles == false)
+                return new(UserManager7CreatePreflightState.ProfilesNotUsed, settings);
+
+            var account = await FindUm7AccountCoreAsync(stream, username, token).ConfigureAwait(false);
+            if (account is not null)
+                return new(UserManager7CreatePreflightState.UsernameAlreadyVisible, settings, ExistingAccount: account);
+            var profile = await ReadUm7ProfileCoreAsync(stream, profileName, token).ConfigureAwait(false);
+            if (profile is null)
+                return new(UserManager7CreatePreflightState.ProfileNotVisible, settings);
+            var group = await ReadUm7GroupCoreAsync(stream, groupName, token).ConfigureAwait(false);
+            if (group is null)
+                return new(UserManager7CreatePreflightState.GroupNotVisible, settings, profile);
+
+            if (await ReadUm7ServiceSettingsCoreAsync(stream, token).ConfigureAwait(false) != settings ||
+                await ReadUm7ProfileCoreAsync(stream, profileName, token).ConfigureAwait(false) != profile ||
+                await ReadUm7GroupCoreAsync(stream, groupName, token).ConfigureAwait(false) != group)
+                throw new InvalidDataException("User Manager v7 creation preflight scope changed.");
+            account = await FindUm7AccountCoreAsync(stream, username, token).ConfigureAwait(false);
+            token.ThrowIfCancellationRequested();
+            return account is null
+                ? new(UserManager7CreatePreflightState.NoVisibleConflict, settings, profile, group)
+                : new(UserManager7CreatePreflightState.UsernameAlreadyVisible, settings, profile, group, account);
+        }, timeout, cancellationToken);
+    }
+
+    private static async Task<UserManager7GroupIdentity?> ReadUm7GroupCoreAsync(Stream stream,
+        string name, CancellationToken token)
+    {
+        var rows = await ReadCommandAsync(stream,
+            ["/user-manager/user/group/print"u8.ToArray(), "=.proplist=.id,name"u8.ToArray(),
+                UserManager6Records.Query("name", name)],
+            words => UserManager7Records.ParseGroupIdentity(words, name), 1, token).ConfigureAwait(false);
+        token.ThrowIfCancellationRequested();
+        return rows.Count == 0 ? null : rows[0];
+    }
+
     internal Task<UserManager7ProfileMappingEvidence?> ReadUserManager7ProfileMappingAsync(string name,
         TimeSpan? timeout = null, CancellationToken cancellationToken = default)
     {

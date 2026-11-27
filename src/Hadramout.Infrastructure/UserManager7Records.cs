@@ -90,6 +90,19 @@ internal sealed record UserManager7CombinedObservation(UserManager7ProfileStatus
 internal sealed record UserManager7TotalUsageSample(string RemoteId, string Username,
     UserManager6Usage Usage, string? ActiveSessionsRaw, string? ActualProfileRaw);
 
+internal sealed record UserManager7GroupIdentity(string RemoteId, string Name);
+internal enum UserManager7CreatePreflightState
+{
+    ServiceDisabled, PolicyUnknown, ProfilesNotUsed, UsernameAlreadyVisible,
+    ProfileNotVisible, GroupNotVisible, NoVisibleConflict
+}
+
+// Observations only. NoVisibleConflict is not proof of absence, permissions,
+// effective group attributes, or authorization to dispatch a creation command.
+internal sealed record UserManager7CreatePreflightEvidence(UserManager7CreatePreflightState State,
+    UserManager7ServiceSettings Settings, UserManager7Profile? Profile = null,
+    UserManager7GroupIdentity? Group = null, UserManager7Account? ExistingAccount = null);
+
 internal static class UserManager7Records
 {
     // Consumes an already captured one-shot monitor reply; no network command is
@@ -151,6 +164,9 @@ internal static class UserManager7Records
             throw new InvalidDataException("Invalid User Manager v7 definition remote identity.");
         return id!;
     }
+
+    internal static UserManager7GroupIdentity ParseGroupIdentity(byte[][] words, string name) =>
+        new(RemoteId(words), ExactKey(words, "name", name));
 
     internal static UserManager7Profile ParseProfile(byte[][] words, string name) =>
         new(RemoteId(words), ExactKey(words, "name", name),

@@ -1821,6 +1821,144 @@ public sealed class RouterOsTlsTransportTests(ITestOutputHelper output)
         Assert.False(server.HasPendingConnection);
     }
 
+    [Theory]
+    [InlineData("clear")]
+    [InlineData("existing")]
+    [InlineData("late-existing")]
+    [InlineData("service-off")]
+    [InlineData("profiles-off")]
+    [InlineData("policy-unknown")]
+    [InlineData("profile-absent")]
+    [InlineData("group-absent")]
+    [InlineData("group-wrong")]
+    [InlineData("group-duplicate")]
+    [InlineData("policy-drift")]
+    [InlineData("profile-drift")]
+    [InlineData("group-drift")]
+    [InlineData("group-trap")]
+    [InlineData("v6")]
+    public async Task UserManager7CreationPreflightChecksExplicitGroupAndNeverWrites(string condition)
+    {
+        using var certificates = new Certificates();
+        using var server = new LoopbackServer(certificates.Leaf, certificates.Root, output);
+        Task serve = server.RunAsync(reply: true, handler: async (tls, token) =>
+        {
+            await PrepareProbePeerAsync(tls, token, condition == "v6" ? "6.49.19" : "7.21.1");
+            async Task Expect(string[] expected)
+            {
+                var request = await RouterOsWireCodec.ReadSentenceAsync(tls, token);
+                Assert.Equal(expected, request.Select(word => Encoding.UTF8.GetString(word)).ToArray());
+            }
+            async Task Done() => await RouterOsWireCodec.WriteSentenceAsync(tls, ["!done"u8.ToArray()], token);
+            async Task Closed() => Assert.Equal(0, await tls.ReadAsync(new byte[1], token));
+            async Task Settings(bool second)
+            {
+                await Expect(["/user-manager/print", "=.proplist=enabled,use-profiles"]);
+                var row = new List<ReadOnlyMemory<byte>> { "!re"u8.ToArray(),
+                    condition == "service-off" ? "=enabled=no"u8.ToArray() : "=enabled=yes"u8.ToArray() };
+                if (condition != "policy-unknown")
+                    row.Add(condition == "profiles-off" || (second && condition == "policy-drift")
+                        ? "=use-profiles=no"u8.ToArray() : "=use-profiles=yes"u8.ToArray());
+                await RouterOsWireCodec.WriteSentenceAsync(tls, row.ToArray(), token);
+                await Done();
+            }
+            async Task Account(bool second)
+            {
+                await Expect(["/user-manager/user/print",
+                    "=.proplist=.id,name,disabled,group,shared-users", "?name=001"]);
+                if (condition == "existing" || (second && condition == "late-existing"))
+                    await RouterOsWireCodec.WriteSentenceAsync(tls, ["!re"u8.ToArray(), "=.id=*1"u8.ToArray(),
+                        "=name=001"u8.ToArray(), "=disabled=yes"u8.ToArray()], token);
+                await Done();
+            }
+            async Task Profile(bool second)
+            {
+                await Expect(["/user-manager/profile/print",
+                    "=.proplist=.id,name,validity,starts-when,override-shared-users", "?name=day"]);
+                if (condition != "profile-absent")
+                    await RouterOsWireCodec.WriteSentenceAsync(tls, ["!re"u8.ToArray(),
+                        second && condition == "profile-drift" ? "=.id=*3"u8.ToArray() : "=.id=*2"u8.ToArray(),
+                        "=name=day"u8.ToArray()], token);
+                await Done();
+            }
+            async Task Group(bool second)
+            {
+                await Expect(["/user-manager/user/group/print", "=.proplist=.id,name", "?name=voucher"]);
+                if (condition == "group-trap")
+                {
+                    await RouterOsWireCodec.WriteSentenceAsync(tls, ["!trap"u8.ToArray()], token);
+                    return;
+                }
+                if (condition != "group-absent")
+                {
+                    ReadOnlyMemory<byte>[] row = ["!re"u8.ToArray(),
+                        second && condition == "group-drift" ? "=.id=*5"u8.ToArray() : "=.id=*4"u8.ToArray(),
+                        condition == "group-wrong" ? "=name=other"u8.ToArray() : "=name=voucher"u8.ToArray()];
+                    await RouterOsWireCodec.WriteSentenceAsync(tls, row, token);
+                    if (condition == "group-duplicate")
+                        await RouterOsWireCodec.WriteSentenceAsync(tls, row, token);
+                    if (condition is "group-wrong" or "group-duplicate") return;
+                }
+                await Done();
+            }
+
+            if (condition == "v6") { await Closed(); return; }
+            await Settings(false);
+            if (condition is "service-off" or "profiles-off" or "policy-unknown") { await Closed(); return; }
+            await Account(false);
+            if (condition == "existing") { await Closed(); return; }
+            await Profile(false);
+            if (condition == "profile-absent") { await Closed(); return; }
+            await Group(false);
+            if (condition is "group-trap" or "group-wrong" or "group-duplicate") return;
+            if (condition == "group-absent") { await Closed(); return; }
+            await Settings(true);
+            if (condition == "policy-drift") { await Closed(); return; }
+            await Profile(true);
+            if (condition == "profile-drift") { await Closed(); return; }
+            await Group(true);
+            if (condition == "group-drift") { await Closed(); return; }
+            await Account(true);
+            await Closed();
+        });
+        async Task<UserManager7CreatePreflightEvidence> Read()
+        {
+            using var session = await RouterOsSession.ConnectAsync("127.0.0.1", "router.test",
+                "synthetic-user"u8.ToArray(), "synthetic-private-password"u8.ToArray(), server.Port,
+                trustedRootDer: certificates.Root.RawData);
+            return await session.ReadUserManager7CreationPreflightAsync("001", "day", "voucher");
+        }
+        try
+        {
+            if (condition == "v6") await Assert.ThrowsAsync<NotSupportedException>(Read);
+            else if (condition is "group-trap" or "group-wrong" or "group-duplicate" or "policy-drift" or "profile-drift" or "group-drift")
+                await Assert.ThrowsAsync<InvalidDataException>(Read);
+            else
+            {
+                var evidence = await Read();
+                Assert.Equal(condition switch
+                {
+                    "existing" or "late-existing" => UserManager7CreatePreflightState.UsernameAlreadyVisible,
+                    "service-off" => UserManager7CreatePreflightState.ServiceDisabled,
+                    "profiles-off" => UserManager7CreatePreflightState.ProfilesNotUsed,
+                    "policy-unknown" => UserManager7CreatePreflightState.PolicyUnknown,
+                    "profile-absent" => UserManager7CreatePreflightState.ProfileNotVisible,
+                    "group-absent" => UserManager7CreatePreflightState.GroupNotVisible,
+                    _ => UserManager7CreatePreflightState.NoVisibleConflict
+                }, evidence.State);
+                if (condition is "clear" or "late-existing")
+                {
+                    Assert.Equal("*2", evidence.Profile!.RemoteId);
+                    Assert.Equal("*4", evidence.Group!.RemoteId);
+                }
+                if (condition is "existing" or "late-existing") Assert.Equal("*1", evidence.ExistingAccount!.RemoteId);
+                else Assert.Null(evidence.ExistingAccount);
+            }
+        }
+        finally { await serve; }
+        Assert.False(server.HasPendingConnection);
+    }
+
     [Fact]
     public async Task UserManager6LookupNeverSendsLegacyMenuToV7()
     {
