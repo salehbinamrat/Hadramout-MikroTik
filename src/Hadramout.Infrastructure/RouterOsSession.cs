@@ -151,17 +151,59 @@ internal sealed class RouterOsSession : IDisposable
         UserManager6Records.ValidateKey(username, nameof(username));
         return WithReadSessionAsync<UserManager7Account?>(async (stream, token) =>
         {
-            string version = await ReadVersionCoreAsync(stream, token).ConfigureAwait(false);
-            if (RouterOsInventory.ClassifyVersion(version) != RouterOsFamily.V7)
-                throw new NotSupportedException("User Manager v7 requires a supported RouterOS v7 release.");
-            var rows = await ReadCommandAsync(stream,
-                ["/user-manager/user/print"u8.ToArray(),
-                    "=.proplist=.id,name,disabled,group,shared-users"u8.ToArray(),
-                    UserManager6Records.Query("name", username)],
-                words => UserManager7Records.ParseAccount(words, username), 1, token).ConfigureAwait(false);
-            token.ThrowIfCancellationRequested();
-            return rows.Count == 0 ? null : rows[0];
+            await RequireUserManager7FamilyAsync(stream, token).ConfigureAwait(false);
+            return await FindUm7AccountCoreAsync(stream, username, token).ConfigureAwait(false);
         }, timeout, cancellationToken);
+    }
+
+    internal Task<UserManager7AssignmentEvidence?> ReadUserManager7AssignmentsAsync(string username,
+        TimeSpan? timeout = null, CancellationToken cancellationToken = default)
+    {
+        UserManager6Records.ValidateKey(username, nameof(username));
+        return WithReadSessionAsync<UserManager7AssignmentEvidence?>(async (stream, token) =>
+        {
+            await RequireUserManager7FamilyAsync(stream, token).ConfigureAwait(false);
+            var account = await FindUm7AccountCoreAsync(stream, username, token).ConfigureAwait(false);
+            if (account is null) return null;
+            var ids = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var assignments = await ReadCommandAsync(stream,
+                ["/user-manager/user-profile/print"u8.ToArray(),
+                    "=.proplist=.id,user,profile,state,end-time"u8.ToArray(),
+                    UserManager6Records.Query("user", username)],
+                words =>
+                {
+                    var row = UserManager7Records.ParseAssignment(words, username);
+                    if (!ids.Add(row.RemoteId))
+                        throw new InvalidDataException("Duplicate User Manager v7 assignment identity.");
+                    return row;
+                }, 128, token).ConfigureAwait(false);
+            // Same session is not an atomic router snapshot. Reject observed drift,
+            // including disappearance/recreation of an identically named account.
+            var after = await FindUm7AccountCoreAsync(stream, username, token).ConfigureAwait(false);
+            if (after != account)
+                throw new InvalidDataException("User Manager v7 account changed during assignment read.");
+            token.ThrowIfCancellationRequested();
+            return new(account, assignments);
+        }, timeout, cancellationToken);
+    }
+
+    private static async Task RequireUserManager7FamilyAsync(Stream stream, CancellationToken token)
+    {
+        string version = await ReadVersionCoreAsync(stream, token).ConfigureAwait(false);
+        if (RouterOsInventory.ClassifyVersion(version) != RouterOsFamily.V7)
+            throw new NotSupportedException("User Manager v7 requires a supported RouterOS v7 release.");
+    }
+
+    private static async Task<UserManager7Account?> FindUm7AccountCoreAsync(Stream stream,
+        string username, CancellationToken token)
+    {
+        var rows = await ReadCommandAsync(stream,
+            ["/user-manager/user/print"u8.ToArray(),
+                "=.proplist=.id,name,disabled,group,shared-users"u8.ToArray(),
+                UserManager6Records.Query("name", username)],
+            words => UserManager7Records.ParseAccount(words, username), 1, token).ConfigureAwait(false);
+        token.ThrowIfCancellationRequested();
+        return rows.Count == 0 ? null : rows[0];
     }
 
     internal Task<UserManager6Account?> FindUserManager6AccountAsync(string customer, string username,
