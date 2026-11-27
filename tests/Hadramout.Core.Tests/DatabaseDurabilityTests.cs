@@ -1369,6 +1369,100 @@ public sealed class DatabaseDurabilityTests
         Assert.Equal(10L, Scalar(raw, "PRAGMA user_version;"));
     }
 
+    [Fact]
+    [SupportedOSPlatform("windows")]
+    public void ProfileLinkReviewQueueTraversesTenThousandSyntheticClaimsWithoutLoss()
+    {
+        using var file = new TestFile();
+        Guid seed = SeedSecretIntent(file.Path);
+        var journal = new UserManager6CreateJournal(file.Path);
+        Guid router = journal.Read(seed)!.RouterId;
+        // Test-only bulk fixture. All production SQLite constraints/triggers remain
+        // enabled. The one-byte envelope is deliberately NOT a usable credential;
+        // the review queue checks local relationships, never decrypts a secret.
+        using (var c = DatabaseStore.OpenExisting(file.Path))
+        using (var tx = c.BeginTransaction(deferred: false))
+        using (var cmd = c.CreateCommand())
+        {
+            cmd.Transaction = tx;
+            cmd.CommandText = """
+                WITH RECURSIVE seq(n) AS (
+                    VALUES(1) UNION ALL SELECT n+1 FROM seq WHERE n<10000
+                )
+                INSERT INTO voucher_reservations(Id,BackendId,BatchId,Username)
+                SELECT printf('00000000-0000-0000-0000-%012d',n),v.BackendId,v.BatchId,printf('scale-%05d',n)
+                FROM seq CROSS JOIN voucher_reservations v WHERE v.Id=$seed;
+                INSERT INTO um6_create_journal(ReservationId,BackendId,RouterId,Customer,Username,State)
+                SELECT v.Id,v.BackendId,j.RouterId,j.Customer,v.Username,1
+                FROM voucher_reservations v CROSS JOIN um6_create_journal j
+                WHERE j.ReservationId=$seed AND v.Username LIKE 'scale-%';
+                INSERT INTO um6_create_intents(ReservationId,BatchId,PlanId,PlanName,LeafSha256,ProfileOwner,ProfileName)
+                SELECT j.ReservationId,i.BatchId,i.PlanId,i.PlanName,i.LeafSha256,i.ProfileOwner,i.ProfileName
+                FROM um6_create_journal j CROSS JOIN um6_create_intents i
+                WHERE i.ReservationId=$seed AND j.Username LIKE 'scale-%';
+                INSERT INTO um6_voucher_secrets(ReservationId,PasswordEnvelope)
+                SELECT ReservationId,X'01' FROM um6_create_journal WHERE Username LIKE 'scale-%';
+                UPDATE um6_create_journal SET State=2 WHERE Username LIKE 'scale-%';
+                UPDATE um6_create_journal SET State=3 WHERE Username LIKE 'scale-%';
+                INSERT INTO um6_recovery_evidence(ReservationId,StateAtObservation,RemoteId)
+                SELECT ReservationId,3,printf('*%X',CAST(substr(Username,7) AS INTEGER))
+                FROM um6_create_journal WHERE Username LIKE 'scale-%';
+                INSERT INTO um6_profile_link_journal(ReservationId,RemoteId,State)
+                SELECT r.ReservationId,r.RemoteId,2 FROM um6_recovery_evidence r
+                JOIN um6_create_journal j ON j.ReservationId=r.ReservationId WHERE j.Username LIKE 'scale-%';
+                UPDATE um6_profile_link_journal SET State=3 WHERE ReservationId IN (
+                    SELECT ReservationId FROM um6_create_journal WHERE Username LIKE 'scale-%'
+                        AND CAST(substr(Username,7) AS INTEGER)%3=1);
+                UPDATE um6_profile_link_journal SET State=4 WHERE ReservationId IN (
+                    SELECT ReservationId FROM um6_create_journal WHERE Username LIKE 'scale-%'
+                        AND CAST(substr(Username,7) AS INTEGER)%3=2);
+                UPDATE voucher_reservations SET Username='drift-' || substr(Username,7)
+                WHERE Username LIKE 'scale-%' AND CAST(substr(Username,7) AS INTEGER)%1000=0;
+                """;
+            cmd.Parameters.AddWithValue("$seed", seed);
+            cmd.ExecuteNonQuery();
+            tx.Commit();
+        }
+
+        var clock = System.Diagnostics.Stopwatch.StartNew();
+        var expected = new UserManager6ProfileLinkCounts(3333, 3334, 3333);
+        Assert.Equal(expected, journal.ReadProfileLinkCounts(router));
+        var seen = new HashSet<Guid>();
+        int pages = 0, drifted = 0, started = 0, uncertain = 0, acknowledged = 0;
+        Guid? cursor = null;
+        do
+        {
+            var page = journal.ReadProfileLinkReviewPage(router, cursor, 500);
+            Assert.Equal(500, page.Rows.Count);
+            foreach (var row in page.Rows)
+            {
+                Assert.Equal(router, row.RouterId);
+                Assert.True(seen.Add(row.Entry.ReservationId), "Repeated keyset row.");
+                int n = int.Parse(row.Username.AsSpan(6), System.Globalization.CultureInfo.InvariantCulture);
+                Assert.Equal("*" + n.ToString("X", System.Globalization.CultureInfo.InvariantCulture), row.Entry.RemoteId);
+                Assert.Equal(n % 1000 != 0, row.LocalScopeMatches);
+                if (!row.LocalScopeMatches) drifted++;
+                switch (row.Entry.State)
+                {
+                    case UserManager6ProfileLinkState.DispatchStarted: started++; break;
+                    case UserManager6ProfileLinkState.Indeterminate: uncertain++; break;
+                    case UserManager6ProfileLinkState.Acknowledged: acknowledged++; break;
+                    default: throw new InvalidDataException("Unexpected synthetic link state.");
+                }
+            }
+            cursor = page.NextAfterReservationId;
+            Assert.InRange(++pages, 1, 20);
+        } while (cursor.HasValue);
+        Assert.Equal(20, pages);
+        Assert.Equal(10000, seen.Count);
+        Assert.Equal(10, drifted);
+        Assert.Equal(expected, new UserManager6ProfileLinkCounts(started, uncertain, acknowledged));
+        Assert.Equal(expected, journal.ReadProfileLinkCounts(router));
+        Assert.Null(journal.ReadProfileLinkEntry(seed));
+        clock.Stop();
+        Console.WriteLine($"UM6 synthetic review: {seen.Count} rows / {pages} pages / {clock.ElapsedMilliseconds} ms (excluding fixture setup).");
+    }
+
     private static Guid SeedSecretIntent(string path)
     {
         Guid id = SeedReservation(path, BackendKind.UserManager6);

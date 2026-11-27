@@ -471,15 +471,17 @@ internal sealed class UserManager6CreateJournal(string databasePath)
         using var tx = c.BeginTransaction(deferred: true);
         using var cmd = c.CreateCommand();
         cmd.Transaction = tx;
+        // Separate first-page and cursor predicates so SQLite can use a direct
+        // keyset range rather than a nullable OR condition on every later page.
         cmd.CommandText = """
             SELECT l.ReservationId,l.RemoteId,l.State,j.RouterId,j.Customer,j.Username
             FROM um6_profile_link_journal l
             JOIN um6_create_journal j ON j.ReservationId=l.ReservationId
-            WHERE j.RouterId=$router AND ($after IS NULL OR l.ReservationId COLLATE BINARY > $after)
-            ORDER BY l.ReservationId COLLATE BINARY LIMIT $limit;
-            """;
+            WHERE j.RouterId=$router
+            """ + (afterReservationId.HasValue ? " AND l.ReservationId COLLATE BINARY > $after" : "") +
+            " ORDER BY l.ReservationId COLLATE BINARY LIMIT $limit;";
         cmd.Parameters.AddWithValue("$router", routerId);
-        cmd.Parameters.AddWithValue("$after", (object?)afterReservationId ?? DBNull.Value);
+        if (afterReservationId.HasValue) cmd.Parameters.AddWithValue("$after", afterReservationId.Value);
         cmd.Parameters.AddWithValue("$limit", pageSize + 1);
         var rows = new List<UserManager6ProfileLinkReviewRow>(pageSize);
         bool hasMore = false;

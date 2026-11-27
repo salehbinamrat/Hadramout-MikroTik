@@ -27,3 +27,7 @@ For each case record PASS, FAIL or NOT RUN, supporting trace hash, exact observe
 
 ## Local review queue
 P16c.4b.2c provides bounded local pages and counts for all retained profile-link attempts on one router, including drifted rows. Every attempt still requires review; neither an acknowledgement nor a visible intended profile proves assignment or eligibility. Keyset pages are individually consistent snapshots, not a frozen multi-page export. Validate scale with measured 10,000-record workloads before claiming performance.
+
+
+## Synthetic local scale check
+P16c.4b.2d adds a 10,000-row bulk synthetic fixture with real database constraints and triggers enabled, 10 deliberate local identity drifts, and one prepared seed excluded from the queue. Verify all 20 pages and exact state totals. Fixture envelopes are deliberately unusable placeholders, not real encrypted passwords; this tests metadata review only, not credential handling or creation throughput. Record elapsed review time (excluding setup) when the test runs. No hardware latency SLA or live-router qualification is inferred. The existing separate router-isolation regression remains mandatory.
