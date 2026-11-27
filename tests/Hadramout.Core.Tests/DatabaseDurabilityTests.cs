@@ -1463,6 +1463,84 @@ public sealed class DatabaseDurabilityTests
         Console.WriteLine($"UM6 synthetic review: {seen.Count} rows / {pages} pages / {clock.ElapsedMilliseconds} ms (excluding fixture setup).");
     }
 
+    [Fact]
+    public void Um7IntentIsImmutableAndRestoreCannotLoseIt()
+    {
+        using var file = new TestFile();
+        using var before = new TestFile();
+        using var identical = new TestFile();
+        Guid id = SeedReservation(file.Path, BackendKind.UserManager7);
+        Guid router;
+        using (var c = DatabaseStore.Open(file.Path))
+        using (var db = Context(c)) router = db.Routers.Single().Id;
+        EnrollIntentTarget(file.Path, router);
+        using (var c = DatabaseStore.Open(file.Path))
+        using (var copy = before.OpenRaw()) c.BackupDatabase(copy);
+        var store = new UserManager7CreateIntentStore(file.Path);
+        var intent = store.Prepare(id, "day", "voucher");
+        Assert.Equal(router, intent.RouterId);
+        Assert.Equal("001", intent.Username);
+        Assert.Equal("day", intent.PlanName);
+        Assert.Equal("voucher", intent.GroupName);
+        Assert.Equal(new string('A',64), intent.LeafSha256);
+        Assert.Equal(intent, new UserManager7CreateIntentStore(file.Path).Read(id));
+        Assert.Throws<SqliteException>(() => store.Prepare(id, "other", "voucher"));
+        using (var c = DatabaseStore.OpenExisting(file.Path))
+        {
+            Assert.Throws<SqliteException>(() => Execute(c, "UPDATE um7_create_intents SET GroupName='other';"));
+            Assert.Throws<SqliteException>(() => Execute(c, "DELETE FROM um7_create_intents;"));
+            Assert.Throws<SqliteException>(() => Execute(c, "INSERT OR REPLACE INTO um7_create_intents SELECT * FROM um7_create_intents;"));
+            using var copy = identical.OpenRaw();
+            c.BackupDatabase(copy);
+        }
+        UserManager7CreateIntentStore.RequireEquivalentForRestore(file.Path, identical.Path);
+        Assert.Throws<InvalidOperationException>(() => UserManager7CreateIntentStore.RequireEquivalentForRestore(file.Path, before.Path));
+        Assert.Throws<InvalidOperationException>(() => UserManager7CreateIntentStore.RequireEquivalentForRestore(before.Path, file.Path));
+    }
+
+    [Theory]
+    [InlineData("wrong-backend")]
+    [InlineData("no-target")]
+    [InlineData("bad-profile")]
+    [InlineData("bad-group")]
+    public void Um7IntentRejectsInvalidLocalPreparation(string condition)
+    {
+        using var file = new TestFile();
+        Guid id = SeedReservation(file.Path, condition == "wrong-backend" ? BackendKind.UserManager6 : BackendKind.UserManager7);
+        Guid router;
+        using (var c = DatabaseStore.Open(file.Path))
+        using (var db = Context(c)) router = db.Routers.Single().Id;
+        if (condition != "no-target") EnrollIntentTarget(file.Path, router);
+        var store = new UserManager7CreateIntentStore(file.Path);
+        if (condition is "bad-profile" or "bad-group")
+            Assert.Throws<ArgumentException>(() => store.Prepare(id, condition == "bad-profile" ? " " : "day",
+                condition == "bad-group" ? " bad" : "voucher"));
+        else Assert.Throws<InvalidOperationException>(() => store.Prepare(id, "day", "voucher"));
+        Assert.Null(store.Read(id));
+    }
+
+    [Fact]
+    public void Um7IntentRetainsOriginalUsernameAndRejectsCrossFamilyReservation()
+    {
+        using var file = new TestFile();
+        Guid id = SeedReservation(file.Path, BackendKind.UserManager7);
+        Guid router;
+        using (var c = DatabaseStore.Open(file.Path))
+        using (var db = Context(c)) router = db.Routers.Single().Id;
+        EnrollIntentTarget(file.Path, router);
+        var store = new UserManager7CreateIntentStore(file.Path);
+        var intent = store.Prepare(id, "day", "voucher");
+        using (var c = DatabaseStore.OpenExisting(file.Path))
+        {
+            Execute(c, "UPDATE voucher_reservations SET Username='changed';");
+            Execute(c, "UPDATE backends SET Kind=2;");
+        }
+        Assert.Equal(intent, store.Read(id));
+        Assert.Throws<SqliteException>(() => new UserManager6CreateJournal(file.Path).Prepare(id, "admin"));
+        Assert.Null(new UserManager6CreateJournal(file.Path).Read(id));
+        Assert.Throws<InvalidOperationException>(() => UserManager7CreateIntentStore.RequireEquivalentForRestore(file.Path, file.Path));
+    }
+
     private static Guid SeedSecretIntent(string path)
     {
         Guid id = SeedReservation(path, BackendKind.UserManager6);
@@ -1502,13 +1580,14 @@ public sealed class DatabaseDurabilityTests
     // guard in sync with new migrations; never silently leave a newer table behind.
     internal static void RecreateLegacyFixture(SqliteConnection c, int version)
     {
-        if (version is < 1 or > 10) throw new ArgumentOutOfRangeException(nameof(version));
-        Assert.Equal(11, DatabaseStore.CurrentSchemaVersion);
-        Assert.Equal(11L, Scalar(c, "PRAGMA user_version;"));
+        if (version is < 1 or > 11) throw new ArgumentOutOfRangeException(nameof(version));
+        Assert.Equal(12, DatabaseStore.CurrentSchemaVersion);
+        Assert.Equal(12L, Scalar(c, "PRAGMA user_version;"));
         using var tx = c.BeginTransaction(deferred: false);
         using var cmd = c.CreateCommand();
         cmd.Transaction = tx;
-        cmd.CommandText = "DROP TABLE um6_profile_link_journal;";
+        cmd.CommandText = "DROP TRIGGER um7_intent_exclude_um6; DROP TABLE um7_create_intents;";
+        if (version < 11) cmd.CommandText += " DROP TABLE um6_profile_link_journal;";
         if (version < 10) cmd.CommandText += " DROP TRIGGER um6_recovery_consistency_guard; DROP TABLE um6_recovery_evidence;";
         if (version < 9) cmd.CommandText += " DROP TABLE um6_create_evidence;";
         if (version < 8) cmd.CommandText += " DROP TABLE um6_voucher_secrets;";
@@ -1525,7 +1604,7 @@ public sealed class DatabaseDurabilityTests
 
         cmd.Transaction = null;
         cmd.CommandText = "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%';";
-        Assert.Equal(version == 10 ? 14L : version == 9 ? 13L : version == 8 ? 12L : version == 7 ? 11L : version == 6 ? 10L : version == 5 ? 9L : version == 4 ? 8L : version == 3 ? 7L : 6L, (long)cmd.ExecuteScalar()!);
+        Assert.Equal(version == 11 ? 15L : version == 10 ? 14L : version == 9 ? 13L : version == 8 ? 12L : version == 7 ? 11L : version == 6 ? 10L : version == 5 ? 9L : version == 4 ? 8L : version == 3 ? 7L : 6L, (long)cmd.ExecuteScalar()!);
         Assert.Equal((long)version, Scalar(c, "PRAGMA user_version;"));
     }
 
@@ -1540,6 +1619,7 @@ public sealed class DatabaseDurabilityTests
     [InlineData(8)]
     [InlineData(9)]
     [InlineData(10)]
+    [InlineData(11)]
     public void EveryLegacyFixtureHasOnlyItsOwnSchemaAndUpgrades(int version)
     {
         using var file = new TestFile();

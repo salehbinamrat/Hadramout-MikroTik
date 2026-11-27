@@ -6,7 +6,7 @@ namespace Hadramout.Infrastructure;
 /// <summary>Opens an owned local database with durable settings and atomic schema upgrades.</summary>
 public static class DatabaseStore
 {
-    public const int CurrentSchemaVersion = 11;
+    public const int CurrentSchemaVersion = 12;
     public const int ApplicationId = 0x484D4B54;
 
     public static SqliteConnection Open(string path) => OpenCore(path, SqliteOpenMode.ReadWriteCreate);
@@ -142,6 +142,13 @@ public static class DatabaseStore
             Execute(connection, tx, SchemaV11);
             Execute(connection, tx, "PRAGMA user_version=11;");
             version = 11;
+        }
+
+        if (version == 11)
+        {
+            Execute(connection, tx, SchemaV12);
+            Execute(connection, tx, "PRAGMA user_version=12;");
+            version = 12;
         }
 
         if (version != CurrentSchemaVersion)
@@ -438,5 +445,41 @@ public static class DatabaseStore
         BEGIN SELECT RAISE(ABORT,'Invalid UM6 profile link transition'); END;
         CREATE TRIGGER um6_profile_link_no_delete BEFORE DELETE ON um6_profile_link_journal
         BEGIN SELECT RAISE(ABORT,'UM6 profile link evidence is retained'); END;
+        """;
+
+    // Immutable UM7 preparation only; dispatch and secret claims are separate.
+    private const string SchemaV12 = """
+        CREATE TABLE um7_create_intents (
+            ReservationId TEXT NOT NULL PRIMARY KEY REFERENCES voucher_reservations(Id) ON DELETE RESTRICT,
+            BackendId TEXT NOT NULL REFERENCES backends(Id) ON DELETE RESTRICT,
+            RouterId TEXT NOT NULL REFERENCES routers(Id) ON DELETE RESTRICT,
+            BatchId TEXT NOT NULL REFERENCES voucher_batches(Id) ON DELETE RESTRICT,
+            PlanId TEXT NOT NULL REFERENCES plans(Id) ON DELETE RESTRICT,
+            Username TEXT COLLATE BINARY NOT NULL CHECK(typeof(Username)='text' AND length(Username) BETWEEN 1 AND 128 AND Username=trim(Username) AND instr(Username,char(0))=0),
+            PlanName TEXT COLLATE BINARY NOT NULL CHECK(typeof(PlanName)='text' AND length(PlanName) BETWEEN 1 AND 128 AND instr(PlanName,char(0))=0),
+            LeafSha256 TEXT COLLATE BINARY NOT NULL CHECK(length(LeafSha256)=64 AND LeafSha256 NOT GLOB '*[^0-9A-F]*'),
+            ProfileName TEXT COLLATE BINARY NOT NULL CHECK(typeof(ProfileName)='text' AND length(ProfileName) BETWEEN 1 AND 128 AND ProfileName=trim(ProfileName) AND instr(ProfileName,char(0))=0),
+            GroupName TEXT COLLATE BINARY NOT NULL CHECK(typeof(GroupName)='text' AND length(GroupName) BETWEEN 1 AND 128 AND GroupName=trim(GroupName) AND instr(GroupName,char(0))=0),
+            UNIQUE(RouterId,Username)
+        );
+        CREATE TRIGGER um7_intent_insert_guard BEFORE INSERT ON um7_create_intents
+        WHEN NOT EXISTS (
+            SELECT 1 FROM voucher_reservations v
+            JOIN backends b ON b.Id=v.BackendId AND b.Kind=3
+            JOIN voucher_batches batch ON batch.Id=v.BatchId AND batch.BackendId=v.BackendId
+            JOIN plans p ON p.Id=batch.PlanId AND p.BackendId=v.BackendId
+            JOIN router_targets t ON t.RouterId=b.RouterId
+            WHERE v.Id=NEW.ReservationId AND v.BackendId=NEW.BackendId AND b.RouterId=NEW.RouterId
+                AND v.Username=NEW.Username AND batch.Id=NEW.BatchId AND p.Id=NEW.PlanId
+                AND p.Name=NEW.PlanName AND t.LeafSha256=NEW.LeafSha256
+                AND NOT EXISTS (SELECT 1 FROM um6_create_journal j WHERE j.ReservationId=v.Id))
+        BEGIN SELECT RAISE(ABORT,'Invalid UM7 creation intent'); END;
+        CREATE TRIGGER um7_intent_no_update BEFORE UPDATE ON um7_create_intents
+        BEGIN SELECT RAISE(ABORT,'UM7 creation intent is immutable'); END;
+        CREATE TRIGGER um7_intent_no_delete BEFORE DELETE ON um7_create_intents
+        BEGIN SELECT RAISE(ABORT,'UM7 creation intent is retained'); END;
+        CREATE TRIGGER um7_intent_exclude_um6 BEFORE INSERT ON um6_create_journal
+        WHEN EXISTS (SELECT 1 FROM um7_create_intents i WHERE i.ReservationId=NEW.ReservationId)
+        BEGIN SELECT RAISE(ABORT,'Reservation already bound to UM7'); END;
         """;
 }
