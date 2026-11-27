@@ -144,6 +144,26 @@ internal sealed class RouterOsSession : IDisposable
         }, timeout, cancellationToken);
     }
 
+    // UM7 uses its own menu and name identity; never fall back to the legacy menu.
+    internal Task<UserManager7Account?> FindUserManager7AccountAsync(string username,
+        TimeSpan? timeout = null, CancellationToken cancellationToken = default)
+    {
+        UserManager6Records.ValidateKey(username, nameof(username));
+        return WithReadSessionAsync<UserManager7Account?>(async (stream, token) =>
+        {
+            string version = await ReadVersionCoreAsync(stream, token).ConfigureAwait(false);
+            if (RouterOsInventory.ClassifyVersion(version) != RouterOsFamily.V7)
+                throw new NotSupportedException("User Manager v7 requires a supported RouterOS v7 release.");
+            var rows = await ReadCommandAsync(stream,
+                ["/user-manager/user/print"u8.ToArray(),
+                    "=.proplist=.id,name,disabled,group,shared-users"u8.ToArray(),
+                    UserManager6Records.Query("name", username)],
+                words => UserManager7Records.ParseAccount(words, username), 1, token).ConfigureAwait(false);
+            token.ThrowIfCancellationRequested();
+            return rows.Count == 0 ? null : rows[0];
+        }, timeout, cancellationToken);
+    }
+
     internal Task<UserManager6Account?> FindUserManager6AccountAsync(string customer, string username,
         TimeSpan? timeout = null, CancellationToken cancellationToken = default)
     {

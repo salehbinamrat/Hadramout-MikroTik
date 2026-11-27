@@ -1130,6 +1130,91 @@ public sealed class RouterOsTlsTransportTests(ITestOutputHelper output)
         finally { await serve; }
     }
 
+    [Theory]
+    [InlineData("present")]
+    [InlineData("disabled")]
+    [InlineData("missing-flag")]
+    [InlineData("absent")]
+    [InlineData("wrong-name")]
+    [InlineData("legacy-username")]
+    [InlineData("wrong-id")]
+    [InlineData("duplicate")]
+    [InlineData("duplicate-field")]
+    [InlineData("invalid-flag")]
+    [InlineData("trap")]
+    [InlineData("v6")]
+    public async Task UserManager7AccountLookupUsesOnlyVersionCorrectBoundedProjection(string condition)
+    {
+        using var certificates = new Certificates();
+        using var server = new LoopbackServer(certificates.Leaf, certificates.Root, output);
+        Task serve = server.RunAsync(reply: true, handler: async (tls, token) =>
+        {
+            await PrepareProbePeerAsync(tls, token, condition == "v6" ? "6.49.19" : "7.21.1");
+            if (condition == "v6")
+            {
+                Assert.Equal(0, await tls.ReadAsync(new byte[1], token));
+                return;
+            }
+            byte[][] request = await RouterOsWireCodec.ReadSentenceAsync(tls, token);
+            Assert.Equal(new[] { "/user-manager/user/print",
+                "=.proplist=.id,name,disabled,group,shared-users", "?name=كرت=001" },
+                request.Select(word => Encoding.UTF8.GetString(word)).ToArray());
+            if (condition == "trap")
+            {
+                await RouterOsWireCodec.WriteSentenceAsync(tls, ["!trap"u8.ToArray()], token);
+                return;
+            }
+            if (condition != "absent")
+            {
+                var row = new List<ReadOnlyMemory<byte>>
+                {
+                    "!re"u8.ToArray(), Encoding.ASCII.GetBytes(condition == "wrong-id" ? "=.id=1" : "=.id=*1"),
+                    Encoding.UTF8.GetBytes(condition switch
+                    {
+                        "wrong-name" => "=name=other",
+                        "legacy-username" => "=username=كرت=001",
+                        _ => "=name=كرت=001"
+                    }),
+                    "=group=default"u8.ToArray(), "=shared-users=unlimited"u8.ToArray()
+                };
+                if (condition != "missing-flag")
+                    row.Add(Encoding.ASCII.GetBytes("=disabled=" + (condition switch
+                    {
+                        "disabled" => "yes", "invalid-flag" => "maybe", _ => "no"
+                    })));
+                if (condition == "duplicate-field") row.Add("=disabled=yes"u8.ToArray());
+                await RouterOsWireCodec.WriteSentenceAsync(tls, row.ToArray(), token);
+                if (condition == "duplicate")
+                    await RouterOsWireCodec.WriteSentenceAsync(tls, row.ToArray(), token);
+                if (condition is "wrong-name" or "legacy-username" or "wrong-id" or "duplicate" or "duplicate-field" or "invalid-flag")
+                    return;
+            }
+            await RouterOsWireCodec.WriteSentenceAsync(tls, ["!done"u8.ToArray()], token);
+            Assert.Equal(0, await tls.ReadAsync(new byte[1], token));
+        });
+        Task<UserManager7Account?> Find() => RouterOsReadRecovery.FindUserManager7AccountAsync("كرت=001",
+            "127.0.0.1", "router.test", "synthetic-user"u8.ToArray(), "synthetic-private-password"u8.ToArray(),
+            server.Port, trustedRootDer: certificates.Root.RawData);
+        try
+        {
+            if (condition == "v6") await Assert.ThrowsAsync<NotSupportedException>(Find);
+            else if (condition is "present" or "disabled" or "missing-flag")
+            {
+                var account = await Find();
+                Assert.NotNull(account);
+                Assert.Equal("*1", account.RemoteId);
+                Assert.Equal("كرت=001", account.Username);
+                Assert.Equal(condition == "missing-flag" ? (bool?)null : condition == "disabled", account.Disabled);
+                Assert.Equal("default", account.Group);
+                Assert.Equal("unlimited", account.SharedUsersRaw);
+            }
+            else if (condition == "absent") Assert.Null(await Find());
+            else await Assert.ThrowsAsync<InvalidDataException>(Find);
+        }
+        finally { await serve; }
+        Assert.False(server.HasPendingConnection);
+    }
+
     [Fact]
     public async Task UserManager6LookupNeverSendsLegacyMenuToV7()
     {

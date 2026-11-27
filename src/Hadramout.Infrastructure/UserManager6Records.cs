@@ -219,7 +219,7 @@ internal static class UserManager6Records
         return value!;
     }
 
-    private static string? ReadText(byte[][] words, string field, int maxBytes)
+    internal static string? ReadText(byte[][] words, string field, int maxBytes)
     {
         byte[] prefix = Encoding.ASCII.GetBytes("=" + field + "=");
         string? result = null;

@@ -93,6 +93,26 @@ internal static class RouterOsReadRecovery
         ReadBoundAsync(databasePath, routerId, timeout,
             (session, token) => session.ReadVersionAsync(timeout, token), cancellationToken);
 
+    internal static Task<UserManager7Account?> FindUserManager7AccountAsync(string username,
+        string host, string certificateName, ReadOnlyMemory<byte> login, ReadOnlyMemory<byte> password,
+        int port = 8729, TimeSpan? timeout = null, ReadOnlyMemory<byte> trustedRootDer = default,
+        CancellationToken cancellationToken = default)
+    {
+        UserManager6Records.ValidateKey(username, nameof(username));
+        return ReadAsync(host, certificateName, login, password, port, timeout, trustedRootDer,
+            (session, token) => session.FindUserManager7AccountAsync(username, timeout, token), cancellationToken);
+    }
+
+    [SupportedOSPlatform("windows")]
+    internal static Task<UserManager7Account?> FindBoundUserManager7AccountAsync(string databasePath,
+        Guid routerId, string username, TimeSpan? timeout = null,
+        CancellationToken cancellationToken = default)
+    {
+        UserManager6Records.ValidateKey(username, nameof(username));
+        return ReadBoundAsync(databasePath, routerId, timeout,
+            (session, token) => session.FindUserManager7AccountAsync(username, timeout, token), cancellationToken);
+    }
+
     [SupportedOSPlatform("windows")]
     internal static Task<UserManager6Account?> FindBoundUserManager6AccountAsync(string databasePath,
         Guid routerId, string customer, string username, TimeSpan? timeout = null,
