@@ -1466,6 +1466,112 @@ public sealed class RouterOsTlsTransportTests(ITestOutputHelper output)
         finally { await serve; }
     }
 
+    [Theory]
+    [InlineData("multiple")]
+    [InlineData("empty")]
+    [InlineData("absent")]
+    [InlineData("unknown-counter")]
+    [InlineData("overflow")]
+    [InlineData("wrong-user")]
+    [InlineData("inactive")]
+    [InlineData("missing-active")]
+    [InlineData("ended")]
+    [InlineData("duplicate-id")]
+    [InlineData("drift")]
+    [InlineData("limit")]
+    [InlineData("trap")]
+    [InlineData("v6")]
+    public async Task UserManager7ActiveSessionReadPreservesAccountingEvidenceAndRejectsUnsafeRows(string condition)
+    {
+        using var certificates = new Certificates();
+        using var server = new LoopbackServer(certificates.Leaf, certificates.Root, output);
+        Task serve = server.RunAsync(reply: true, handler: async (tls, token) =>
+        {
+            await PrepareProbePeerAsync(tls, token, condition == "v6" ? "6.49.19" : "7.21.1");
+            if (condition == "v6") { Assert.Equal(0, await tls.ReadAsync(new byte[1], token)); return; }
+            async Task Account(bool second)
+            {
+                var request = await RouterOsWireCodec.ReadSentenceAsync(tls, token);
+                Assert.Equal(new[] { "/user-manager/user/print",
+                    "=.proplist=.id,name,disabled,group,shared-users", "?name=001" },
+                    request.Select(word => Encoding.UTF8.GetString(word)).ToArray());
+                if (condition != "absent")
+                    await RouterOsWireCodec.WriteSentenceAsync(tls, ["!re"u8.ToArray(),
+                        second && condition == "drift" ? "=.id=*2"u8.ToArray() : "=.id=*1"u8.ToArray(),
+                        "=name=001"u8.ToArray(), "=disabled=no"u8.ToArray()], token);
+                await RouterOsWireCodec.WriteSentenceAsync(tls, ["!done"u8.ToArray()], token);
+            }
+            await Account(false);
+            if (condition == "absent") { Assert.Equal(0, await tls.ReadAsync(new byte[1], token)); return; }
+            var request = await RouterOsWireCodec.ReadSentenceAsync(tls, token);
+            Assert.Equal(new[] { "/user-manager/session/print",
+                "=.proplist=.id,user,active,download,upload,uptime,started,ended,last-accounting-packet,status",
+                "?user=001", "?active=yes" }, request.Select(word => Encoding.UTF8.GetString(word)).ToArray());
+            if (condition == "trap")
+            {
+                await RouterOsWireCodec.WriteSentenceAsync(tls, ["!trap"u8.ToArray()], token);
+                return;
+            }
+            int count = condition switch { "empty" => 0, "multiple" or "duplicate-id" => 2, "limit" => 129, _ => 1 };
+            for (int i = 0; i < count; i++)
+            {
+                var row = new List<ReadOnlyMemory<byte>>
+                {
+                    "!re"u8.ToArray(),
+                    Encoding.ASCII.GetBytes("=.id=" + (condition == "duplicate-id" ? (i == 0 ? "*A" : "*a") :
+                        "*" + (i+10).ToString("X", System.Globalization.CultureInfo.InvariantCulture))),
+                    condition == "wrong-user" ? "=user=002"u8.ToArray() : "=user=001"u8.ToArray(),
+                    condition == "overflow" ? "=download=18446744073709551615"u8.ToArray() : "=download=4294967296"u8.ToArray(),
+                    "=uptime=1d2h"u8.ToArray(), "=started=nov/26/2026 18:00:00"u8.ToArray(),
+                    condition == "ended" ? "=ended=nov/26/2026 19:00:00"u8.ToArray() : "=ended="u8.ToArray(),
+                    "=last-accounting-packet=nov/26/2026 18:01:00"u8.ToArray(), "=status=start,interim"u8.ToArray()
+                };
+                if (condition != "missing-active")
+                    row.Add(condition == "inactive" ? "=active=no"u8.ToArray() : "=active=yes"u8.ToArray());
+                if (condition != "unknown-counter") row.Add("=upload=128"u8.ToArray());
+                await RouterOsWireCodec.WriteSentenceAsync(tls, row.ToArray(), token);
+            }
+            if (condition is "wrong-user" or "inactive" or "missing-active" or "ended" or "duplicate-id" or "limit") return;
+            await RouterOsWireCodec.WriteSentenceAsync(tls, ["!done"u8.ToArray()], token);
+            await Account(true);
+            Assert.Equal(0, await tls.ReadAsync(new byte[1], token));
+        });
+        async Task<UserManager7ActiveSessionEvidence?> Read()
+        {
+            using var session = await RouterOsSession.ConnectAsync("127.0.0.1", "router.test",
+                "synthetic-user"u8.ToArray(), "synthetic-private-password"u8.ToArray(), server.Port,
+                trustedRootDer: certificates.Root.RawData);
+            return await session.ReadUserManager7ActiveSessionsAsync("001");
+        }
+        try
+        {
+            if (condition == "v6") await Assert.ThrowsAsync<NotSupportedException>(Read);
+            else if (condition == "absent") Assert.Null(await Read());
+            else if (condition is "multiple" or "empty" or "unknown-counter" or "overflow")
+            {
+                var evidence = await Read();
+                Assert.NotNull(evidence);
+                Assert.Equal("*1", evidence.Account.RemoteId);
+                Assert.Equal(condition switch { "multiple" => 2, "empty" => 0, _ => 1 },
+                    evidence.VisibleActiveSessions.Count);
+                Assert.All(evidence.VisibleActiveSessions, row =>
+                {
+                    Assert.Equal("001", row.Username);
+                    Assert.Equal(condition == "overflow" ? ulong.MaxValue : 4294967296UL, row.Usage.DownloadUsed.Bytes);
+                    Assert.Equal(condition == "unknown-counter" ? (ulong?)null : 128UL, row.Usage.UploadUsed.Bytes);
+                    Assert.Equal(condition is "unknown-counter" or "overflow" ? (ulong?)null : 4294967424UL,
+                        row.Usage.ObservedTransferBytes);
+                    Assert.Equal(93600UL, row.Usage.ObservedUptimeSeconds);
+                    Assert.Equal("nov/26/2026 18:01:00", row.LastAccountingPacketRaw);
+                    Assert.Equal("start,interim", row.StatusRaw);
+                });
+            }
+            else await Assert.ThrowsAsync<InvalidDataException>(Read);
+        }
+        finally { await serve; }
+        Assert.False(server.HasPendingConnection);
+    }
+
     [Fact]
     public async Task UserManager6LookupNeverSendsLegacyMenuToV7()
     {

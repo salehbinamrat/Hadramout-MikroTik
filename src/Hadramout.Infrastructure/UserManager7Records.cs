@@ -37,6 +37,13 @@ internal sealed record UserManager7Limitation(string RemoteId, string Name,
     string? UptimeLimitRaw, string? RateLimitRxRaw, string? RateLimitTxRaw,
     string? ResetIntervalRaw, string? ResetStartRaw);
 
+// Only visible active accounting sessions. No historical totals, entitlement
+// or assertion of current connectivity; RADIUS accounting may be absent or stale.
+internal sealed record UserManager7ActiveSession(string RemoteId, string Username,
+    UserManager6Usage Usage, string? StartedRaw, string? LastAccountingPacketRaw, string? StatusRaw);
+internal sealed record UserManager7ActiveSessionEvidence(UserManager7Account Account,
+    IReadOnlyList<UserManager7ActiveSession> VisibleActiveSessions);
+
 internal static class UserManager7Records
 {
     private static string ExactKey(byte[][] words, string field, string? expected = null)
@@ -81,6 +88,24 @@ internal static class UserManager7Records
             UserManager6Records.ReadText(words, "rate-limit-tx", 128),
             UserManager6Records.ReadText(words, "reset-counters-interval", 64),
             UserManager6Records.ReadText(words, "reset-counters-start-time", 128));
+
+    internal static UserManager7ActiveSession ParseActiveSession(byte[][] words, string username)
+    {
+        string user = ExactKey(words, "user", username);
+        string id = RemoteId(words);
+        if (UserManager6Records.ReadText(words, "active", 8) is not ("yes" or "true"))
+            throw new InvalidDataException("User Manager v7 session did not report active state.");
+        string? ended = UserManager6Records.ReadText(words, "ended", 128);
+        if (!string.IsNullOrEmpty(ended))
+            throw new InvalidDataException("User Manager v7 active session has an end time.");
+        var usage = new UserManager6Usage(
+            UserManager6ByteValue.FromRaw(UserManager6Records.ReadText(words, "download", 64)),
+            UserManager6ByteValue.FromRaw(UserManager6Records.ReadText(words, "upload", 64)),
+            UserManager6Records.ReadText(words, "uptime", 128));
+        return new(id, user, usage, UserManager6Records.ReadText(words, "started", 128),
+            UserManager6Records.ReadText(words, "last-accounting-packet", 128),
+            UserManager6Records.ReadText(words, "status", 128));
+    }
 
     internal static UserManager7Assignment ParseAssignment(byte[][] words, string username)
     {

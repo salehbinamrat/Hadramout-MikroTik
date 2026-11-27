@@ -187,6 +187,34 @@ internal sealed class RouterOsSession : IDisposable
         }, timeout, cancellationToken);
     }
 
+    internal Task<UserManager7ActiveSessionEvidence?> ReadUserManager7ActiveSessionsAsync(string username,
+        TimeSpan? timeout = null, CancellationToken cancellationToken = default)
+    {
+        UserManager6Records.ValidateKey(username, nameof(username));
+        return WithReadSessionAsync<UserManager7ActiveSessionEvidence?>(async (stream, token) =>
+        {
+            await RequireUserManager7FamilyAsync(stream, token).ConfigureAwait(false);
+            var account = await FindUm7AccountCoreAsync(stream, username, token).ConfigureAwait(false);
+            if (account is null) return null;
+            var ids = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var sessions = await ReadCommandAsync(stream,
+                ["/user-manager/session/print"u8.ToArray(),
+                    "=.proplist=.id,user,active,download,upload,uptime,started,ended,last-accounting-packet,status"u8.ToArray(),
+                    UserManager6Records.Query("user", username), "?active=yes"u8.ToArray()],
+                words =>
+                {
+                    var row = UserManager7Records.ParseActiveSession(words, username);
+                    if (!ids.Add(row.RemoteId))
+                        throw new InvalidDataException("Duplicate User Manager v7 active session identity.");
+                    return row;
+                }, 128, token).ConfigureAwait(false);
+            if (await FindUm7AccountCoreAsync(stream, username, token).ConfigureAwait(false) != account)
+                throw new InvalidDataException("User Manager v7 account changed during session read.");
+            token.ThrowIfCancellationRequested();
+            return new(account, sessions);
+        }, timeout, cancellationToken);
+    }
+
     internal Task<UserManager7ProfileMappingEvidence?> ReadUserManager7ProfileMappingAsync(string name,
         TimeSpan? timeout = null, CancellationToken cancellationToken = default)
     {
