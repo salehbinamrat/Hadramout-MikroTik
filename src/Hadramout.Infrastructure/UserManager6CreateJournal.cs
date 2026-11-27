@@ -41,6 +41,17 @@ internal sealed record UserManager6ProfileLinkReadEvidence(UserManager6ProfileLi
 internal enum UserManager6ProfileLinkState { DispatchStarted = 2, Indeterminate = 3, Acknowledged = 4 }
 internal sealed record UserManager6ProfileLinkEntry(Guid ReservationId, string RemoteId, UserManager6ProfileLinkState State);
 
+internal sealed record UserManager6ProfileLinkReviewScope(UserManager6ProfileLinkScope Intent,
+    UserManager6ProfileLinkEntry Entry);
+internal enum UserManager6ProfileLinkReviewState
+{
+    AccountNotVisible, ActualProfileUnknown, EmptyProfileReported, OtherProfileReported,
+    IntendedNameProfileNotVisible, IntendedNameAndOwnerVisible
+}
+internal sealed record UserManager6ProfileLinkReviewEvidence(UserManager6ProfileLinkReviewScope Scope,
+    UserManager6ProfileLinkReviewState State, UserManager6DisabledCreationObservation? Account,
+    string? ActualProfile, UserManager6Profile? Profile);
+
 internal sealed record UserManager6CreationReviewRow(UserManager6CreateEntry Entry, bool LocalIdentityMatches);
 internal sealed record UserManager6CreationReviewPage(IReadOnlyList<UserManager6CreationReviewRow> Rows,
     Guid? NextAfterReservationId);
@@ -394,7 +405,17 @@ internal sealed class UserManager6CreateJournal(string databasePath)
     {
         ValidateId(reservationId);
         using var c = OpenReadOnly();
+        using var tx = c.BeginTransaction(deferred: true);
+        var entry = ReadProfileLinkEntry(c, tx, reservationId);
+        tx.Commit();
+        return entry;
+    }
+
+    private static UserManager6ProfileLinkEntry? ReadProfileLinkEntry(SqliteConnection c,
+        SqliteTransaction tx, Guid reservationId)
+    {
         using var cmd = c.CreateCommand();
+        cmd.Transaction = tx;
         cmd.CommandText = "SELECT RemoteId,State FROM um6_profile_link_journal WHERE ReservationId=$id;";
         cmd.Parameters.AddWithValue("$id", reservationId);
         using var r = cmd.ExecuteReader();
@@ -404,6 +425,22 @@ internal sealed class UserManager6CreateJournal(string databasePath)
         if (!UserManager6Records.IsOpaqueRemoteId(remoteId) || !Enum.IsDefined(state))
             throw new InvalidDataException("Invalid retained profile link entry.");
         return new(reservationId, remoteId, state);
+    }
+
+    // Capture both immutable intent and non-rearmable link attempt in one snapshot.
+    internal UserManager6ProfileLinkReviewScope ReadProfileLinkReviewScope(Guid reservationId)
+    {
+        ValidateId(reservationId);
+        using var c = OpenReadOnly();
+        using var tx = c.BeginTransaction(deferred: true);
+        var intent = ReadProfileLinkScope(c, tx, reservationId);
+        var entry = ReadProfileLinkEntry(c, tx, reservationId)
+            ?? throw new InvalidOperationException("Existing profile link claim required.");
+        if (intent.Creation.State is not (UserManager6CreateState.Indeterminate or UserManager6CreateState.Acknowledged) ||
+            entry.RemoteId != intent.Creation.ExpectedRemoteId)
+            throw new InvalidOperationException("Profile link identity no longer matches.");
+        tx.Commit();
+        return new(intent, entry);
     }
 
     // Acknowledgement is not confirmed assignment. Neither terminal state can be replayed.
