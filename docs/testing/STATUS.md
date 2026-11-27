@@ -42,7 +42,8 @@
 - PR #41 merged c143d2aabbe22e3bb4feddfe67c93986a6b3b51b; Core 45951709257 / Release 45951709362 passed on 4562c00d55ac225b403620abb4aed5f0ac7ec778; package artifact 15177277753, smoke evidence 15177417396. Bound profile preflight passed hosted CI.
 - PR #42 merged c531fda46a615d5b7485f70b208c8cd8212a1a47; corrected head 12f1a2a81d4738ba05ad4af3056053b5ea26a8eb Core 45953274844 / Release 45953274845 passed, package artifact 15177288935, smoke evidence 15177553418. Schema v11 local one-shot journal and concurrency test passed hosted CI.
 - PR #43 merged ccc2f725b57df0942d50c102c9ac100935272c97; Core 45954244490 / Release 45954244604 passed on adf5b0ecb4e9c9db4bbb92700a320ba77b9fa115; package artifact 15178700325, smoke evidence 15178526009. Same-row conflict guard passed hosted CI.
-- P16c.4b.2b proposed read-only retained profile-link review, exact disabled identity and visible intended owner/profile, local scope drift rejection; 12 synthetic regression cases. Hosted CI pending. No remote mutation or assignment confirmation.
+- PR #44 merged 5ca6c52079b05114c2160ecf364d569bab566a4e; Core 45955198253 / Release 45955198252 passed on 8164ad5d95389ab9c62871196864958ccac362d0; package artifact 15177964709, smoke evidence 15178278700. Read-only profile link review passed hosted CI.
+- P16c.4b.2c proposed local router-scoped profile-link review queue and counts plus isolated lab qualification protocol; four new regression cases. Hosted CI pending. No physical qualification or production mutation.
 - P10 remaining: restore UI and RBAC, managed crash cleanup, real cross-account/device validation, full audit coverage/actor attribution, retention and scheduling. No production restore.
 - P01 deeper per-feature audit; physical Windows, RouterOS, printers; hard-kill, power-loss and disk-full tests pending. main remains unprotected; exact-head manual gate enforced. No production DB or real router changes.
 
