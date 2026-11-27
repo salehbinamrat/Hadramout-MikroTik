@@ -678,6 +678,80 @@ public sealed class RouterOsWireCodecTests
         Assert.Equal(0L, wire.Length);
     }
 
+    [Theory]
+    [InlineData("valid")]
+    [InlineData("zero")]
+    [InlineData("missing-counters")]
+    [InlineData("scaled")]
+    [InlineData("overflow")]
+    [InlineData("empty")]
+    [InlineData("wrong-id")]
+    [InlineData("wrong-name")]
+    [InlineData("missing-id")]
+    [InlineData("missing-name")]
+    [InlineData("duplicate-row")]
+    [InlineData("duplicate-field")]
+    [InlineData("trap")]
+    [InlineData("partial")]
+    public async Task Um7TotalUsageQualificationRequiresCompleteIdentityBoundReply(string condition)
+    {
+        using var wire = new MemoryStream();
+        if (condition != "empty" && condition != "trap")
+        {
+            var row = new List<ReadOnlyMemory<byte>> { "!re"u8.ToArray() };
+            if (condition != "missing-id")
+                row.Add(condition == "wrong-id" ? "=.id=*2"u8.ToArray() : "=.id=*1"u8.ToArray());
+            if (condition != "missing-name")
+                row.Add(condition == "wrong-name" ? "=name=002"u8.ToArray() : "=name=001"u8.ToArray());
+            if (condition != "missing-counters")
+            {
+                row.Add(Encoding.ASCII.GetBytes("=total-download=" + (condition switch
+                {
+                    "zero" => "0", "scaled" => "4.7GiB", "overflow" => "18446744073709551615", _ => "4294967296"
+                })));
+                row.Add(condition == "zero" ? "=total-upload=0"u8.ToArray() : "=total-upload=128"u8.ToArray());
+                row.Add(condition == "zero" ? "=total-uptime=0s"u8.ToArray() : "=total-uptime=1d2h"u8.ToArray());
+            }
+            row.Add("=active-sessions=0"u8.ToArray());
+            row.Add("=actual-profile=day"u8.ToArray());
+            if (condition == "duplicate-field") row.Add("=total-download=1"u8.ToArray());
+            await RouterOsWireCodec.WriteSentenceAsync(wire, row, CancellationToken.None);
+            if (condition == "duplicate-row")
+                await RouterOsWireCodec.WriteSentenceAsync(wire, row, CancellationToken.None);
+        }
+        if (condition == "trap")
+            await RouterOsWireCodec.WriteSentenceAsync(wire, ["!trap"u8.ToArray()], CancellationToken.None);
+        else if (condition != "partial")
+            await RouterOsWireCodec.WriteSentenceAsync(wire, ["!done"u8.ToArray()], CancellationToken.None);
+        using var input = new MemoryStream(wire.ToArray(), writable: false);
+        var account = new UserManager7Account("*1", "001", false, null, null);
+        Task<UserManager7TotalUsageSample?> Read() =>
+            UserManager7Records.ReadQualifiedTotalUsageReplyAsync(input, account, CancellationToken.None);
+        if (condition == "partial")
+            await Assert.ThrowsAsync<EndOfStreamException>(Read);
+        else if (condition == "empty")
+            Assert.Null(await Read());
+        else if (condition is "valid" or "zero" or "missing-counters" or "scaled" or "overflow")
+        {
+            var sample = await Read();
+            Assert.NotNull(sample);
+            Assert.Equal("*1", sample.RemoteId);
+            Assert.Equal("001", sample.Username);
+            Assert.Equal("0", sample.ActiveSessionsRaw);
+            Assert.Equal("day", sample.ActualProfileRaw);
+            Assert.Equal(condition switch
+            {
+                "valid" => 4294967424UL, "zero" => 0UL, _ => (ulong?)null
+            }, sample.Usage.ObservedTransferBytes);
+            Assert.Equal(condition switch
+            {
+                "zero" => 0UL, "missing-counters" => (ulong?)null, _ => 93600UL
+            }, sample.Usage.ObservedUptimeSeconds);
+            if (condition == "scaled") Assert.Equal("4.7GiB", sample.Usage.DownloadUsed.Raw);
+        }
+        else await Assert.ThrowsAsync<InvalidDataException>(Read);
+    }
+
     // Separate in/out buffers model the duplex exchange without a real router.
     private sealed class CreateExchangeStream(byte[] response, bool failAfterFirstWrite = false) : MemoryStream
     {
