@@ -6,7 +6,7 @@ namespace Hadramout.Infrastructure;
 /// <summary>Opens an owned local database with durable settings and atomic schema upgrades.</summary>
 public static class DatabaseStore
 {
-    public const int CurrentSchemaVersion = 10;
+    public const int CurrentSchemaVersion = 11;
     public const int ApplicationId = 0x484D4B54;
 
     public static SqliteConnection Open(string path) => OpenCore(path, SqliteOpenMode.ReadWriteCreate);
@@ -135,6 +135,13 @@ public static class DatabaseStore
             Execute(connection, tx, SchemaV10);
             Execute(connection, tx, "PRAGMA user_version=10;");
             version = 10;
+        }
+
+        if (version == 10)
+        {
+            Execute(connection, tx, SchemaV11);
+            Execute(connection, tx, "PRAGMA user_version=11;");
+            version = 11;
         }
 
         if (version != CurrentSchemaVersion)
@@ -393,5 +400,43 @@ public static class DatabaseStore
             SELECT 1 FROM um6_recovery_evidence r WHERE r.ReservationId=NEW.ReservationId
                 AND r.RemoteId<>NEW.RemoteId)
         BEGIN SELECT RAISE(ABORT,'Creation evidence conflicts with recovery evidence'); END;
+        """;
+
+    // Local one-shot profile-link dispatch journal, independent of account creation.
+    private const string SchemaV11 = """
+        CREATE TABLE um6_profile_link_journal (
+            ReservationId TEXT NOT NULL PRIMARY KEY REFERENCES um6_create_intents(ReservationId) ON DELETE RESTRICT,
+            RemoteId TEXT COLLATE BINARY NOT NULL CHECK(
+                typeof(RemoteId)='text' AND length(RemoteId) BETWEEN 2 AND 33 AND
+                instr(RemoteId,char(0))=0 AND substr(RemoteId,1,1)='*' AND
+                substr(RemoteId,2) NOT GLOB '*[^0-9a-fA-F]*'),
+            State INTEGER NOT NULL CHECK(State IN (2,3,4))
+        );
+        CREATE TRIGGER um6_profile_link_insert_guard BEFORE INSERT ON um6_profile_link_journal
+        WHEN NEW.State<>2 OR NOT EXISTS (
+            SELECT 1 FROM um6_create_journal j
+            JOIN um6_create_intents i ON i.ReservationId=j.ReservationId
+            JOIN voucher_reservations v ON v.Id=j.ReservationId AND v.BackendId=j.BackendId AND v.Username=j.Username
+            JOIN backends b ON b.Id=j.BackendId AND b.RouterId=j.RouterId AND b.Kind=2
+            JOIN voucher_batches batch ON batch.Id=v.BatchId AND batch.Id=i.BatchId AND batch.BackendId=j.BackendId
+            JOIN plans p ON p.Id=batch.PlanId AND p.Id=i.PlanId AND p.BackendId=j.BackendId AND p.Name=i.PlanName
+            JOIN router_targets t ON t.RouterId=j.RouterId AND t.LeafSha256=i.LeafSha256
+            JOIN um6_voucher_secrets secret ON secret.ReservationId=j.ReservationId
+            WHERE j.ReservationId=NEW.ReservationId AND j.State IN (3,4)
+            AND (EXISTS (SELECT 1 FROM um6_recovery_evidence r
+                    WHERE r.ReservationId=j.ReservationId AND r.RemoteId=NEW.RemoteId)
+                OR EXISTS (SELECT 1 FROM um6_create_evidence e
+                    WHERE e.ReservationId=j.ReservationId AND e.Kind=2 AND e.RemoteId=NEW.RemoteId))
+            AND NOT EXISTS (SELECT 1 FROM um6_create_evidence e
+                WHERE e.ReservationId=j.ReservationId AND e.RemoteId IS NOT NULL AND e.RemoteId<>NEW.RemoteId)
+            AND NOT EXISTS (SELECT 1 FROM um6_recovery_evidence r
+                WHERE r.ReservationId=j.ReservationId AND r.RemoteId<>NEW.RemoteId))
+        BEGIN SELECT RAISE(ABORT,'Invalid UM6 profile link claim'); END;
+        CREATE TRIGGER um6_profile_link_update_guard BEFORE UPDATE ON um6_profile_link_journal
+        WHEN NEW.ReservationId IS NOT OLD.ReservationId OR NEW.RemoteId IS NOT OLD.RemoteId
+            OR NOT (OLD.State=2 AND NEW.State IN (3,4))
+        BEGIN SELECT RAISE(ABORT,'Invalid UM6 profile link transition'); END;
+        CREATE TRIGGER um6_profile_link_no_delete BEFORE DELETE ON um6_profile_link_journal
+        BEGIN SELECT RAISE(ABORT,'UM6 profile link evidence is retained'); END;
         """;
 }

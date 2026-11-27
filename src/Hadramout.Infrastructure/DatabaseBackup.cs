@@ -191,7 +191,7 @@ public static class DatabaseBackup
             throw new InvalidDataException("Backup belongs to another application.");
         cmd.CommandText = "PRAGMA user_version;";
         long version = (long)cmd.ExecuteScalar()!;
-        if (version != DatabaseStore.CurrentSchemaVersion && !(allowLegacyVersion && version is 4 or 5 or 6 or 7 or 8 or 9))
+        if (version != DatabaseStore.CurrentSchemaVersion && !(allowLegacyVersion && version is 4 or 5 or 6 or 7 or 8 or 9 or 10))
             throw new InvalidDataException("Backup schema version is not supported by this release.");
     }
 
@@ -284,6 +284,17 @@ public static class DatabaseBackup
                 """;
             if ((long)cmd.ExecuteScalar()! != 5)
                 throw new InvalidDataException("Backup is missing UM6 recovery evidence objects.");
+        }
+        if (version >= 11)
+        {
+            cmd.CommandText = """
+                SELECT count(*) FROM sqlite_schema WHERE
+                    (type='table' AND name='um6_profile_link_journal') OR
+                    (type='trigger' AND name IN ('um6_profile_link_insert_guard',
+                        'um6_profile_link_update_guard','um6_profile_link_no_delete'));
+                """;
+            if ((long)cmd.ExecuteScalar()! != 4)
+                throw new InvalidDataException("Backup is missing UM6 profile link journal objects.");
         }
     }
 

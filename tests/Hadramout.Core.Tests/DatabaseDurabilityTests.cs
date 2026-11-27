@@ -1148,6 +1148,85 @@ public sealed class DatabaseDurabilityTests
         Assert.Null(journal.ReadBoundRecoveryScope(id).Recovery);
     }
 
+    private static UserManager6ProfileLinkReadEvidence MatchingProfileEvidence(UserManager6ProfileLinkScope scope) =>
+        new(UserManager6ProfileLinkReadState.BothVisible, new(scope.Creation.ExpectedRemoteId!, true),
+            new(scope.ProfileOwner, scope.ProfileName, null, null));
+
+    [Theory]
+    [InlineData(UserManager6ProfileLinkState.Acknowledged)]
+    [InlineData(UserManager6ProfileLinkState.Indeterminate)]
+    [SupportedOSPlatform("windows")]
+    public void ProfileLinkClaimIsDurableOneShotAndRestoreCannotRearm(UserManager6ProfileLinkState outcome)
+    {
+        using var file = new TestFile();
+        using var before = new TestFile();
+        using var after = new TestFile();
+        Guid id = SeedSecretIntent(file.Path);
+        new UserManager6VoucherSecretStore(file.Path).Save(id, "synthetic"u8);
+        var journal = new UserManager6CreateJournal(file.Path);
+        Assert.True(journal.TryBeginBoundDispatch(id));
+        Assert.True(journal.TryMarkIndeterminate(id));
+        Assert.True(journal.TryRecordRecoveryObservation(new(journal.ReadBoundRecoveryScope(id), new("*1", false))));
+        var scope = journal.ReadProfileLinkScope(id);
+        var evidence = MatchingProfileEvidence(scope);
+        using (var c = DatabaseStore.Open(file.Path))
+        using (var destination = before.OpenRaw()) c.BackupDatabase(destination);
+        Assert.True(journal.TryClaimProfileLink(scope, evidence));
+        Assert.False(new UserManager6CreateJournal(file.Path).TryClaimProfileLink(scope, evidence));
+        Assert.Equal(UserManager6ProfileLinkState.DispatchStarted, journal.ReadProfileLinkEntry(id)!.State);
+        Assert.True(journal.TryRecordProfileLinkResult(id, outcome));
+        Assert.False(journal.TryRecordProfileLinkResult(id, outcome));
+        Assert.False(journal.TryClaimProfileLink(scope, evidence));
+        Assert.Equal(outcome, journal.ReadProfileLinkEntry(id)!.State);
+        Assert.Equal(UserManager6CreateState.Indeterminate, journal.Read(id)!.State);
+        using (var c = DatabaseStore.Open(file.Path))
+        {
+            Assert.Throws<SqliteException>(() => Execute(c, "UPDATE um6_profile_link_journal SET State=2;"));
+            Assert.Throws<SqliteException>(() => Execute(c, "UPDATE um6_profile_link_journal SET RemoteId='*2';"));
+            Assert.Throws<SqliteException>(() => Execute(c, "DELETE FROM um6_profile_link_journal;"));
+            Assert.Throws<SqliteException>(() => Execute(c, "INSERT OR REPLACE INTO um6_profile_link_journal SELECT * FROM um6_profile_link_journal;"));
+            using var destination = after.OpenRaw();
+            c.BackupDatabase(destination);
+        }
+        Assert.Throws<InvalidOperationException>(() => UserManager6CreateJournal.RequireEquivalentProfileLinksForRestore(file.Path, before.Path));
+        Assert.Throws<InvalidOperationException>(() => UserManager6CreateJournal.RequireEquivalentProfileLinksForRestore(before.Path, file.Path));
+        UserManager6CreateJournal.RequireEquivalentProfileLinksForRestore(file.Path, after.Path);
+    }
+
+    [Theory]
+    [InlineData("in-flight")]
+    [InlineData("missing-profile")]
+    [InlineData("wrong-owner")]
+    [InlineData("wrong-id")]
+    [InlineData("drift")]
+    [SupportedOSPlatform("windows")]
+    public void ProfileLinkClaimRejectsUnsafeOrStaleEvidence(string condition)
+    {
+        using var file = new TestFile();
+        Guid id = SeedSecretIntent(file.Path);
+        new UserManager6VoucherSecretStore(file.Path).Save(id, "synthetic"u8);
+        var journal = new UserManager6CreateJournal(file.Path);
+        Assert.True(journal.TryBeginBoundDispatch(id));
+        if (condition != "in-flight") Assert.True(journal.TryMarkIndeterminate(id));
+        Assert.True(journal.TryRecordRecoveryObservation(new(journal.ReadBoundRecoveryScope(id), new("*1", false))));
+        var scope = journal.ReadProfileLinkScope(id);
+        var evidence = MatchingProfileEvidence(scope);
+        evidence = condition switch
+        {
+            "missing-profile" => evidence with { State = UserManager6ProfileLinkReadState.ProfileNotVisible, Profile = null },
+            "wrong-owner" => evidence with { Profile = new("other", scope.ProfileName, null, null) },
+            "wrong-id" => evidence with { Account = new("*2", true) },
+            _ => evidence
+        };
+        if (condition == "drift")
+        {
+            using var c = DatabaseStore.Open(file.Path);
+            Execute(c, "UPDATE plans SET Name='changed';");
+        }
+        Assert.Throws<InvalidOperationException>(() => journal.TryClaimProfileLink(scope, evidence));
+        Assert.Null(journal.ReadProfileLinkEntry(id));
+    }
+
     private static Guid SeedSecretIntent(string path)
     {
         Guid id = SeedReservation(path, BackendKind.UserManager6);
@@ -1187,13 +1266,14 @@ public sealed class DatabaseDurabilityTests
     // guard in sync with new migrations; never silently leave a newer table behind.
     internal static void RecreateLegacyFixture(SqliteConnection c, int version)
     {
-        if (version is < 1 or > 9) throw new ArgumentOutOfRangeException(nameof(version));
-        Assert.Equal(10, DatabaseStore.CurrentSchemaVersion);
-        Assert.Equal(10L, Scalar(c, "PRAGMA user_version;"));
+        if (version is < 1 or > 10) throw new ArgumentOutOfRangeException(nameof(version));
+        Assert.Equal(11, DatabaseStore.CurrentSchemaVersion);
+        Assert.Equal(11L, Scalar(c, "PRAGMA user_version;"));
         using var tx = c.BeginTransaction(deferred: false);
         using var cmd = c.CreateCommand();
         cmd.Transaction = tx;
-        cmd.CommandText = "DROP TRIGGER um6_recovery_consistency_guard; DROP TABLE um6_recovery_evidence;";
+        cmd.CommandText = "DROP TABLE um6_profile_link_journal;";
+        if (version < 10) cmd.CommandText += " DROP TRIGGER um6_recovery_consistency_guard; DROP TABLE um6_recovery_evidence;";
         if (version < 9) cmd.CommandText += " DROP TABLE um6_create_evidence;";
         if (version < 8) cmd.CommandText += " DROP TABLE um6_voucher_secrets;";
         if (version < 7) cmd.CommandText += " DROP TABLE um6_create_intents;";
@@ -1209,7 +1289,7 @@ public sealed class DatabaseDurabilityTests
 
         cmd.Transaction = null;
         cmd.CommandText = "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%';";
-        Assert.Equal(version == 9 ? 13L : version == 8 ? 12L : version == 7 ? 11L : version == 6 ? 10L : version == 5 ? 9L : version == 4 ? 8L : version == 3 ? 7L : 6L, (long)cmd.ExecuteScalar()!);
+        Assert.Equal(version == 10 ? 14L : version == 9 ? 13L : version == 8 ? 12L : version == 7 ? 11L : version == 6 ? 10L : version == 5 ? 9L : version == 4 ? 8L : version == 3 ? 7L : 6L, (long)cmd.ExecuteScalar()!);
         Assert.Equal((long)version, Scalar(c, "PRAGMA user_version;"));
     }
 
@@ -1223,6 +1303,7 @@ public sealed class DatabaseDurabilityTests
     [InlineData(7)]
     [InlineData(8)]
     [InlineData(9)]
+    [InlineData(10)]
     public void EveryLegacyFixtureHasOnlyItsOwnSchemaAndUpgrades(int version)
     {
         using var file = new TestFile();
