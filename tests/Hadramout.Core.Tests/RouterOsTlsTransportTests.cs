@@ -1694,6 +1694,133 @@ public sealed class RouterOsTlsTransportTests(ITestOutputHelper output)
         Assert.False(server.HasPendingConnection);
     }
 
+    [Theory]
+    [InlineData("both")]
+    [InlineData("empty")]
+    [InlineData("profiles-off")]
+    [InlineData("unknown-policy")]
+    [InlineData("service-off")]
+    [InlineData("unknown-service")]
+    [InlineData("disabled-account")]
+    [InlineData("session-trap")]
+    [InlineData("wrong-session")]
+    [InlineData("policy-drift")]
+    [InlineData("account-drift")]
+    [InlineData("absent")]
+    [InlineData("v6")]
+    public async Task UserManager7CombinedObservationNeverReturnsPartialOrCrossScopeEvidence(string condition)
+    {
+        using var certificates = new Certificates();
+        using var server = new LoopbackServer(certificates.Leaf, certificates.Root, output);
+        Task serve = server.RunAsync(reply: true, handler: async (tls, token) =>
+        {
+            await PrepareProbePeerAsync(tls, token, condition == "v6" ? "6.49.19" : "7.21.1");
+            if (condition == "v6") { Assert.Equal(0, await tls.ReadAsync(new byte[1], token)); return; }
+            async Task Account(bool second)
+            {
+                var request = await RouterOsWireCodec.ReadSentenceAsync(tls, token);
+                Assert.Equal(new[] { "/user-manager/user/print",
+                    "=.proplist=.id,name,disabled,group,shared-users", "?name=001" },
+                    request.Select(word => Encoding.UTF8.GetString(word)).ToArray());
+                if (condition != "absent")
+                    await RouterOsWireCodec.WriteSentenceAsync(tls, ["!re"u8.ToArray(),
+                        second && condition == "account-drift" ? "=.id=*2"u8.ToArray() : "=.id=*1"u8.ToArray(),
+                        "=name=001"u8.ToArray(), condition == "disabled-account" ? "=disabled=yes"u8.ToArray() : "=disabled=no"u8.ToArray()], token);
+                await RouterOsWireCodec.WriteSentenceAsync(tls, ["!done"u8.ToArray()], token);
+            }
+            async Task Settings(bool second)
+            {
+                var request = await RouterOsWireCodec.ReadSentenceAsync(tls, token);
+                Assert.Equal(new[] { "/user-manager/print", "=.proplist=enabled,use-profiles" },
+                    request.Select(word => Encoding.UTF8.GetString(word)).ToArray());
+                var row = new List<ReadOnlyMemory<byte>> { "!re"u8.ToArray() };
+                if (condition != "unknown-service")
+                    row.Add(condition == "service-off" ? "=enabled=no"u8.ToArray() : "=enabled=yes"u8.ToArray());
+                if (condition != "unknown-policy")
+                    row.Add(condition == "profiles-off" || (second && condition == "policy-drift")
+                        ? "=use-profiles=no"u8.ToArray() : "=use-profiles=yes"u8.ToArray());
+                await RouterOsWireCodec.WriteSentenceAsync(tls, row.ToArray(), token);
+                await RouterOsWireCodec.WriteSentenceAsync(tls, ["!done"u8.ToArray()], token);
+            }
+            await Account(false);
+            if (condition == "absent") { Assert.Equal(0, await tls.ReadAsync(new byte[1], token)); return; }
+            await Settings(false);
+            if (condition is not ("profiles-off" or "unknown-policy" or "service-off" or "unknown-service"))
+            {
+                var request = await RouterOsWireCodec.ReadSentenceAsync(tls, token);
+                Assert.Equal(new[] { "/user-manager/user-profile/print",
+                    "=.proplist=.id,user,profile,state,end-time", "?user=001" },
+                    request.Select(word => Encoding.UTF8.GetString(word)).ToArray());
+                if (condition != "empty")
+                    await RouterOsWireCodec.WriteSentenceAsync(tls, ["!re"u8.ToArray(), "=.id=*A"u8.ToArray(),
+                        "=user=001"u8.ToArray(), "=profile=day"u8.ToArray(), "=state=running active"u8.ToArray()], token);
+                await RouterOsWireCodec.WriteSentenceAsync(tls, ["!done"u8.ToArray()], token);
+            }
+            if (condition is not ("service-off" or "unknown-service"))
+            {
+                var request = await RouterOsWireCodec.ReadSentenceAsync(tls, token);
+                Assert.Equal(new[] { "/user-manager/session/print",
+                    "=.proplist=.id,user,active,download,upload,uptime,started,ended,last-accounting-packet,status",
+                    "?user=001", "?active=yes" }, request.Select(word => Encoding.UTF8.GetString(word)).ToArray());
+                if (condition == "session-trap")
+                {
+                    await RouterOsWireCodec.WriteSentenceAsync(tls, ["!trap"u8.ToArray()], token);
+                    return;
+                }
+                if (condition != "empty")
+                    await RouterOsWireCodec.WriteSentenceAsync(tls, ["!re"u8.ToArray(), "=.id=*B"u8.ToArray(),
+                        condition == "wrong-session" ? "=user=002"u8.ToArray() : "=user=001"u8.ToArray(),
+                        "=active=yes"u8.ToArray(), "=download=0"u8.ToArray()], token);
+                if (condition == "wrong-session") return;
+                await RouterOsWireCodec.WriteSentenceAsync(tls, ["!done"u8.ToArray()], token);
+            }
+            await Settings(true);
+            if (condition != "policy-drift") await Account(true);
+            Assert.Equal(0, await tls.ReadAsync(new byte[1], token));
+        });
+        async Task<UserManager7CombinedObservation?> Read()
+        {
+            using var session = await RouterOsSession.ConnectAsync("127.0.0.1", "router.test",
+                "synthetic-user"u8.ToArray(), "synthetic-private-password"u8.ToArray(), server.Port,
+                trustedRootDer: certificates.Root.RawData);
+            return await session.ReadUserManager7CombinedObservationAsync("001");
+        }
+        try
+        {
+            if (condition == "v6") await Assert.ThrowsAsync<NotSupportedException>(Read);
+            else if (condition == "absent") Assert.Null(await Read());
+            else if (condition is "session-trap" or "wrong-session" or "policy-drift" or "account-drift")
+                await Assert.ThrowsAsync<InvalidDataException>(Read);
+            else
+            {
+                var evidence = await Read();
+                Assert.NotNull(evidence);
+                Assert.Equal((bool?)(condition == "disabled-account"), evidence.ProfileStatus.Account.Disabled);
+                Assert.Equal(condition switch
+                {
+                    "profiles-off" => UserManager7ProfileObservation.ProfilesNotUsed,
+                    "unknown-policy" or "unknown-service" => UserManager7ProfileObservation.PolicyUnknown,
+                    "service-off" => UserManager7ProfileObservation.ServiceDisabled,
+                    "empty" => UserManager7ProfileObservation.NoVisibleAssignments,
+                    _ => UserManager7ProfileObservation.ActiveReported
+                }, evidence.ProfileStatus.Observation);
+                if (condition is "service-off" or "unknown-service")
+                    Assert.Null(evidence.VisibleActiveSessions);
+                else if (condition == "empty")
+                    Assert.Empty(evidence.VisibleActiveSessions!);
+                else
+                {
+                    var row = Assert.Single(evidence.VisibleActiveSessions!);
+                    Assert.Equal("001", row.Username);
+                    Assert.Equal(0UL, row.Usage.DownloadUsed.Bytes);
+                    Assert.Null(row.Usage.ObservedTransferBytes);
+                }
+            }
+        }
+        finally { await serve; }
+        Assert.False(server.HasPendingConnection);
+    }
+
     [Fact]
     public async Task UserManager6LookupNeverSendsLegacyMenuToV7()
     {

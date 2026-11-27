@@ -239,23 +239,59 @@ internal sealed class RouterOsSession : IDisposable
             await RequireUserManager7FamilyAsync(stream, token).ConfigureAwait(false);
             var account = await FindUm7AccountCoreAsync(stream, username, token).ConfigureAwait(false);
             if (account is null) return null;
-            var ids = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            var sessions = await ReadCommandAsync(stream,
-                ["/user-manager/session/print"u8.ToArray(),
-                    "=.proplist=.id,user,active,download,upload,uptime,started,ended,last-accounting-packet,status"u8.ToArray(),
-                    UserManager6Records.Query("user", username), "?active=yes"u8.ToArray()],
-                words =>
-                {
-                    var row = UserManager7Records.ParseActiveSession(words, username);
-                    if (!ids.Add(row.RemoteId))
-                        throw new InvalidDataException("Duplicate User Manager v7 active session identity.");
-                    return row;
-                }, 128, token).ConfigureAwait(false);
+            var sessions = await ReadUm7ActiveSessionsCoreAsync(stream, username, token).ConfigureAwait(false);
             if (await FindUm7AccountCoreAsync(stream, username, token).ConfigureAwait(false) != account)
                 throw new InvalidDataException("User Manager v7 account changed during session read.");
             token.ThrowIfCancellationRequested();
             return new(account, sessions);
         }, timeout, cancellationToken);
+    }
+
+    // Read both observations under one deadline and one authenticated session.
+    // Do not mix independently fetched profile and accounting results.
+    internal Task<UserManager7CombinedObservation?> ReadUserManager7CombinedObservationAsync(string username,
+        TimeSpan? timeout = null, CancellationToken cancellationToken = default)
+    {
+        UserManager6Records.ValidateKey(username, nameof(username));
+        return WithReadSessionAsync<UserManager7CombinedObservation?>(async (stream, token) =>
+        {
+            await RequireUserManager7FamilyAsync(stream, token).ConfigureAwait(false);
+            var account = await FindUm7AccountCoreAsync(stream, username, token).ConfigureAwait(false);
+            if (account is null) return null;
+            var settings = await ReadUm7ServiceSettingsCoreAsync(stream, token).ConfigureAwait(false);
+            IReadOnlyList<UserManager7Assignment>? assignments = null;
+            IReadOnlyList<UserManager7ActiveSession>? sessions = null;
+            if (settings.Enabled == true)
+            {
+                if (settings.UseProfiles == true)
+                    assignments = await ReadUm7AssignmentsCoreAsync(stream, username, token).ConfigureAwait(false);
+                sessions = await ReadUm7ActiveSessionsCoreAsync(stream, username, token).ConfigureAwait(false);
+            }
+            if (await ReadUm7ServiceSettingsCoreAsync(stream, token).ConfigureAwait(false) != settings ||
+                await FindUm7AccountCoreAsync(stream, username, token).ConfigureAwait(false) != account)
+                throw new InvalidDataException("User Manager v7 policy or account changed during combined read.");
+            token.ThrowIfCancellationRequested();
+            return new(new(account, settings, assignments), sessions);
+        }, timeout, cancellationToken);
+    }
+
+    private static async Task<IReadOnlyList<UserManager7ActiveSession>> ReadUm7ActiveSessionsCoreAsync(
+        Stream stream, string username, CancellationToken token)
+    {
+        var ids = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var sessions = await ReadCommandAsync(stream,
+            ["/user-manager/session/print"u8.ToArray(),
+                "=.proplist=.id,user,active,download,upload,uptime,started,ended,last-accounting-packet,status"u8.ToArray(),
+                UserManager6Records.Query("user", username), "?active=yes"u8.ToArray()],
+            words =>
+            {
+                var row = UserManager7Records.ParseActiveSession(words, username);
+                if (!ids.Add(row.RemoteId))
+                    throw new InvalidDataException("Duplicate User Manager v7 active session identity.");
+                return row;
+            }, 128, token).ConfigureAwait(false);
+        token.ThrowIfCancellationRequested();
+        return sessions;
     }
 
     internal Task<UserManager7ProfileMappingEvidence?> ReadUserManager7ProfileMappingAsync(string name,
