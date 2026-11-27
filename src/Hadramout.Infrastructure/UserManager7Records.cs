@@ -79,8 +79,43 @@ internal sealed record UserManager7ProfileStatusEvidence(UserManager7Account Acc
     }
 }
 
+// Qualification only: monitor responses must identify the sampled user explicitly.
+// Never use a positional row or infer ownership from a single requested selector.
+internal sealed record UserManager7TotalUsageSample(string RemoteId, string Username,
+    UserManager6Usage Usage, string? ActiveSessionsRaw, string? ActualProfileRaw);
+
 internal static class UserManager7Records
 {
+    // Consumes an already captured one-shot monitor reply; no network command is
+    // exposed until the lab verifies exact selector and identity-bearing response.
+    internal static async Task<UserManager7TotalUsageSample?> ReadQualifiedTotalUsageReplyAsync(
+        Stream stream, UserManager7Account account, CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(stream);
+        ArgumentNullException.ThrowIfNull(account);
+        UserManager6Records.ValidateKey(account.Username, nameof(account));
+        if (!UserManager6Records.IsOpaqueRemoteId(account.RemoteId))
+            throw new ArgumentException("Exact account identity required.", nameof(account));
+        var reply = await RouterOsReplyReader.ReadAsync(stream, words =>
+        {
+            string id = RemoteId(words);
+            if (id != account.RemoteId)
+                throw new InvalidDataException("User Manager v7 total usage identity does not match.");
+            string name = ExactKey(words, "name", account.Username);
+            var usage = new UserManager6Usage(
+                UserManager6ByteValue.FromRaw(UserManager6Records.ReadText(words, "total-download", 64)),
+                UserManager6ByteValue.FromRaw(UserManager6Records.ReadText(words, "total-upload", 64)),
+                UserManager6Records.ReadText(words, "total-uptime", 128));
+            return new UserManager7TotalUsageSample(id, name, usage,
+                UserManager6Records.ReadText(words, "active-sessions", 64),
+                UserManager6Records.ReadText(words, "actual-profile", 512));
+        }, 1, cancellationToken).ConfigureAwait(false);
+        if (reply.Outcome != RouterOsReplyOutcome.Completed)
+            throw new InvalidDataException("User Manager v7 total usage read did not complete.");
+        cancellationToken.ThrowIfCancellationRequested();
+        return reply.Rows.Count == 0 ? null : reply.Rows[0];
+    }
+
     private static bool? ReadFlag(byte[][] words, string field) =>
         UserManager6Records.ReadText(words, field, 8) switch
         {
