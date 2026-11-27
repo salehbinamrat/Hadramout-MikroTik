@@ -70,6 +70,9 @@ internal enum UserManager6PreflightState { ProfileNotVisible, UsernameAlreadyVis
 internal sealed record UserManager6PreflightEvidence(UserManager6PreflightState State,
     UserManager6Profile? Profile, string? ExistingCustomer);
 
+// Observation only: not a persisted confirmation, entitlement or permission to print.
+internal sealed record UserManager6DisabledCreationObservation(string RemoteId, bool ReturnedIdMatched);
+
 internal static class UserManager6Records
 {
     private static readonly UTF8Encoding Utf8 = new(false, true);
@@ -119,6 +122,25 @@ internal static class UserManager6Records
         try { ValidateKey(customer, nameof(customer)); }
         catch (ArgumentException) { throw new InvalidDataException("Invalid User Manager customer identity."); }
         return customer;
+    }
+
+    internal static bool IsOpaqueRemoteId(string? value) =>
+        value is { Length: >= 2 and <= 33 } && value[0] == '*' &&
+        value.Skip(1).All(char.IsAsciiHexDigit);
+
+    internal static UserManager6DisabledCreationObservation ParseDisabledCreationObservation(
+        byte[][] words, Guid reservationId, string customer, string username, string? returnedId)
+    {
+        RequiredMatch(words, "customer", customer);
+        RequiredMatch(words, "username", username);
+        RequiredMatch(words, "comment", "hmk-create:" + reservationId.ToString("N"));
+        if (ReadText(words, "disabled", 8) is not ("yes" or "true"))
+            throw new InvalidDataException("User Manager readback did not prove disabled state.");
+        string? id = ReadText(words, ".id", 33);
+        if (!IsOpaqueRemoteId(id) ||
+            (returnedId is not null && !string.Equals(id, returnedId, StringComparison.Ordinal)))
+            throw new InvalidDataException("User Manager readback identity does not match.");
+        return new(id!, returnedId is not null);
     }
 
     internal static UserManager6Profile ParseProfile(byte[][] words, string owner, string name) =>
