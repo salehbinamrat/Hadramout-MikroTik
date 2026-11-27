@@ -30,6 +30,14 @@ internal sealed record UserManager6StoredRecoveryEvidence(UserManager6CreateStat
 internal sealed record UserManager6RecoveryObservation(UserManager6RecoveryScope Scope,
     UserManager6DisabledCreationObservation? VisibleDisabledAccount);
 
+internal sealed record UserManager6ProfileLinkScope(UserManager6RecoveryScope Creation,
+    string ProfileOwner, string ProfileName);
+
+internal enum UserManager6ProfileLinkReadState { AccountNotVisible, ProfileNotVisible, BothVisible }
+
+internal sealed record UserManager6ProfileLinkReadEvidence(UserManager6ProfileLinkReadState State,
+    UserManager6DisabledCreationObservation? Account, UserManager6Profile? Profile);
+
 internal sealed record UserManager6CreationReviewRow(UserManager6CreateEntry Entry, bool LocalIdentityMatches);
 internal sealed record UserManager6CreationReviewPage(IReadOnlyList<UserManager6CreationReviewRow> Rows,
     Guid? NextAfterReservationId);
@@ -308,6 +316,33 @@ internal sealed class UserManager6CreateJournal(string databasePath)
             scope = new(reservationId, r.GetGuid(0), r.GetString(1), r.GetString(2),
                 r.GetString(3), state, hasAck ? new(returned, observed) : null, recovery);
         }
+        return scope;
+    }
+
+    // Require historical positive disabled-account evidence, not merely an add receipt.
+    // Read the bound profile intent and account scope in one local snapshot.
+    internal UserManager6ProfileLinkScope ReadProfileLinkScope(Guid reservationId)
+    {
+        ValidateId(reservationId);
+        using var c = OpenReadOnly();
+        using var tx = c.BeginTransaction(deferred: true);
+        var creation = ReadBoundRecoveryScope(c, tx, reservationId);
+        if (creation.Recovery is null && creation.Evidence?.ObservedId is null)
+            throw new InvalidOperationException("Prior exact disabled-account evidence required.");
+        using var cmd = c.CreateCommand();
+        cmd.Transaction = tx;
+        cmd.CommandText = "SELECT ProfileOwner,ProfileName FROM um6_create_intents WHERE ReservationId=$id;";
+        cmd.Parameters.AddWithValue("$id", reservationId);
+        UserManager6ProfileLinkScope scope;
+        using (var r = cmd.ExecuteReader())
+        {
+            if (!r.Read()) throw new InvalidOperationException("Bound profile intent required.");
+            string owner = r.GetString(0), name = r.GetString(1);
+            UserManager6Records.ValidateKey(owner, nameof(owner));
+            UserManager6Records.ValidateKey(name, nameof(name));
+            scope = new(creation, owner, name);
+        }
+        tx.Commit();
         return scope;
     }
 

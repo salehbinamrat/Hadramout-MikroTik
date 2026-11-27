@@ -149,6 +149,25 @@ internal static class RouterOsReadRecovery
         return new UserManager6CreateJournal(databasePath).TryRecordRecoveryObservation(observation);
     }
 
+    // The entire read may retry only through the existing read-only recovery path.
+    // The caller must hold the managed generation and quiesce configuration changes.
+    [SupportedOSPlatform("windows")]
+    internal static async Task<UserManager6ProfileLinkReadEvidence> ReadBoundUm6ProfileLinkPreflightAsync(
+        string databasePath, Guid reservationId, TimeSpan? timeout = null,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var journal = new UserManager6CreateJournal(databasePath);
+        var scope = journal.ReadProfileLinkScope(reservationId);
+        var evidence = await ReadBoundAsync(databasePath, scope.Creation.RouterId, timeout,
+            (session, token) => session.ReadUm6ProfileLinkPreflightAsync(scope, timeout, token),
+            cancellationToken, requiredPin: scope.Creation.LeafSha256).ConfigureAwait(false);
+        cancellationToken.ThrowIfCancellationRequested();
+        if (journal.ReadProfileLinkScope(reservationId) != scope)
+            throw new InvalidOperationException("Local profile intent or creation evidence changed during review.");
+        return evidence;
+    }
+
     [SupportedOSPlatform("windows")]
     private static async Task<T> ReadBoundAsync<T>(string databasePath, Guid routerId, TimeSpan? timeout,
         Func<RouterOsSession, CancellationToken, Task<T>> operation, CancellationToken cancellationToken,
