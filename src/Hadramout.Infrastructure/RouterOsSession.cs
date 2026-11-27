@@ -252,6 +252,36 @@ internal sealed class RouterOsSession : IDisposable
         }, timeout, cancellationToken);
     }
 
+    // Qualification only. Call on an exclusively held, authenticated stream after
+    // an acknowledged creation exchange. Never reconnect, retry, mutate or mark a
+    // journal confirmed here; an absent row is only absence of visible evidence.
+    internal static async Task<UserManager6DisabledCreationObservation?> ReadUm6DisabledCreationObservationAsync(
+        Stream stream, Guid reservationId, string customer, string username,
+        UserManager6CreateWireReceipt receipt, CancellationToken token)
+    {
+        ArgumentNullException.ThrowIfNull(stream);
+        ArgumentNullException.ThrowIfNull(receipt);
+        if (reservationId == Guid.Empty)
+            throw new ArgumentException("Reservation identity required.", nameof(reservationId));
+        UserManager6Records.ValidateKey(customer, nameof(customer));
+        UserManager6Records.ValidateKey(username, nameof(username));
+        if (receipt.Outcome != UserManager6CreateWireOutcome.Acknowledged ||
+            (receipt.ReturnedId is not null && !UserManager6Records.IsOpaqueRemoteId(receipt.ReturnedId)))
+            throw new InvalidOperationException("A valid acknowledged creation receipt is required.");
+        token.ThrowIfCancellationRequested();
+        await RequireUserManager6FamilyAsync(stream, token).ConfigureAwait(false);
+        // Global visible username match, not a customer-filtered query that could
+        // conceal a conflicting account. More than one row fails closed.
+        var rows = await ReadCommandAsync(stream,
+            ["/tool/user-manager/user/print"u8.ToArray(),
+                "=.proplist=.id,customer,username,disabled,comment"u8.ToArray(),
+                UserManager6Records.Query("username", username)],
+            words => UserManager6Records.ParseDisabledCreationObservation(words,
+                reservationId, customer, username, receipt.ReturnedId), 1, token).ConfigureAwait(false);
+        token.ThrowIfCancellationRequested();
+        return rows.Count == 0 ? null : rows[0];
+    }
+
     private static Task<IReadOnlyList<UserManager6Profile>> ReadUniqueVisibleUm6ProfileAsync(
         Stream stream, string owner, string name, CancellationToken token) =>
         ReadCommandAsync(stream,

@@ -828,6 +828,103 @@ public sealed class DatabaseDurabilityTests
         Assert.Equal(UserManager6CreateState.Prepared, new UserManager6CreateJournal(file.Path).Read(id)!.State);
     }
 
+    [Theory]
+    [InlineData("match")]
+    [InlineData("no-returned-id")]
+    [InlineData("absent")]
+    [InlineData("wrong-id")]
+    [InlineData("bad-id")]
+    [InlineData("wrong-customer")]
+    [InlineData("wrong-username")]
+    [InlineData("wrong-marker")]
+    [InlineData("enabled")]
+    [InlineData("missing-disabled")]
+    [InlineData("duplicate")]
+    [InlineData("trap")]
+    [InlineData("wrong-version")]
+    public async Task QualifiedDisabledCreationReadbackRequiresExactCompletedEvidence(string condition)
+    {
+        Guid id = Guid.NewGuid();
+        string marker = "hmk-create:" + id.ToString("N");
+        using var replies = new MemoryStream();
+        await WriteReplyAsync(replies, "!re", condition == "wrong-version" ? "=version=7.20.1" : "=version=6.49.19");
+        await WriteReplyAsync(replies, "!done");
+        var row = new List<string> { "!re",
+            condition == "wrong-id" ? "=.id=*2" : condition == "bad-id" ? "=.id=*Z" : "=.id=*1",
+            condition == "wrong-customer" ? "=customer=other" : "=customer=admin",
+            condition == "wrong-username" ? "=username=002" : "=username=001",
+            "=comment=" + (condition == "wrong-marker" ? "different" : marker) };
+        if (condition != "missing-disabled")
+            row.Add(condition == "enabled" ? "=disabled=no" : "=disabled=yes");
+        if (condition == "trap")
+            await WriteReplyAsync(replies, "!trap", "=message=synthetic");
+        else if (condition != "wrong-version")
+        {
+            if (condition != "absent") await WriteReplyAsync(replies, row.ToArray());
+            if (condition == "duplicate") await WriteReplyAsync(replies, row.ToArray());
+            await WriteReplyAsync(replies, "!done");
+        }
+        using var stream = new QualificationExchange(replies.ToArray(), _ => { });
+        var receipt = new UserManager6CreateWireReceipt(UserManager6CreateWireOutcome.Acknowledged,
+            condition == "no-returned-id" ? null : "*1");
+        if (condition is "match" or "no-returned-id" or "absent")
+        {
+            var result = await RouterOsSession.ReadUm6DisabledCreationObservationAsync(
+                stream, id, "admin", "001", receipt, CancellationToken.None);
+            if (condition == "absent") Assert.Null(result);
+            else
+            {
+                Assert.NotNull(result);
+                Assert.Equal("*1", result.RemoteId);
+                Assert.Equal(condition == "match", result.ReturnedIdMatched);
+            }
+        }
+        else if (condition == "wrong-version")
+            await Assert.ThrowsAsync<NotSupportedException>(() => RouterOsSession.ReadUm6DisabledCreationObservationAsync(
+                stream, id, "admin", "001", receipt, CancellationToken.None));
+        else
+            await Assert.ThrowsAsync<InvalidDataException>(() => RouterOsSession.ReadUm6DisabledCreationObservationAsync(
+                stream, id, "admin", "001", receipt, CancellationToken.None));
+        using var sent = new MemoryStream(stream.ToArray());
+        var version = await RouterOsWireCodec.ReadSentenceAsync(sent, CancellationToken.None);
+        Assert.Equal("/system/resource/print", Encoding.UTF8.GetString(version[0]));
+        if (condition != "wrong-version")
+        {
+            var query = await RouterOsWireCodec.ReadSentenceAsync(sent, CancellationToken.None);
+            Assert.Equal(new[] { "/tool/user-manager/user/print",
+                "=.proplist=.id,customer,username,disabled,comment", "?username=001" },
+                query.Select(word => Encoding.UTF8.GetString(word)).ToArray());
+        }
+        Assert.Equal(sent.Length, sent.Position);
+    }
+
+    [Theory]
+    [InlineData(false, null)]
+    [InlineData(true, "*Z")]
+    public async Task QualifiedDisabledCreationReadbackRejectsInvalidReceiptBeforeAnyCommand(bool acknowledged, string? remoteId)
+    {
+        using var stream = new QualificationExchange([], _ => { });
+        var receipt = new UserManager6CreateWireReceipt(acknowledged
+            ? UserManager6CreateWireOutcome.Acknowledged : UserManager6CreateWireOutcome.Indeterminate, remoteId);
+        await Assert.ThrowsAsync<InvalidOperationException>(() => RouterOsSession.ReadUm6DisabledCreationObservationAsync(
+            stream, Guid.NewGuid(), "admin", "001", receipt, CancellationToken.None));
+        Assert.Equal(0L, stream.Length);
+    }
+
+    [Fact]
+    public async Task QualifiedDisabledCreationReadbackDoesNotAcceptIncompleteReply()
+    {
+        Guid id = Guid.NewGuid();
+        using var replies = new MemoryStream();
+        await WriteReplyAsync(replies, "!re", "=version=6.49.19");
+        await WriteReplyAsync(replies, "!done");
+        await WriteReplyAsync(replies, "!re", "=.id=*1", "=customer=admin", "=username=001",
+            "=disabled=yes", "=comment=hmk-create:" + id.ToString("N"));
+        using var stream = new QualificationExchange(replies.ToArray(), _ => { });
+        await Assert.ThrowsAsync<EndOfStreamException>(() => RouterOsSession.ReadUm6DisabledCreationObservationAsync(
+            stream, id, "admin", "001", new(UserManager6CreateWireOutcome.Acknowledged, "*1"), CancellationToken.None));
+    }
+
     private static ValueTask WriteReplyAsync(Stream stream, params string[] words) =>
         RouterOsWireCodec.WriteSentenceAsync(stream,
             words.Select(word => (ReadOnlyMemory<byte>)Encoding.UTF8.GetBytes(word)).ToArray(), CancellationToken.None);
