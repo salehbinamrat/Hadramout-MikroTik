@@ -79,6 +79,12 @@ internal sealed record UserManager7ProfileStatusEvidence(UserManager7Account Acc
     }
 }
 
+// Same logical read, not an atomic router snapshot. A null session list means
+// accounting was not read; an empty list means no visible active sessions.
+// Neither is proof of connectivity, entitlement, or historical usage.
+internal sealed record UserManager7CombinedObservation(UserManager7ProfileStatusEvidence ProfileStatus,
+    IReadOnlyList<UserManager7ActiveSession>? VisibleActiveSessions);
+
 // Qualification only: monitor responses must identify the sampled user explicitly.
 // Never use a positional row or infer ownership from a single requested selector.
 internal sealed record UserManager7TotalUsageSample(string RemoteId, string Username,

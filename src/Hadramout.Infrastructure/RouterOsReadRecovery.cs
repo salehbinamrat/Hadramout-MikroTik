@@ -144,6 +144,16 @@ internal static class RouterOsReadRecovery
     }
 
     [SupportedOSPlatform("windows")]
+    internal static Task<UserManager7CombinedObservation?> ReadBoundUserManager7CombinedObservationAsync(
+        string databasePath, Guid routerId, string username, TimeSpan? timeout = null,
+        CancellationToken cancellationToken = default)
+    {
+        UserManager6Records.ValidateKey(username, nameof(username));
+        return ReadBoundAsync(databasePath, routerId, timeout,
+            (session, token) => session.ReadUserManager7CombinedObservationAsync(username, timeout, token), cancellationToken);
+    }
+
+    [SupportedOSPlatform("windows")]
     internal static Task<UserManager7ActiveSessionEvidence?> ReadBoundUserManager7ActiveSessionsAsync(
         string databasePath, Guid routerId, string username, TimeSpan? timeout = null,
         CancellationToken cancellationToken = default)
