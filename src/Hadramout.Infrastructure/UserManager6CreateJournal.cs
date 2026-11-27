@@ -52,6 +52,15 @@ internal sealed record UserManager6ProfileLinkReviewEvidence(UserManager6Profile
     UserManager6ProfileLinkReviewState State, UserManager6DisabledCreationObservation? Account,
     string? ActualProfile, UserManager6Profile? Profile);
 
+internal sealed record UserManager6ProfileLinkReviewRow(UserManager6ProfileLinkEntry Entry,
+    Guid RouterId, string Customer, string Username, bool LocalScopeMatches);
+internal sealed record UserManager6ProfileLinkReviewPage(IReadOnlyList<UserManager6ProfileLinkReviewRow> Rows,
+    Guid? NextAfterReservationId);
+internal sealed record UserManager6ProfileLinkCounts(long DispatchStarted, long Indeterminate, long Acknowledged)
+{
+    internal long RequiresReview => checked(DispatchStarted + Indeterminate + Acknowledged);
+}
+
 internal sealed record UserManager6CreationReviewRow(UserManager6CreateEntry Entry, bool LocalIdentityMatches);
 internal sealed record UserManager6CreationReviewPage(IReadOnlyList<UserManager6CreationReviewRow> Rows,
     Guid? NextAfterReservationId);
@@ -433,14 +442,89 @@ internal sealed class UserManager6CreateJournal(string databasePath)
         ValidateId(reservationId);
         using var c = OpenReadOnly();
         using var tx = c.BeginTransaction(deferred: true);
+        var scope = ReadProfileLinkReviewScope(c, tx, reservationId);
+        tx.Commit();
+        return scope;
+    }
+
+    private static UserManager6ProfileLinkReviewScope ReadProfileLinkReviewScope(SqliteConnection c,
+        SqliteTransaction tx, Guid reservationId)
+    {
         var intent = ReadProfileLinkScope(c, tx, reservationId);
         var entry = ReadProfileLinkEntry(c, tx, reservationId)
             ?? throw new InvalidOperationException("Existing profile link claim required.");
         if (intent.Creation.State is not (UserManager6CreateState.Indeterminate or UserManager6CreateState.Acknowledged) ||
             entry.RemoteId != intent.Creation.ExpectedRemoteId)
             throw new InvalidOperationException("Profile link identity no longer matches.");
-        tx.Commit();
         return new(intent, entry);
+    }
+
+    // Bounded local workload only; include drifted claims instead of hiding them.
+    // One consistent snapshot and at most pageSize scope checks, no network or secret load.
+    internal UserManager6ProfileLinkReviewPage ReadProfileLinkReviewPage(Guid routerId,
+        Guid? afterReservationId = null, int pageSize = 100)
+    {
+        ValidateId(routerId);
+        if (afterReservationId.HasValue) ValidateId(afterReservationId.Value);
+        if (pageSize is < 1 or > 500) throw new ArgumentOutOfRangeException(nameof(pageSize));
+        using var c = OpenReadOnly();
+        using var tx = c.BeginTransaction(deferred: true);
+        using var cmd = c.CreateCommand();
+        cmd.Transaction = tx;
+        cmd.CommandText = """
+            SELECT l.ReservationId,l.RemoteId,l.State,j.RouterId,j.Customer,j.Username
+            FROM um6_profile_link_journal l
+            JOIN um6_create_journal j ON j.ReservationId=l.ReservationId
+            WHERE j.RouterId=$router AND ($after IS NULL OR l.ReservationId COLLATE BINARY > $after)
+            ORDER BY l.ReservationId COLLATE BINARY LIMIT $limit;
+            """;
+        cmd.Parameters.AddWithValue("$router", routerId);
+        cmd.Parameters.AddWithValue("$after", (object?)afterReservationId ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$limit", pageSize + 1);
+        var rows = new List<UserManager6ProfileLinkReviewRow>(pageSize);
+        bool hasMore = false;
+        using (var r = cmd.ExecuteReader())
+        {
+            while (r.Read())
+            {
+                if (rows.Count == pageSize) { hasMore = true; break; }
+                var entry = new UserManager6ProfileLinkEntry(r.GetGuid(0), r.GetString(1),
+                    (UserManager6ProfileLinkState)r.GetInt32(2));
+                rows.Add(new(entry, r.GetGuid(3), r.GetString(4), r.GetString(5), false));
+            }
+        }
+        for (int i = 0; i < rows.Count; i++)
+        {
+            try
+            {
+                var scope = ReadProfileLinkReviewScope(c, tx, rows[i].Entry.ReservationId);
+                rows[i] = rows[i] with { LocalScopeMatches = scope.Entry == rows[i].Entry };
+            }
+            catch (InvalidOperationException) { /* retain inconsistent row for manual review */ }
+            catch (InvalidDataException) { /* retain inconsistent row for manual review */ }
+            catch (ArgumentException) { /* retain invalid local identity for manual review */ }
+        }
+        tx.Commit();
+        return new(rows.AsReadOnly(), hasMore ? rows[^1].Entry.ReservationId : null);
+    }
+
+    internal UserManager6ProfileLinkCounts ReadProfileLinkCounts(Guid routerId)
+    {
+        ValidateId(routerId);
+        using var c = OpenReadOnly();
+        using var cmd = c.CreateCommand();
+        cmd.CommandText = """
+            SELECT count(CASE WHEN l.State=2 THEN 1 END),
+                   count(CASE WHEN l.State=3 THEN 1 END),
+                   count(CASE WHEN l.State=4 THEN 1 END)
+            FROM um6_profile_link_journal l
+            JOIN um6_create_journal j ON j.ReservationId=l.ReservationId
+            WHERE j.RouterId=$router;
+            """;
+        cmd.Parameters.AddWithValue("$router", routerId);
+        using var r = cmd.ExecuteReader();
+        if (!r.Read()) throw new InvalidDataException("Missing profile link counts.");
+        return new(r.GetInt64(0), r.GetInt64(1), r.GetInt64(2));
     }
 
     // Acknowledgement is not confirmed assignment. Neither terminal state can be replayed.

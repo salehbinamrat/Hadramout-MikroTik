@@ -1261,6 +1261,114 @@ public sealed class DatabaseDurabilityTests
         Assert.Equal(UserManager6CreateState.Indeterminate, journal.Read(id)!.State);
     }
 
+    [Fact]
+    [SupportedOSPlatform("windows")]
+    public void ProfileLinkReviewQueueScopesPaginatesAndRetainsDriftedClaims()
+    {
+        using var file = new TestFile();
+        Guid first = SeedSecretIntent(file.Path);
+        var journal = new UserManager6CreateJournal(file.Path);
+        Guid router = journal.Read(first)!.RouterId;
+        Guid otherRouter;
+        Guid[] ids = new Guid[3];
+        Guid otherId;
+        using (var c = DatabaseStore.OpenExisting(file.Path))
+        using (var db = Context(c))
+        {
+            var original = db.Reservations.Single();
+            for (int i = 0; i < ids.Length; i++)
+            {
+                var extra = new VoucherReservation
+                {
+                    BackendId = original.BackendId, BatchId = original.BatchId, Username = "link-" + i
+                };
+                ids[i] = extra.Id;
+                db.Reservations.Add(extra);
+            }
+            var remote = new Router { SiteId = db.Sites.Single().Id, Name = "other-link-router" };
+            var backend = new Backend { RouterId = remote.Id, Kind = BackendKind.UserManager6 };
+            var plan = new Plan { BackendId = backend.Id, Name = "day" };
+            var batch = new VoucherBatch { BackendId = backend.Id, PlanId = plan.Id };
+            var other = new VoucherReservation { BackendId = backend.Id, BatchId = batch.Id, Username = "001" };
+            db.AddRange(remote, backend, plan, batch, other);
+            db.SaveChanges();
+            otherRouter = remote.Id;
+            otherId = other.Id;
+        }
+        using (var ca = CreateEnrollmentCa())
+            new RouterTargetStore(file.Path).Enroll(otherRouter, "other-router.test", 8729, "other-router.test",
+                new string('B',64), ca.RawData);
+        foreach (Guid id in ids.Append(otherId))
+        {
+            journal.Prepare(id, "admin");
+            journal.PrepareBoundIntent(id, "admin", "day");
+        }
+
+        void Claim(Guid id, UserManager6ProfileLinkState state)
+        {
+            new UserManager6VoucherSecretStore(file.Path).Save(id, "synthetic"u8);
+            Assert.True(journal.TryBeginBoundDispatch(id));
+            Assert.True(journal.TryMarkIndeterminate(id));
+            Assert.True(journal.TryRecordRecoveryObservation(new(journal.ReadBoundRecoveryScope(id), new("*1", false))));
+            var scope = journal.ReadProfileLinkScope(id);
+            Assert.True(journal.TryClaimProfileLink(scope, MatchingProfileEvidence(scope)));
+            if (state != UserManager6ProfileLinkState.DispatchStarted)
+                Assert.True(journal.TryRecordProfileLinkResult(id, state));
+        }
+        Claim(first, UserManager6ProfileLinkState.DispatchStarted);
+        Claim(ids[0], UserManager6ProfileLinkState.Indeterminate);
+        Claim(ids[1], UserManager6ProfileLinkState.Acknowledged);
+        Claim(otherId, UserManager6ProfileLinkState.Indeterminate);
+
+        var counts = journal.ReadProfileLinkCounts(router);
+        Assert.Equal(new UserManager6ProfileLinkCounts(1, 1, 1), counts);
+        Assert.Equal(3L, counts.RequiresReview);
+        Assert.Equal(new UserManager6ProfileLinkCounts(0, 1, 0), journal.ReadProfileLinkCounts(otherRouter));
+        Assert.Equal(otherId, Assert.Single(journal.ReadProfileLinkReviewPage(otherRouter).Rows).Entry.ReservationId);
+        using (var c = DatabaseStore.OpenExisting(file.Path))
+            Execute(c, "UPDATE voucher_reservations SET Username='changed' WHERE Username='link-0';");
+        var page = journal.ReadProfileLinkReviewPage(router, pageSize: 2);
+        Assert.Equal(2, page.Rows.Count);
+        Assert.NotNull(page.NextAfterReservationId);
+        var next = journal.ReadProfileLinkReviewPage(router, page.NextAfterReservationId, 2);
+        Assert.Null(next.NextAfterReservationId);
+        Assert.Single(next.Rows);
+        var rows = page.Rows.Concat(next.Rows).ToArray();
+        Assert.Equal(3, rows.Select(row => row.Entry.ReservationId).Distinct().Count());
+        Assert.All(rows, row =>
+        {
+            Assert.Equal(router, row.RouterId);
+            Assert.Equal(row.Entry.ReservationId != ids[0], row.LocalScopeMatches);
+            Assert.Equal(row.Entry, journal.ReadProfileLinkEntry(row.Entry.ReservationId));
+        });
+        Assert.DoesNotContain(rows, row => row.Entry.ReservationId == ids[2] || row.Entry.ReservationId == otherId);
+        Assert.Equal(counts, journal.ReadProfileLinkCounts(router));
+        Assert.Empty(journal.ReadProfileLinkReviewPage(Guid.NewGuid()).Rows);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(501)]
+    public void ProfileLinkReviewQueueRejectsUnboundedPages(int pageSize)
+    {
+        using var file = new TestFile();
+        var journal = new UserManager6CreateJournal(file.Path);
+        Assert.Throws<ArgumentOutOfRangeException>(() => journal.ReadProfileLinkReviewPage(Guid.NewGuid(), pageSize: pageSize));
+    }
+
+    [Fact]
+    public void ProfileLinkReviewQueueDoesNotCreateOrMigrateDatabase()
+    {
+        using var file = new TestFile();
+        var journal = new UserManager6CreateJournal(file.Path);
+        Assert.Throws<SqliteException>(() => journal.ReadProfileLinkCounts(Guid.NewGuid()));
+        Assert.False(File.Exists(file.Path));
+        using (var c = DatabaseStore.Open(file.Path)) RecreateLegacyFixture(c, 10);
+        Assert.Throws<InvalidDataException>(() => journal.ReadProfileLinkReviewPage(Guid.NewGuid()));
+        using var raw = file.OpenRaw();
+        Assert.Equal(10L, Scalar(raw, "PRAGMA user_version;"));
+    }
+
     private static Guid SeedSecretIntent(string path)
     {
         Guid id = SeedReservation(path, BackendKind.UserManager6);
