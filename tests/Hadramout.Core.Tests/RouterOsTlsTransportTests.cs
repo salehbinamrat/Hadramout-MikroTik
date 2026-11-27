@@ -1215,6 +1215,121 @@ public sealed class RouterOsTlsTransportTests(ITestOutputHelper output)
         Assert.False(server.HasPendingConnection);
     }
 
+    [Theory]
+    [InlineData("multiple")]
+    [InlineData("empty")]
+    [InlineData("account-absent")]
+    [InlineData("disabled")]
+    [InlineData("unknown")]
+    [InlineData("conflicting-active")]
+    [InlineData("wrong-user")]
+    [InlineData("missing-profile")]
+    [InlineData("invalid-id")]
+    [InlineData("duplicate-id")]
+    [InlineData("trap")]
+    [InlineData("account-drift")]
+    [InlineData("account-disappears")]
+    [InlineData("limit")]
+    [InlineData("v6")]
+    public async Task UserManager7AssignmentsPreserveSeparateStatesAndRejectUnsafeReads(string condition)
+    {
+        using var certificates = new Certificates();
+        using var server = new LoopbackServer(certificates.Leaf, certificates.Root, output);
+        Task serve = server.RunAsync(reply: true, handler: async (tls, token) =>
+        {
+            await PrepareProbePeerAsync(tls, token, condition == "v6" ? "6.49.19" : "7.21.1");
+            if (condition == "v6")
+            {
+                Assert.Equal(0, await tls.ReadAsync(new byte[1], token));
+                return;
+            }
+            async Task Account(bool second)
+            {
+                byte[][] request = await RouterOsWireCodec.ReadSentenceAsync(tls, token);
+                Assert.Equal(new[] { "/user-manager/user/print",
+                    "=.proplist=.id,name,disabled,group,shared-users", "?name=001" },
+                    request.Select(word => Encoding.UTF8.GetString(word)).ToArray());
+                if (condition != "account-absent" && !(second && condition == "account-disappears"))
+                    await RouterOsWireCodec.WriteSentenceAsync(tls, ["!re"u8.ToArray(),
+                        second && condition == "account-drift" ? "=.id=*2"u8.ToArray() : "=.id=*1"u8.ToArray(),
+                        "=name=001"u8.ToArray(), condition == "disabled" ? "=disabled=yes"u8.ToArray() : "=disabled=no"u8.ToArray()], token);
+                await RouterOsWireCodec.WriteSentenceAsync(tls, ["!done"u8.ToArray()], token);
+            }
+            await Account(false);
+            if (condition == "account-absent")
+            {
+                Assert.Equal(0, await tls.ReadAsync(new byte[1], token));
+                return;
+            }
+            byte[][] request = await RouterOsWireCodec.ReadSentenceAsync(tls, token);
+            Assert.Equal(new[] { "/user-manager/user-profile/print",
+                "=.proplist=.id,user,profile,state,end-time", "?user=001" },
+                request.Select(word => Encoding.UTF8.GetString(word)).ToArray());
+            if (condition == "trap")
+            {
+                await RouterOsWireCodec.WriteSentenceAsync(tls, ["!trap"u8.ToArray()], token);
+                return;
+            }
+            int count = condition switch
+            {
+                "empty" => 0, "multiple" => 3, "duplicate-id" or "conflicting-active" => 2,
+                "limit" => 129, _ => 1
+            };
+            for (int i = 0; i < count; i++)
+            {
+                var row = new List<ReadOnlyMemory<byte>>
+                {
+                    "!re"u8.ToArray(),
+                    Encoding.ASCII.GetBytes("=.id=" + (condition == "invalid-id" ? "1" :
+                        condition == "duplicate-id" ? (i == 0 ? "*A" : "*a") : "*" + (i+10).ToString("X", System.Globalization.CultureInfo.InvariantCulture))),
+                    condition == "wrong-user" ? "=user=002"u8.ToArray() : "=user=001"u8.ToArray()
+                };
+                if (condition != "missing-profile") row.Add("=profile=day"u8.ToArray());
+                if (condition != "unknown")
+                    row.Add(Encoding.ASCII.GetBytes("=state=" + (condition == "conflicting-active" || i == 0 ?
+                        "running active" : i == 1 ? "running" : "used")));
+                row.Add("=end-time=2026-12-01 10:00:00"u8.ToArray());
+                await RouterOsWireCodec.WriteSentenceAsync(tls, row.ToArray(), token);
+            }
+            if (condition is "wrong-user" or "missing-profile" or "invalid-id" or "duplicate-id" or "limit") return;
+            await RouterOsWireCodec.WriteSentenceAsync(tls, ["!done"u8.ToArray()], token);
+            await Account(true);
+            Assert.Equal(0, await tls.ReadAsync(new byte[1], token));
+        });
+        Task<UserManager7AssignmentEvidence?> Read() => RouterOsReadRecovery.ReadUserManager7AssignmentsAsync("001",
+            "127.0.0.1", "router.test", "synthetic-user"u8.ToArray(), "synthetic-private-password"u8.ToArray(),
+            server.Port, trustedRootDer: certificates.Root.RawData);
+        try
+        {
+            if (condition == "v6") await Assert.ThrowsAsync<NotSupportedException>(Read);
+            else if (condition == "account-absent") Assert.Null(await Read());
+            else if (condition is "multiple" or "empty" or "disabled" or "unknown" or "conflicting-active")
+            {
+                var evidence = await Read();
+                Assert.NotNull(evidence);
+                Assert.Equal("*1", evidence.Account.RemoteId);
+                Assert.Equal((bool?)(condition == "disabled"), evidence.Account.Disabled);
+                Assert.Equal(condition == "conflicting-active", evidence.ConflictingActiveReports);
+                Assert.Equal(condition switch { "multiple" => 3, "empty" => 0, "conflicting-active" => 2, _ => 1 },
+                    evidence.VisibleAssignments.Count);
+                if (condition == "multiple")
+                    Assert.Equal(new[] { UserManager7AssignmentState.ActiveReported, UserManager7AssignmentState.ReadyReported,
+                        UserManager7AssignmentState.UsedReported }, evidence.VisibleAssignments.Select(row => row.State).ToArray());
+                if (condition == "unknown")
+                    Assert.Equal(UserManager7AssignmentState.Unknown, Assert.Single(evidence.VisibleAssignments).State);
+                Assert.All(evidence.VisibleAssignments, row =>
+                {
+                    Assert.Equal("day", row.ProfileName);
+                    Assert.Equal("001", row.Username);
+                    Assert.Equal("2026-12-01 10:00:00", row.EndTimeRaw);
+                });
+            }
+            else await Assert.ThrowsAsync<InvalidDataException>(Read);
+        }
+        finally { await serve; }
+        Assert.False(server.HasPendingConnection);
+    }
+
     [Fact]
     public async Task UserManager6LookupNeverSendsLegacyMenuToV7()
     {
