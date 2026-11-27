@@ -134,6 +134,26 @@ internal static class RouterOsReadRecovery
     }
 
     [SupportedOSPlatform("windows")]
+    internal static Task<UserManager7ProfileMappingEvidence?> ReadBoundUserManager7ProfileMappingAsync(
+        string databasePath, Guid routerId, string name, TimeSpan? timeout = null,
+        CancellationToken cancellationToken = default)
+    {
+        UserManager6Records.ValidateKey(name, nameof(name));
+        return ReadBoundAsync(databasePath, routerId, timeout,
+            (session, token) => session.ReadUserManager7ProfileMappingAsync(name, timeout, token), cancellationToken);
+    }
+
+    [SupportedOSPlatform("windows")]
+    internal static Task<UserManager7Limitation?> FindBoundUserManager7LimitationAsync(
+        string databasePath, Guid routerId, string name, TimeSpan? timeout = null,
+        CancellationToken cancellationToken = default)
+    {
+        UserManager6Records.ValidateKey(name, nameof(name));
+        return ReadBoundAsync(databasePath, routerId, timeout,
+            (session, token) => session.FindUserManager7LimitationAsync(name, timeout, token), cancellationToken);
+    }
+
+    [SupportedOSPlatform("windows")]
     internal static Task<UserManager6Account?> FindBoundUserManager6AccountAsync(string databasePath,
         Guid routerId, string customer, string username, TimeSpan? timeout = null,
         CancellationToken cancellationToken = default)
