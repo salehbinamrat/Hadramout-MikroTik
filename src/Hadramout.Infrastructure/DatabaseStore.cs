@@ -6,7 +6,7 @@ namespace Hadramout.Infrastructure;
 /// <summary>Opens an owned local database with durable settings and atomic schema upgrades.</summary>
 public static class DatabaseStore
 {
-    public const int CurrentSchemaVersion = 12;
+    public const int CurrentSchemaVersion = 13;
     public const int ApplicationId = 0x484D4B54;
 
     public static SqliteConnection Open(string path) => OpenCore(path, SqliteOpenMode.ReadWriteCreate);
@@ -149,6 +149,13 @@ public static class DatabaseStore
             Execute(connection, tx, SchemaV12);
             Execute(connection, tx, "PRAGMA user_version=12;");
             version = 12;
+        }
+
+        if (version == 12)
+        {
+            Execute(connection, tx, SchemaV13);
+            Execute(connection, tx, "PRAGMA user_version=13;");
+            version = 13;
         }
 
         if (version != CurrentSchemaVersion)
@@ -481,5 +488,27 @@ public static class DatabaseStore
         CREATE TRIGGER um7_intent_exclude_um6 BEFORE INSERT ON um6_create_journal
         WHEN EXISTS (SELECT 1 FROM um7_create_intents i WHERE i.ReservationId=NEW.ReservationId)
         BEGIN SELECT RAISE(ABORT,'Reservation already bound to UM7'); END;
+        """;
+
+    private const string SchemaV13 = """
+        CREATE TABLE um7_voucher_secrets (
+            ReservationId TEXT NOT NULL PRIMARY KEY REFERENCES um7_create_intents(ReservationId) ON DELETE RESTRICT,
+            PasswordEnvelope BLOB NOT NULL CHECK(typeof(PasswordEnvelope)='blob' AND length(PasswordEnvelope) BETWEEN 1 AND 20513)
+        );
+        CREATE TRIGGER um7_secret_insert_guard BEFORE INSERT ON um7_voucher_secrets
+        WHEN NOT EXISTS (
+            SELECT 1 FROM um7_create_intents i
+            JOIN voucher_reservations v ON v.Id=i.ReservationId AND v.BackendId=i.BackendId AND v.BatchId=i.BatchId AND v.Username=i.Username
+            JOIN backends b ON b.Id=i.BackendId AND b.Kind=3 AND b.RouterId=i.RouterId
+            JOIN voucher_batches batch ON batch.Id=i.BatchId AND batch.BackendId=i.BackendId AND batch.PlanId=i.PlanId
+            JOIN plans p ON p.Id=i.PlanId AND p.BackendId=i.BackendId AND p.Name=i.PlanName
+            JOIN router_targets t ON t.RouterId=i.RouterId AND t.LeafSha256=i.LeafSha256
+            WHERE i.ReservationId=NEW.ReservationId
+                AND NOT EXISTS (SELECT 1 FROM um6_create_journal j WHERE j.ReservationId=i.ReservationId))
+        BEGIN SELECT RAISE(ABORT,'Valid UM7 creation intent required'); END;
+        CREATE TRIGGER um7_secret_no_update BEFORE UPDATE ON um7_voucher_secrets
+        BEGIN SELECT RAISE(ABORT,'UM7 voucher secret is immutable'); END;
+        CREATE TRIGGER um7_secret_no_delete BEFORE DELETE ON um7_voucher_secrets
+        BEGIN SELECT RAISE(ABORT,'UM7 voucher secret evidence is retained'); END;
         """;
 }

@@ -139,6 +139,7 @@ public static class ManagedDatabase
         UserManager6CreateJournal.RequireEquivalentRecoveryForRestore(currentPath, candidate);
         UserManager6CreateJournal.RequireEquivalentProfileLinksForRestore(currentPath, candidate);
         UserManager7CreateIntentStore.RequireEquivalentForRestore(currentPath, candidate);
+        UserManager7VoucherSecretStore.RequireEquivalentForRestore(currentPath, candidate);
         var statuses = RestoreCredentialInspector.Inspect(candidate);
         if (!allowUnavailableCredentials && statuses.Any(s => s.State == RestoreCredentialState.Unavailable))
             throw new InvalidOperationException("Restored credentials require explicit review before activation.");
