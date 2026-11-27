@@ -143,6 +143,16 @@ internal static class UserManager6Records
         return new(id!, returnedId is not null);
     }
 
+    // An empty actual-profile field is only a visible observation. It cannot prove
+    // the absence of hidden, queued or inactive assignments on legacy RouterOS.
+    internal static (UserManager6DisabledCreationObservation Account, string? ActualProfile) ParseProfileLinkAccount(
+        byte[][] words, Guid reservationId, string customer, string username, string expectedId)
+    {
+        if (!IsOpaqueRemoteId(expectedId)) throw new ArgumentException("Expected identity required.", nameof(expectedId));
+        var account = ParseDisabledCreationObservation(words, reservationId, customer, username, expectedId);
+        return (account, ReadText(words, "actual-profile", 512));
+    }
+
     internal static UserManager6Profile ParseProfile(byte[][] words, string owner, string name) =>
         new(RequiredMatch(words, "owner", owner), RequiredMatch(words, "name", name),
             ReadText(words, "validity", 128), ReadText(words, "starts-at", 128));
