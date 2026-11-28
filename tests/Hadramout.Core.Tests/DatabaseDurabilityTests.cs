@@ -1727,6 +1727,96 @@ public sealed class DatabaseDurabilityTests
         Assert.False(journal.TryMarkIndeterminate(id));
     }
 
+    [Theory]
+    [InlineData(null)]
+    [InlineData("*1A")]
+    [SupportedOSPlatform("windows")]
+    public void Um7AcknowledgementIsImmutableAndDoesNotRearmClaim(string? remoteId)
+    {
+        using var file = new TestFile();
+        using var before = new TestFile();
+        using var identical = new TestFile();
+        Guid id = SeedUm7SecretIntent(file.Path);
+        new UserManager7VoucherSecretStore(file.Path).Save(id, "synthetic"u8);
+        var journal = new UserManager7CreateClaimStore(file.Path);
+        using (var lease = journal.TryClaimForQualification(id)) Assert.NotNull(lease);
+        Assert.Null(journal.ReadAcknowledgement(id));
+        using (var c = DatabaseStore.OpenExisting(file.Path))
+        using (var copy = before.OpenRaw()) c.BackupDatabase(copy);
+        Assert.True(journal.TryRecordAcknowledgement(id, new(UserManager7CreateWireOutcome.Acknowledged, remoteId)));
+        Assert.False(journal.TryRecordAcknowledgement(id, new(UserManager7CreateWireOutcome.Acknowledged, "*2")));
+        Assert.Equal(new UserManager7StoredAcknowledgement(remoteId), new UserManager7CreateClaimStore(file.Path).ReadAcknowledgement(id));
+        Assert.Equal(UserManager7CreateClaimState.DispatchStarted, journal.Read(id));
+        Assert.False(journal.TryMarkIndeterminate(id));
+        Assert.Null(journal.TryClaimForQualification(id));
+        using (var c = DatabaseStore.OpenExisting(file.Path))
+        {
+            Assert.Throws<SqliteException>(() => Execute(c, "UPDATE um7_create_acknowledgements SET RemoteId='*2';"));
+            Assert.Throws<SqliteException>(() => Execute(c, "DELETE FROM um7_create_acknowledgements;"));
+            Assert.Throws<SqliteException>(() => Execute(c, "INSERT OR REPLACE INTO um7_create_acknowledgements SELECT ReservationId,'*2' FROM um7_create_acknowledgements;"));
+            Assert.Throws<SqliteException>(() => Execute(c, "UPDATE um7_create_claims SET State=3;"));
+            using var copy = identical.OpenRaw();
+            c.BackupDatabase(copy);
+        }
+        UserManager7CreateClaimStore.RequireEquivalentAcknowledgementsForRestore(file.Path, identical.Path);
+        Assert.Throws<InvalidOperationException>(() => UserManager7CreateClaimStore.RequireEquivalentAcknowledgementsForRestore(file.Path, before.Path));
+        Assert.Throws<InvalidOperationException>(() => UserManager7CreateClaimStore.RequireEquivalentAcknowledgementsForRestore(before.Path, file.Path));
+    }
+
+    [Theory]
+    [InlineData("no-claim")]
+    [InlineData("indeterminate")]
+    [InlineData("bad-receipt")]
+    [InlineData("bad-id")]
+    [InlineData("drift")]
+    [SupportedOSPlatform("windows")]
+    public void Um7AcknowledgementRejectsInvalidEvidence(string condition)
+    {
+        using var file = new TestFile();
+        Guid id = SeedUm7SecretIntent(file.Path);
+        new UserManager7VoucherSecretStore(file.Path).Save(id, "synthetic"u8);
+        var journal = new UserManager7CreateClaimStore(file.Path);
+        if (condition != "no-claim")
+        {
+            using var lease = journal.TryClaimForQualification(id);
+            Assert.NotNull(lease);
+        }
+        if (condition == "indeterminate") Assert.True(journal.TryMarkIndeterminate(id));
+        if (condition == "drift")
+        {
+            using var c = DatabaseStore.OpenExisting(file.Path);
+            Execute(c, "UPDATE voucher_reservations SET Username='changed';");
+        }
+        if (condition == "bad-receipt")
+            Assert.Throws<ArgumentException>(() => journal.TryRecordAcknowledgement(id, new(UserManager7CreateWireOutcome.Indeterminate, null)));
+        else if (condition == "bad-id")
+            Assert.Throws<ArgumentException>(() => journal.TryRecordAcknowledgement(id, new(UserManager7CreateWireOutcome.Acknowledged, "not-id")));
+        else if (condition == "drift")
+            Assert.Throws<SqliteException>(() => journal.TryRecordAcknowledgement(id, new(UserManager7CreateWireOutcome.Acknowledged, "*1")));
+        else
+            Assert.False(journal.TryRecordAcknowledgement(id, new(UserManager7CreateWireOutcome.Acknowledged, "*1")));
+        Assert.Null(journal.ReadAcknowledgement(id));
+    }
+
+    [Fact]
+    [SupportedOSPlatform("windows")]
+    public void Um7AcknowledgementAndIndeterminateRaceHasExactlyOneWinner()
+    {
+        using var file = new TestFile();
+        Guid id = SeedUm7SecretIntent(file.Path);
+        new UserManager7VoucherSecretStore(file.Path).Save(id, "synthetic"u8);
+        var journal = new UserManager7CreateClaimStore(file.Path);
+        using (var lease = journal.TryClaimForQualification(id)) Assert.NotNull(lease);
+        bool acknowledged = false, indeterminate = false;
+        Parallel.Invoke(
+            () => acknowledged = new UserManager7CreateClaimStore(file.Path).TryRecordAcknowledgement(id, new(UserManager7CreateWireOutcome.Acknowledged, "*1")),
+            () => indeterminate = new UserManager7CreateClaimStore(file.Path).TryMarkIndeterminate(id));
+        Assert.NotEqual(acknowledged, indeterminate);
+        Assert.Equal(acknowledged, journal.ReadAcknowledgement(id) is not null);
+        Assert.Equal(indeterminate ? UserManager7CreateClaimState.Indeterminate : UserManager7CreateClaimState.DispatchStarted, journal.Read(id));
+        Assert.Null(journal.TryClaimForQualification(id));
+    }
+
     private static Guid SeedUm7SecretIntent(string path)
     {
         Guid id = SeedReservation(path, BackendKind.UserManager7);
@@ -1777,13 +1867,14 @@ public sealed class DatabaseDurabilityTests
     // guard in sync with new migrations; never silently leave a newer table behind.
     internal static void RecreateLegacyFixture(SqliteConnection c, int version)
     {
-        if (version is < 1 or > 13) throw new ArgumentOutOfRangeException(nameof(version));
-        Assert.Equal(14, DatabaseStore.CurrentSchemaVersion);
-        Assert.Equal(14L, Scalar(c, "PRAGMA user_version;"));
+        if (version is < 1 or > 14) throw new ArgumentOutOfRangeException(nameof(version));
+        Assert.Equal(15, DatabaseStore.CurrentSchemaVersion);
+        Assert.Equal(15L, Scalar(c, "PRAGMA user_version;"));
         using var tx = c.BeginTransaction(deferred: false);
         using var cmd = c.CreateCommand();
         cmd.Transaction = tx;
-        cmd.CommandText = "DROP TABLE um7_create_claims;";
+        cmd.CommandText = "DROP TRIGGER um7_ack_exclude_indeterminate; DROP TABLE um7_create_acknowledgements;";
+        if (version < 14) cmd.CommandText += " DROP TABLE um7_create_claims;";
         if (version < 13) cmd.CommandText += " DROP TABLE um7_voucher_secrets;";
         if (version < 12) cmd.CommandText += " DROP TRIGGER um7_intent_exclude_um6; DROP TABLE um7_create_intents;";
         if (version < 11) cmd.CommandText += " DROP TABLE um6_profile_link_journal;";
@@ -1803,7 +1894,7 @@ public sealed class DatabaseDurabilityTests
 
         cmd.Transaction = null;
         cmd.CommandText = "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%';";
-        Assert.Equal(version == 13 ? 17L : version == 12 ? 16L : version == 11 ? 15L : version == 10 ? 14L : version == 9 ? 13L : version == 8 ? 12L : version == 7 ? 11L : version == 6 ? 10L : version == 5 ? 9L : version == 4 ? 8L : version == 3 ? 7L : 6L, (long)cmd.ExecuteScalar()!);
+        Assert.Equal(version == 14 ? 18L : version == 13 ? 17L : version == 12 ? 16L : version == 11 ? 15L : version == 10 ? 14L : version == 9 ? 13L : version == 8 ? 12L : version == 7 ? 11L : version == 6 ? 10L : version == 5 ? 9L : version == 4 ? 8L : version == 3 ? 7L : 6L, (long)cmd.ExecuteScalar()!);
         Assert.Equal((long)version, Scalar(c, "PRAGMA user_version;"));
     }
 
@@ -1821,6 +1912,7 @@ public sealed class DatabaseDurabilityTests
     [InlineData(11)]
     [InlineData(12)]
     [InlineData(13)]
+    [InlineData(14)]
     public void EveryLegacyFixtureHasOnlyItsOwnSchemaAndUpgrades(int version)
     {
         using var file = new TestFile();

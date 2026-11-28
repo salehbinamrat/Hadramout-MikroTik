@@ -6,7 +6,7 @@ namespace Hadramout.Infrastructure;
 /// <summary>Opens an owned local database with durable settings and atomic schema upgrades.</summary>
 public static class DatabaseStore
 {
-    public const int CurrentSchemaVersion = 14;
+    public const int CurrentSchemaVersion = 15;
     public const int ApplicationId = 0x484D4B54;
 
     public static SqliteConnection Open(string path) => OpenCore(path, SqliteOpenMode.ReadWriteCreate);
@@ -163,6 +163,13 @@ public static class DatabaseStore
             Execute(connection, tx, SchemaV14);
             Execute(connection, tx, "PRAGMA user_version=14;");
             version = 14;
+        }
+
+        if (version == 14)
+        {
+            Execute(connection, tx, SchemaV15);
+            Execute(connection, tx, "PRAGMA user_version=15;");
+            version = 15;
         }
 
         if (version != CurrentSchemaVersion)
@@ -543,5 +550,37 @@ public static class DatabaseStore
         BEGIN SELECT RAISE(ABORT,'Invalid UM7 creation claim transition'); END;
         CREATE TRIGGER um7_claim_no_delete BEFORE DELETE ON um7_create_claims
         BEGIN SELECT RAISE(ABORT,'UM7 creation claim is retained'); END;
+        """;
+
+    // An acknowledgement is a separate immutable protocol receipt, not
+    // confirmation of remote creation or permission to activate/print.
+    private const string SchemaV15 = """
+        CREATE TABLE um7_create_acknowledgements (
+            ReservationId TEXT NOT NULL PRIMARY KEY REFERENCES um7_create_claims(ReservationId) ON DELETE RESTRICT,
+            RemoteId TEXT COLLATE BINARY CHECK(RemoteId IS NULL OR
+                (typeof(RemoteId)='text' AND length(RemoteId) BETWEEN 2 AND 33
+                    AND substr(RemoteId,1,1)='*' AND substr(RemoteId,2) NOT GLOB '*[^0-9A-Fa-f]*'
+                    AND instr(RemoteId,char(0))=0))
+        );
+        CREATE TRIGGER um7_ack_insert_guard BEFORE INSERT ON um7_create_acknowledgements
+        WHEN NOT EXISTS (
+            SELECT 1 FROM um7_create_claims claim
+            JOIN um7_create_intents i ON i.ReservationId=claim.ReservationId
+            JOIN um7_voucher_secrets secret ON secret.ReservationId=i.ReservationId
+            JOIN voucher_reservations v ON v.Id=i.ReservationId AND v.BackendId=i.BackendId AND v.BatchId=i.BatchId AND v.Username=i.Username
+            JOIN backends b ON b.Id=i.BackendId AND b.Kind=3 AND b.RouterId=i.RouterId
+            JOIN voucher_batches batch ON batch.Id=i.BatchId AND batch.BackendId=i.BackendId AND batch.PlanId=i.PlanId
+            JOIN plans p ON p.Id=i.PlanId AND p.BackendId=i.BackendId AND p.Name=i.PlanName
+            JOIN router_targets t ON t.RouterId=i.RouterId AND t.LeafSha256=i.LeafSha256
+            WHERE claim.ReservationId=NEW.ReservationId AND claim.State=2
+                AND NOT EXISTS (SELECT 1 FROM um6_create_journal j WHERE j.ReservationId=i.ReservationId))
+        BEGIN SELECT RAISE(ABORT,'Valid UM7 in-flight claim required'); END;
+        CREATE TRIGGER um7_ack_no_update BEFORE UPDATE ON um7_create_acknowledgements
+        BEGIN SELECT RAISE(ABORT,'UM7 acknowledgement is immutable'); END;
+        CREATE TRIGGER um7_ack_no_delete BEFORE DELETE ON um7_create_acknowledgements
+        BEGIN SELECT RAISE(ABORT,'UM7 acknowledgement is retained'); END;
+        CREATE TRIGGER um7_ack_exclude_indeterminate BEFORE UPDATE ON um7_create_claims
+        WHEN EXISTS (SELECT 1 FROM um7_create_acknowledgements a WHERE a.ReservationId=OLD.ReservationId)
+        BEGIN SELECT RAISE(ABORT,'UM7 acknowledgement already retained'); END;
         """;
 }
