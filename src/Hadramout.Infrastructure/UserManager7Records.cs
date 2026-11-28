@@ -103,6 +103,10 @@ internal sealed record UserManager7CreatePreflightEvidence(UserManager7CreatePre
     UserManager7ServiceSettings Settings, UserManager7Profile? Profile = null,
     UserManager7GroupIdentity? Group = null, UserManager7Account? ExistingAccount = null);
 
+// Positive observation of the exact disabled account, not proof of profile
+// assignment, entitlement, or permission to activate it.
+internal sealed record UserManager7DisabledCreationObservation(string RemoteId, bool ReturnedIdMatched);
+
 internal static class UserManager7Records
 {
     // Consumes an already captured one-shot monitor reply; no network command is
@@ -163,6 +167,22 @@ internal static class UserManager7Records
         if (!UserManager6Records.IsOpaqueRemoteId(id))
             throw new InvalidDataException("Invalid User Manager v7 definition remote identity.");
         return id!;
+    }
+
+    internal static UserManager7DisabledCreationObservation ParseDisabledCreationObservation(
+        byte[][] words, Guid reservationId, string username, string groupName, string? expectedId)
+    {
+        string id = RemoteId(words);
+        _ = ExactKey(words, "name", username);
+        _ = ExactKey(words, "group", groupName);
+        if (ReadFlag(words, "disabled") != true)
+            throw new InvalidDataException("UM7 creation account is not explicitly disabled.");
+        string? marker = UserManager6Records.ReadText(words, "comment", 128);
+        if (marker != "hmk-um7-create:" + reservationId.ToString("N"))
+            throw new InvalidDataException("UM7 creation marker does not match.");
+        if (expectedId is not null && id != expectedId)
+            throw new InvalidDataException("UM7 returned identity does not match the observed account.");
+        return new(id, expectedId is not null);
     }
 
     internal static UserManager7GroupIdentity ParseGroupIdentity(byte[][] words, string name) =>

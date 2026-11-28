@@ -1959,6 +1959,116 @@ public sealed class RouterOsTlsTransportTests(ITestOutputHelper output)
         Assert.False(server.HasPendingConnection);
     }
 
+    [Theory]
+    [InlineData("matched")]
+    [InlineData("bare")]
+    [InlineData("absent")]
+    [InlineData("wrong-id")]
+    [InlineData("invalid-id")]
+    [InlineData("wrong-name")]
+    [InlineData("wrong-group")]
+    [InlineData("missing-group")]
+    [InlineData("wrong-marker")]
+    [InlineData("missing-marker")]
+    [InlineData("enabled")]
+    [InlineData("missing-disabled")]
+    [InlineData("duplicate")]
+    [InlineData("trap")]
+    [InlineData("v6")]
+    public async Task UserManager7DisabledCreationReadbackRejectsUnmatchedOrUnsafeEvidence(string condition)
+    {
+        Guid reservation = Guid.Parse("aabbccdd-1122-3344-5566-778899aabbcc");
+        using var certificates = new Certificates();
+        using var server = new LoopbackServer(certificates.Leaf, certificates.Root, output);
+        Task serve = server.RunAsync(reply: true, handler: async (tls, token) =>
+        {
+            await PrepareProbePeerAsync(tls, token, condition == "v6" ? "6.49.19" : "7.21.1");
+            if (condition == "v6")
+            {
+                Assert.Equal(0, await tls.ReadAsync(new byte[1], token));
+                return;
+            }
+            var request = await RouterOsWireCodec.ReadSentenceAsync(tls, token);
+            Assert.Equal(new[] { "/user-manager/user/print",
+                "=.proplist=.id,name,group,disabled,comment", "?name=001" },
+                request.Select(word => Encoding.UTF8.GetString(word)).ToArray());
+            if (condition == "trap")
+            {
+                await RouterOsWireCodec.WriteSentenceAsync(tls, ["!trap"u8.ToArray()], token);
+                return;
+            }
+            if (condition != "absent")
+            {
+                var row = new List<ReadOnlyMemory<byte>>
+                {
+                    "!re"u8.ToArray(),
+                    condition == "wrong-id" ? "=.id=*2"u8.ToArray() :
+                        condition == "invalid-id" ? "=.id=bad"u8.ToArray() : "=.id=*1"u8.ToArray(),
+                    condition == "wrong-name" ? "=name=002"u8.ToArray() : "=name=001"u8.ToArray()
+                };
+                if (condition != "missing-group")
+                    row.Add(condition == "wrong-group" ? "=group=other"u8.ToArray() : "=group=voucher"u8.ToArray());
+                if (condition != "missing-disabled")
+                    row.Add(condition == "enabled" ? "=disabled=no"u8.ToArray() : "=disabled=yes"u8.ToArray());
+                if (condition != "missing-marker")
+                    row.Add(condition == "wrong-marker" ? "=comment=unrelated"u8.ToArray() :
+                        "=comment=hmk-um7-create:aabbccdd112233445566778899aabbcc"u8.ToArray());
+                await RouterOsWireCodec.WriteSentenceAsync(tls, row.ToArray(), token);
+                if (condition == "duplicate")
+                    await RouterOsWireCodec.WriteSentenceAsync(tls, row.ToArray(), token);
+                if (condition is not ("matched" or "bare")) return;
+            }
+            await RouterOsWireCodec.WriteSentenceAsync(tls, ["!done"u8.ToArray()], token);
+            Assert.Equal(0, await tls.ReadAsync(new byte[1], token));
+        });
+        async Task<UserManager7DisabledCreationObservation?> Read()
+        {
+            using var session = await RouterOsSession.ConnectAsync("127.0.0.1", "router.test",
+                "synthetic-user"u8.ToArray(), "synthetic-private-password"u8.ToArray(), server.Port,
+                trustedRootDer: certificates.Root.RawData);
+            return await session.ReadUserManager7DisabledCreationAsync(reservation, "001", "voucher",
+                new(UserManager7CreateWireOutcome.Acknowledged, condition == "bare" ? null : "*1"));
+        }
+        try
+        {
+            if (condition == "v6") await Assert.ThrowsAsync<NotSupportedException>(Read);
+            else if (condition == "absent") Assert.Null(await Read());
+            else if (condition is "matched" or "bare")
+            {
+                var observed = await Read();
+                Assert.NotNull(observed);
+                Assert.Equal("*1", observed.RemoteId);
+                Assert.Equal(condition == "matched", observed.ReturnedIdMatched);
+            }
+            else await Assert.ThrowsAsync<InvalidDataException>(Read);
+        }
+        finally { await serve; }
+        Assert.False(server.HasPendingConnection);
+    }
+
+    [Theory]
+    [InlineData("bad-receipt")]
+    [InlineData("bad-id")]
+    [InlineData("bad-reservation")]
+    [InlineData("bad-group")]
+    [InlineData("bad-user")]
+    public async Task UserManager7DisabledCreationRejectsInvalidScopeBeforeReading(string condition)
+    {
+        using var stream = new MemoryStream();
+        var receipt = new UserManager7CreateWireReceipt(
+            condition == "bad-receipt" ? UserManager7CreateWireOutcome.Indeterminate : UserManager7CreateWireOutcome.Acknowledged,
+            condition == "bad-id" ? "invalid" : "*1");
+        Task Read() => RouterOsSession.ReadUm7DisabledCreationCoreAsync(stream,
+            condition == "bad-reservation" ? Guid.Empty : Guid.NewGuid(),
+            condition == "bad-user" ? " " : "001", condition == "bad-group" ? " " : "voucher",
+            receipt, CancellationToken.None);
+        if (condition is "bad-receipt" or "bad-id")
+            await Assert.ThrowsAsync<InvalidOperationException>(Read);
+        else await Assert.ThrowsAnyAsync<ArgumentException>(Read);
+        Assert.Equal(0L, stream.Length);
+        Assert.Equal(0L, stream.Position);
+    }
+
     [Fact]
     public async Task UserManager6LookupNeverSendsLegacyMenuToV7()
     {
