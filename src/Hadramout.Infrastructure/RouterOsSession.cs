@@ -296,6 +296,47 @@ internal sealed class RouterOsSession : IDisposable
 
     // For a profile-backed voucher with an explicit group, check only visible
     // conflicts on the same read session. No write path or claim is created.
+    // Qualification-only readback. A receipt must come from a qualified caller;
+    // this method does not authenticate or persist the receipt or authorize writes.
+    internal Task<UserManager7DisabledCreationObservation?> ReadUserManager7DisabledCreationAsync(
+        Guid reservationId, string username, string groupName, UserManager7CreateWireReceipt receipt,
+        TimeSpan? timeout = null, CancellationToken cancellationToken = default)
+    {
+        ValidateUm7DisabledCreationScope(reservationId, username, groupName, receipt);
+        return WithReadSessionAsync((stream, token) => ReadUm7DisabledCreationCoreAsync(
+            stream, reservationId, username, groupName, receipt, token), timeout, cancellationToken);
+    }
+
+    private static void ValidateUm7DisabledCreationScope(Guid reservationId, string username,
+        string groupName, UserManager7CreateWireReceipt receipt)
+    {
+        ArgumentNullException.ThrowIfNull(receipt);
+        if (reservationId == Guid.Empty)
+            throw new ArgumentException("Reservation identity required.", nameof(reservationId));
+        UserManager6Records.ValidateKey(username, nameof(username));
+        UserManager6Records.ValidateKey(groupName, nameof(groupName));
+        if (receipt.Outcome != UserManager7CreateWireOutcome.Acknowledged ||
+            (receipt.ReturnedId is not null && !UserManager6Records.IsOpaqueRemoteId(receipt.ReturnedId)))
+            throw new InvalidOperationException("Valid UM7 acknowledgement required for readback.");
+    }
+
+    internal static async Task<UserManager7DisabledCreationObservation?> ReadUm7DisabledCreationCoreAsync(
+        Stream stream, Guid reservationId, string username, string groupName,
+        UserManager7CreateWireReceipt receipt, CancellationToken token)
+    {
+        ArgumentNullException.ThrowIfNull(stream);
+        ValidateUm7DisabledCreationScope(reservationId, username, groupName, receipt);
+        token.ThrowIfCancellationRequested();
+        await RequireUserManager7FamilyAsync(stream, token).ConfigureAwait(false);
+        var rows = await ReadCommandAsync(stream,
+            ["/user-manager/user/print"u8.ToArray(), "=.proplist=.id,name,group,disabled,comment"u8.ToArray(),
+                UserManager6Records.Query("name", username)],
+            words => UserManager7Records.ParseDisabledCreationObservation(
+                words, reservationId, username, groupName, receipt.ReturnedId), 1, token).ConfigureAwait(false);
+        token.ThrowIfCancellationRequested();
+        return rows.Count == 0 ? null : rows[0];
+    }
+
     internal Task<UserManager7CreatePreflightEvidence> ReadUserManager7CreationPreflightAsync(
         string username, string profileName, string groupName, TimeSpan? timeout = null,
         CancellationToken cancellationToken = default)
